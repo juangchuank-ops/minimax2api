@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MiniMax 网页反代 - 管理</title>
+    <link rel="stylesheet" href="/admin/static/app.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="brand">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="28" height="28">
+                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                    <path d="M2 17l10 5 10-5"/>
+                    <path d="M2 12l10 5 10-5"/>
+                </svg>
+                <div>
+                    <h1>MiniMax 网页反代</h1>
+                    <span class="subtitle">Web Reverse Proxy</span>
+                </div>
+            </div>
+            <div class="status-badge" id="statusBadge">
+                <span class="dot" id="statusDot"></span>
+                <span id="statusText">检查中...</span>
+            </div>
+        </header>
+
+        <!-- Main -->
+        <main class="main">
+            <!-- Status Card -->
+            <section class="card">
+                <h2>运行状态</h2>
+                <div class="stats">
+                    <div class="stat">
+                        <span class="stat-label">目标地址</span>
+                        <span class="stat-value" id="targetDisplay">-</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">代理端口</span>
+                        <span class="stat-value" id="portDisplay">8000</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">连接状态</span>
+                        <span class="stat-value" id="connectivityDisplay">-</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Config Card -->
+            <section class="card">
+                <h2>配置</h2>
+                <div class="form-group">
+                    <label for="targetUrl">代理目标 URL</label>
+                    <input type="url" id="targetUrl" placeholder="https://agent.minimaxi.com">
+                    <p class="hint">所有请求将被转发至此地址。</p>
+                </div>
+                <div class="form-group">
+                    <label for="localPort">本地端口</label>
+                    <input type="number" id="localPort" placeholder="8000" min="1024" max="65535">
+                    <p class="hint">修改后需重启服务生效。</p>
+                </div>
+                <div class="actions">
+                    <button class="btn btn-secondary" id="testBtn">测试连接</button>
+                    <button class="btn btn-primary" id="saveBtn">保存配置</button>
+                </div>
+                <div id="resultArea" class="result" style="display:none"></div>
+            </section>
+
+            <!-- Usage Card -->
+            <section class="card">
+                <h2>使用说明</h2>
+                <p>配置完成后，通过以下地址访问 MiniMax：</p>
+                <div class="url-box" id="proxyUrlDisplay">http://localhost:8000/</div>
+                <p class="hint" style="margin-top:0.75rem">
+                    该代理会转发所有请求至目标站点，并自动替换页面中的 URL，
+                    让你通过自己的服务器访问 MiniMax Agent 网页。
+                </p>
+            </section>
+        </main>
+    </div>
+    <script src="/admin/static/app.js"></script>
+</body>
+</html>

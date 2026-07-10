@@ -1,0 +1,165 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Manrope:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+
+  @keyframes accordion-down {
+    from {
+      height: 0;
+    }
+    to {
+      height: var(--radix-accordion-content-height);
+    }
+  }
+  @keyframes accordion-up {
+    from {
+      height: var(--radix-accordion-content-height);
+    }
+    to {
+      height: 0;
+    }
+  }
+}
+
+@utility container {
+  margin-inline: auto;
+  padding-inline: 2rem;
+  @media (width >= --theme(--breakpoint-sm)) {
+    max-width: none;
+  }
+  @media (width >= 1400px) {
+    max-width: 1400px;
+  }
+}
+
+/*
+  Cyan/Teal Tech Theme
+*/
+@layer base {
+  :root {
+    /* Light theme */
+    --background: 0 0% 100%;
+    --foreground: 222 15% 15%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 15% 15%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 15% 15%;
+    --primary: 187 95% 42%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 210 10% 96%;
+    --secondary-foreground: 222 15% 15%;
+    --muted: 210 10% 96%;
+    --muted-foreground: 215 8% 47%;
+    --accent: 210 10% 96%;
+    --accent-foreground: 222 15% 15%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 214 12% 88%;
+    --input: 214 12% 88%;
+    --ring: 187 95% 42%;
+    --radius: 0;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      /* Dark theme */
+      --background: 220 14% 10%;
+      --foreground: 0 0% 98%;
+      --card: 220 13% 13%;
+      --card-foreground: 0 0% 98%;
+      --popover: 220 13% 13%;
+      --popover-foreground: 0 0% 98%;
+      --primary: 187 85% 48%;
+      --primary-foreground: 220 14% 8%;
+      --secondary: 220 10% 17%;
+      --secondary-foreground: 0 0% 98%;
+      --muted: 220 10% 17%;
+      --muted-foreground: 215 6% 62%;
+      --accent: 220 10% 17%;
+      --accent-foreground: 0 0% 98%;
+      --destructive: 0 63% 31%;
+      --destructive-foreground: 0 0% 98%;
+      --border: 220 10% 22%;
+      --input: 220 10% 22%;
+      --ring: 187 85% 48%;
+    }
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply text-foreground transition-colors duration-300;
+    font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6, .font-extrabold, .font-black, .font-bold {
+    font-family: 'Outfit', ui-sans-serif, system-ui, sans-serif;
+  }
+  
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background-image: 
+      radial-gradient(circle at 20% 40%, rgba(6, 182, 212, 0.10), transparent 40%),
+      radial-gradient(circle at 80% 70%, rgba(13, 148, 136, 0.08), transparent 40%);
+    background-attachment: fixed;
+    pointer-events: none;
+  }
+  
+  @media (prefers-color-scheme: dark) {
+    body::before {
+      background-image:
+        radial-gradient(circle at 20% 40%, rgba(6, 182, 212, 0.06), transparent 30%),
+        radial-gradient(circle at 80% 70%, rgba(13, 148, 136, 0.05), transparent 30%);
+    }
+  }
+
+  /* 修复原生 <select> 下拉在暗色主题下 option 白底白字不可见的问题 */
+  select option {
+    background-color: hsl(var(--card));
+    color: hsl(var(--card-foreground));
+  }
+  select option:checked,
+  select option:hover {
+    background-color: hsl(var(--accent));
+    color: hsl(var(--accent-foreground));
+  }
+}
