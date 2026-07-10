@@ -1,0 +1,27 @@
+{
+  "minimax_api_key": "",
+  "minimax_base_url": "https://api.minimax.io/v1",
+  "proxy_api_keys": ["sk-minimax"],
+  "default_model": "MiniMax-M2.7",
+  "available_models": [
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2"
+  ],
+  "webui_password": "minimax",
+  "accounts": [
+    {
+      "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODI0Njk5MDIsInVzZXIiOnsiaWQiOiIyNzUzMTgzODIxMTA0MjkxODQiLCJuYW1lIjoi55m96JOdIiwiYXZhdGFyIjoiaHR0cHM6Ly90aGlyZHd4LnFsb2dvLmNuL21tb3Blbi92aV8zMi9rU3RXU1dtNVBHaWFlRzFIRUZZaDE4NXZRcjVaVGZhZDJUN0VlZ05pYUdDWmpZcmJON29QemlhaWFQZjZpYmljQ1RWVms2Uk1wTzFIakFYRWlhOGJ3UEJKRERHMk1UYTg4WWljdW9MWVhTOFZVSVBpY0puMC8xMzIiLCJkZXZpY2VJRCI6IiIsImlzQW5vbnltb3VzIjpmYWxzZX19.8o6_ron6WmBU9F4JIAyPxqFRin5xtXzjLsCjovjy4qo",
+      "name": "eyJhbGci",
+      "base_url": "https://agent.minimaxi.com/v1",
+      "auth_mode": "token",
+      "auth_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODI0Njk5MDIsInVzZXIiOnsiaWQiOiIyNzUzMTgzODIxMTA0MjkxODQiLCJuYW1lIjoi55m96JOdIiwiYXZhdGFyIjoiaHR0cHM6Ly90aGlyZHd4LnFsb2dvLmNuL21tb3Blbi92aV8zMi9rU3RXU1dtNVBHaWFlRzFIRUZZaDE4NXZRcjVaVGZhZDJUN0VlZ05pYUdDWmpZcmJON29QemlhaWFQZjZpYmljQ1RWVms2Uk1wTzFIakFYRWlhOGJ3UEJKRERHMk1UYTg4WWljdW9MWVhTOFZVSVBpY0puMC8xMzIiLCJkZXZpY2VJRCI6IiIsImlzQW5vbnltb3VzIjpmYWxzZX19.8o6_ron6WmBU9F4JIAyPxqFRin5xtXzjLsCjovjy4qo",
+      "is_active": true,
+      "request_count": 0
+    }
+  ]
+}
