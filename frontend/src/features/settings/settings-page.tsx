@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, RefreshCw, Server, Settings2, Shield, Sparkles, Waves, ScrollText } from "lucide-react";
+import { CalendarCheck, ExternalLink, RefreshCw, Server, Settings2, Shield, Sparkles, Waves, ScrollText } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -48,9 +48,33 @@ type Draft = {
   publicBaseURL: string;
   maxTotalSizeMB: number;
   autoDownload: boolean;
+  // The check-in fields are spelled out with a prefix rather than spread in
+  // like the sections above. Two of them would otherwise be ambiguous next to
+  // the upstream block: `lang` sits beside `language`, and `enabled` reads as
+  // the whole gateway's switch rather than one section's.
+  signinEnabled: boolean;
+  signinHour: number;
+  signinMinute: number;
+  signinGapSeconds: number;
+  signinTimeoutSec: number;
+  signinSkipZeroCredit: boolean;
+  signinCreditFreshMin: number;
+  signinCreditRefreshMin: number;
+  signinLang: string;
+  signinOSName: string;
+  signinBrowserName: string;
+  signinBrowserLanguage: string;
+  signinBrowserPlatform: string;
+  signinDeviceMemory: number;
+  signinCPUCoreNum: number;
+  signinTimezoneOffsetMin: number;
+  signinStatusPath: string;
+  signinClaimPath: string;
+  signinCreditPath: string;
 };
 
 function toDraft(settings: SettingsDTO): Draft {
+  const signin = settings.signin;
   return {
     ...settings.server,
     adminPassword: "",
@@ -58,6 +82,25 @@ function toDraft(settings: SettingsDTO): Draft {
     ...settings.routing,
     ...settings.audit,
     ...settings.media,
+    signinEnabled: signin.enabled,
+    signinHour: signin.hour,
+    signinMinute: signin.minute,
+    signinGapSeconds: signin.gapSeconds,
+    signinTimeoutSec: signin.timeoutSec,
+    signinSkipZeroCredit: signin.skipZeroCredit,
+    signinCreditFreshMin: signin.creditFreshMin,
+    signinCreditRefreshMin: signin.creditRefreshMin,
+    signinLang: signin.lang,
+    signinOSName: signin.osName,
+    signinBrowserName: signin.browserName,
+    signinBrowserLanguage: signin.browserLanguage,
+    signinBrowserPlatform: signin.browserPlatform,
+    signinDeviceMemory: signin.deviceMemory,
+    signinCPUCoreNum: signin.cpuCoreNum,
+    signinTimezoneOffsetMin: signin.timezoneOffsetMin,
+    signinStatusPath: signin.statusPath,
+    signinClaimPath: signin.claimPath,
+    signinCreditPath: signin.creditPath,
   };
 }
 
@@ -114,6 +157,27 @@ export function SettingsPage() {
           publicBaseURL: value.publicBaseURL,
           maxTotalSizeMB: value.maxTotalSizeMB,
           autoDownload: value.autoDownload,
+        },
+        signin: {
+          enabled: value.signinEnabled,
+          hour: value.signinHour,
+          minute: value.signinMinute,
+          gapSeconds: value.signinGapSeconds,
+          timeoutSec: value.signinTimeoutSec,
+          skipZeroCredit: value.signinSkipZeroCredit,
+          creditFreshMin: value.signinCreditFreshMin,
+          creditRefreshMin: value.signinCreditRefreshMin,
+          lang: value.signinLang,
+          osName: value.signinOSName,
+          browserName: value.signinBrowserName,
+          browserLanguage: value.signinBrowserLanguage,
+          browserPlatform: value.signinBrowserPlatform,
+          deviceMemory: value.signinDeviceMemory,
+          cpuCoreNum: value.signinCPUCoreNum,
+          timezoneOffsetMin: value.signinTimezoneOffsetMin,
+          statusPath: value.signinStatusPath,
+          claimPath: value.signinClaimPath,
+          creditPath: value.signinCreditPath,
         },
         ...(value.adminPassword ? { adminPassword: value.adminPassword } : {}),
       }),
@@ -382,6 +446,95 @@ export function SettingsPage() {
           </Field>
           <Field label={t("settings.media.autoDownload")} help={t("settings.media.autoDownloadHelp")}>
             <Switch checked={draft.autoDownload} onCheckedChange={(value) => set("autoDownload", value)} />
+          </Field>
+        </SettingsGroup>
+
+        <SettingsGroup icon={<CalendarCheck />} title={t("settings.groups.signin")}>
+          <Field label={t("settings.signin.enabled")} help={t("settings.signin.enabledHelp")}>
+            <Switch checked={draft.signinEnabled} onCheckedChange={(value) => set("signinEnabled", value)} />
+          </Field>
+          <Field label={t("settings.signin.time")} help={t("settings.signin.timeHelp")}>
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                max={23}
+                aria-label={t("settings.signin.time")}
+                className="w-20"
+                value={draft.signinHour}
+                onChange={(event) => set("signinHour", Number(event.target.value))}
+              />
+              <span className="text-xs text-muted-foreground">:</span>
+              <Input
+                type="number"
+                min={0}
+                max={59}
+                aria-label={t("settings.signin.time")}
+                className="w-20"
+                value={draft.signinMinute}
+                onChange={(event) => set("signinMinute", Number(event.target.value))}
+              />
+            </div>
+          </Field>
+          <Field label={t("settings.signin.gap")} unit={t("settings.units.seconds")} help={t("settings.signin.gapHelp")}>
+            <Input
+              type="number"
+              min={0}
+              max={120}
+              value={draft.signinGapSeconds}
+              onChange={(event) => set("signinGapSeconds", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.signin.timeout")} unit={t("settings.units.seconds")} help={t("settings.signin.timeoutHelp")}>
+            <Input
+              type="number"
+              min={5}
+              max={300}
+              value={draft.signinTimeoutSec}
+              onChange={(event) => set("signinTimeoutSec", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.signin.skipZeroCredit")} help={t("settings.signin.skipZeroCreditHelp")}>
+            <Switch checked={draft.signinSkipZeroCredit} onCheckedChange={(value) => set("signinSkipZeroCredit", value)} />
+          </Field>
+          <Field label={t("settings.signin.creditFresh")} unit={t("settings.units.minutes")} help={t("settings.signin.creditFreshHelp")}>
+            <Input
+              type="number"
+              min={1}
+              max={10080}
+              value={draft.signinCreditFreshMin}
+              onChange={(event) => set("signinCreditFreshMin", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.signin.creditRefresh")} unit={t("settings.units.minutes")} help={t("settings.signin.creditRefreshHelp")}>
+            <Input
+              type="number"
+              min={0}
+              max={1440}
+              value={draft.signinCreditRefreshMin}
+              onChange={(event) => set("signinCreditRefreshMin", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.signin.lang")} help={t("settings.signin.langHelp")}>
+            <Input value={draft.signinLang} onChange={(event) => set("signinLang", event.target.value)} />
+          </Field>
+          <Field label={t("settings.signin.timezoneOffset")} help={t("settings.signin.timezoneOffsetHelp")}>
+            <Input
+              type="number"
+              min={-720}
+              max={840}
+              value={draft.signinTimezoneOffsetMin}
+              onChange={(event) => set("signinTimezoneOffsetMin", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.signin.statusPath")} help={t("settings.signin.pathHelp")}>
+            <Input value={draft.signinStatusPath} onChange={(event) => set("signinStatusPath", event.target.value)} />
+          </Field>
+          <Field label={t("settings.signin.claimPath")} help={t("settings.signin.pathHelp")}>
+            <Input value={draft.signinClaimPath} onChange={(event) => set("signinClaimPath", event.target.value)} />
+          </Field>
+          <Field label={t("settings.signin.creditPath")} help={t("settings.signin.pathHelp")}>
+            <Input value={draft.signinCreditPath} onChange={(event) => set("signinCreditPath", event.target.value)} />
           </Field>
         </SettingsGroup>
 

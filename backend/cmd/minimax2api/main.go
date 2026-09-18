@@ -18,6 +18,7 @@ import (
 	"minimax2api/internal/gateway"
 	"minimax2api/internal/minimax"
 	"minimax2api/internal/pool"
+	"minimax2api/internal/signin"
 	"minimax2api/internal/store"
 )
 
@@ -32,7 +33,8 @@ func main() {
 	settingsFn := func() config.Settings { return st.Settings() }
 	client := minimax.New(settingsFn)
 	accountPool := pool.New(st, settingsFn)
-	api := admin.New(st, accountPool, client, settingsFn)
+	signinSvc := signin.New(st, client, settingsFn, gateway.CredentialOf)
+	api := admin.New(st, accountPool, client, signinSvc, settingsFn)
 	compat := gateway.New(st, accountPool, client, settingsFn)
 
 	mux := http.NewServeMux()
@@ -64,6 +66,13 @@ func main() {
 
 	go janitor(st)
 
+	// The check-in scheduler and credit poller live for as long as the process
+	// does, so they take a context cancelled by the same signal that stops the
+	// HTTP server.
+	runCtx, stopRun := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopRun()
+	signinSvc.Start(runCtx)
+
 	go func() {
 		log.Printf("MiniMax2API %s 已启动 · 管理台 http://%s · 数据目录 %s", gateway.Version, displayAddr(addr), cfg.DataDir)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -71,9 +80,8 @@ func main() {
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	<-runCtx.Done()
+	stopRun()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

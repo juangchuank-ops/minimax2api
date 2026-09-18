@@ -37,6 +37,49 @@ type Quota struct {
 	Note      string    `json:"note"`
 }
 
+// Check-in outcome values stored on an account.
+const (
+	SigninOK      = "ok"      // claimed (or already claimed) today
+	SigninAlready = "already" // upstream said today's credits were taken
+	SigninFailed  = "failed"
+	SigninSkipped = "skipped" // mainland account, disabled, or no fingerprint
+)
+
+// SigninDay is one slot of the seven-day check-in cycle.
+type SigninDay struct {
+	DayNo   int  `json:"dayNo"`
+	Points  int  `json:"points"`
+	Status  int  `json:"status"`
+	IsToday bool `json:"isToday"`
+}
+
+// SigninPanel is the persisted view of the upstream check-in board. It is kept
+// so the console can render the seven-day strip without calling upstream on
+// every page load.
+type SigninPanel struct {
+	Scene int         `json:"scene"`
+	Days  []SigninDay `json:"days"`
+}
+
+// Credit is the last observed balance.
+//
+// Total is the number that matters for routing. The upstream reports it inside
+// op_credit_summary.total_remaining_amount; the flat fields beside it belong to
+// the pre-migration credit system and read zero on every migrated account.
+type Credit struct {
+	Total     int       `json:"total"`
+	Free      int       `json:"free"`
+	Purchased int       `json:"purchased"`
+	PlanName  string    `json:"planName"`
+	PlanType  int       `json:"planType"`
+	SyncedAt  time.Time `json:"syncedAt"`
+}
+
+// Exhausted reports whether the balance is known to be spent.
+func (c *Credit) Exhausted() bool {
+	return c != nil && c.Total <= 0
+}
+
 type Account struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
@@ -76,6 +119,21 @@ type Account struct {
 	CreatedAt     time.Time `json:"createdAt"`
 	UpdatedAt     time.Time `json:"updatedAt"`
 	Quota         *Quota    `json:"quota,omitempty"`
+	// SigninAt is the last check-in attempt, successful or not. It doubles as
+	// the scheduler's "already swept today" marker, which is why it is written
+	// even on failure: a day where every account errored must not be retried on
+	// every tick.
+	SigninAt     time.Time    `json:"signinAt"`
+	SigninStatus string       `json:"signinStatus"`
+	SigninStreak int          `json:"signinStreak"`
+	SigninPoints int          `json:"signinPoints"`
+	SigninTotal  int64        `json:"signinTotal"`
+	SigninError  string       `json:"signinError"`
+	SigninPanel  *SigninPanel `json:"signinPanel,omitempty"`
+	// Credit is the last observed balance, refreshed by the background poller
+	// and by the sweep. It is advisory: routing only acts on it while it is
+	// fresh (see Settings.CreditFresh).
+	Credit *Credit `json:"credit,omitempty"`
 }
 
 // AccountView is the API representation. It is an explicit projection rather
@@ -109,9 +167,17 @@ type AccountView struct {
 	// No omitempty: the console declares quota as a required field that may be
 	// null, so the key must always be present. Omitting it would make the
 	// property undefined instead of null and silently break strict checks.
-	Quota       *Quota `json:"quota"`
-	TokenMasked string `json:"tokenMasked"`
-	Inflight    int    `json:"inflight"`
+	Quota        *Quota       `json:"quota"`
+	SigninAt     time.Time    `json:"signinAt"`
+	SigninStatus string       `json:"signinStatus"`
+	SigninStreak int          `json:"signinStreak"`
+	SigninPoints int          `json:"signinPoints"`
+	SigninTotal  int64        `json:"signinTotal"`
+	SigninError  string       `json:"signinError"`
+	SigninPanel  *SigninPanel `json:"signinPanel"`
+	Credit       *Credit      `json:"credit"`
+	TokenMasked  string       `json:"tokenMasked"`
+	Inflight     int          `json:"inflight"`
 }
 
 // NewAccountView projects an account for API responses.
@@ -128,6 +194,10 @@ func NewAccountView(account *Account, inflight int) AccountView {
 		SuccessCount: account.SuccessCount, LastUsedAt: account.LastUsedAt,
 		LastError: account.LastError, CreatedAt: account.CreatedAt, UpdatedAt: account.UpdatedAt,
 		Quota: account.Quota, TokenMasked: MaskToken(account.Token), Inflight: inflight,
+		SigninAt: account.SigninAt, SigninStatus: account.SigninStatus,
+		SigninStreak: account.SigninStreak, SigninPoints: account.SigninPoints,
+		SigninTotal: account.SigninTotal, SigninError: account.SigninError,
+		SigninPanel: account.SigninPanel, Credit: account.Credit,
 	}
 }
 

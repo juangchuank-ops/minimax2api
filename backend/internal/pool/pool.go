@@ -122,7 +122,7 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 				delete(p.sticky, sessionKey)
 			} else {
 				for _, account := range accounts {
-					if account.ID == entry.accountID && routable(account, p.inflight[account.ID], now) {
+					if account.ID == entry.accountID && routable(account, p.inflight[account.ID], now, settings) {
 						p.inflight[account.ID]++
 						entry.expires = now.Add(settings.StickyTTL())
 						p.sticky[sessionKey] = entry
@@ -135,7 +135,7 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 
 	candidates := make([]*store.Account, 0, len(accounts))
 	for _, account := range accounts {
-		if routable(account, p.inflight[account.ID], now) {
+		if routable(account, p.inflight[account.ID], now, settings) {
 			candidates = append(candidates, account)
 		}
 	}
@@ -179,7 +179,7 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 	return chosen, nil
 }
 
-func routable(account *store.Account, inflight int, now time.Time) bool {
+func routable(account *store.Account, inflight int, now time.Time, settings config.Settings) bool {
 	if !account.Enabled {
 		return false
 	}
@@ -194,6 +194,15 @@ func routable(account *store.Account, inflight int, now time.Time) bool {
 	// computed over the fingerprint query string, so an account missing either
 	// half is unusable rather than merely degraded.
 	if account.Token == "" || account.UUID == "" || account.DeviceID == "" {
+		return false
+	}
+	// A spent account is held out of rotation, but only while the reading is
+	// recent. Past CreditFresh the balance counts as unknown and the account is
+	// scheduled again: a day-old zero would otherwise strand capacity that a
+	// single request refills, and the upstream remains the final authority on
+	// whether a request is affordable.
+	if settings.Signin.SkipZeroCredit && account.Credit.Exhausted() &&
+		now.Sub(account.Credit.SyncedAt) < settings.CreditFresh() {
 		return false
 	}
 	limit := account.MaxConcurrent
@@ -270,6 +279,7 @@ func (p *Pool) DropSticky(sessionKey string) {
 // Summary reports pool health for dashboards and /health.
 func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, routableCount int) {
 	accounts := p.store.ListAccounts()
+	settings := p.settings()
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -294,7 +304,7 @@ func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, routableCo
 		default:
 			active++
 		}
-		if routable(account, p.inflight[account.ID], now) {
+		if routable(account, p.inflight[account.ID], now, settings) {
 			routableCount++
 		}
 	}

@@ -35,6 +35,10 @@ CHECKS = [
     ("accounts", "AccountDTO", "/admin/api/accounts", "items.0"),
     ("accounts", "AccountSummary", "/admin/api/accounts", "summary"),
     ("accounts", "AccountQuota", "/admin/api/accounts", "items.0.quota"),
+    ("accounts", "AccountSigninPanel", "/admin/api/accounts", "items.0.signinPanel"),
+    ("accounts", "AccountCredit", "/admin/api/accounts", "items.0.credit"),
+    ("accounts", "SigninOverview", "/admin/api/signin", ""),
+    ("accounts", "SigninReport", "/admin/api/signin", "lastReport"),
     ("client-keys", "ClientKeyDTO", "/admin/api/client-keys", "items.0"),
     ("models", "ModelDTO", "/admin/api/models", "items.0"),
     ("request-audits", "AuditDTO", "/admin/api/audits", "items.0"),
@@ -43,12 +47,16 @@ CHECKS = [
 ]
 
 # When a collection is empty there is no live sample to inspect (audits are only
-# written by gateway traffic, quota only after a successful probe). Fall back to
-# comparing against the Go struct's json tags, which still catches a renamed or
-# dropped field.
+# written by gateway traffic, quota only after a successful probe, and the
+# sign-in fields only after a sweep). Fall back to comparing against the Go
+# struct's json tags, which still catches a renamed or dropped field.
 STATIC_SOURCES = {
     "AccountQuota": ("backend/internal/store/types.go", "Quota"),
     "AuditDTO": ("backend/internal/store/types.go", "Audit"),
+    "AccountSigninPanel": ("backend/internal/store/types.go", "SigninPanel"),
+    "AccountCredit": ("backend/internal/store/types.go", "Credit"),
+    "SigninReport": ("backend/internal/signin/signin.go", "Report"),
+    "SigninAccountResult": ("backend/internal/signin/signin.go", "AccountResult"),
 }
 
 

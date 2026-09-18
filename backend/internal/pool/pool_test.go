@@ -229,11 +229,55 @@ func TestRoutableTreatsZeroMaxConcurrentAsOne(t *testing.T) {
 		MaxConcurrent: 0,
 	}
 
-	if !routable(account, 0, now) {
+	if !routable(account, 0, now, config.Settings{}) {
 		t.Fatal("account with unset MaxConcurrent should accept one request")
 	}
-	if routable(account, 1, now) {
+	if routable(account, 1, now, config.Settings{}) {
 		t.Fatal("unset MaxConcurrent should cap at one, not allow two")
+	}
+}
+
+// TestRoutableSkipsSpentAccounts covers the credit guard, including the case
+// that matters most: a stale zero must not hold an account out of rotation
+// forever, because the reading is a snapshot and the upstream is the authority.
+func TestRoutableSkipsSpentAccounts(t *testing.T) {
+	now := time.Now()
+	base := &store.Account{
+		Enabled: true, Token: "token-x", UUID: "uuid-x", DeviceID: "device-x",
+		Status: store.StatusActive, MaxConcurrent: 1,
+	}
+
+	guard := config.Settings{}
+	guard.Signin.SkipZeroCredit = true
+	guard.Signin.CreditFreshMin = 60
+
+	spent := *base
+	spent.Credit = &store.Credit{Total: 0, SyncedAt: now.Add(-5 * time.Minute)}
+	if routable(&spent, 0, now, guard) {
+		t.Error("a fresh zero balance should hold the account out of rotation")
+	}
+
+	stale := *base
+	stale.Credit = &store.Credit{Total: 0, SyncedAt: now.Add(-2 * time.Hour)}
+	if !routable(&stale, 0, now, guard) {
+		t.Error("a stale zero balance should not hold the account out of rotation")
+	}
+
+	funded := *base
+	funded.Credit = &store.Credit{Total: 400, SyncedAt: now}
+	if !routable(&funded, 0, now, guard) {
+		t.Error("an account with credit should be routable")
+	}
+
+	// No reading at all means unknown, not spent.
+	if !routable(base, 0, now, guard) {
+		t.Error("an account with no balance reading should be routable")
+	}
+
+	unguarded := config.Settings{}
+	unguarded.Signin.CreditFreshMin = 60
+	if !routable(&spent, 0, now, unguarded) {
+		t.Error("a zero balance should be ignored while SkipZeroCredit is off")
 	}
 }
 

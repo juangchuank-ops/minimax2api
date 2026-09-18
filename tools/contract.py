@@ -134,6 +134,22 @@ def main():
     probe(base, "account batch", "/admin/api/accounts/batch", "POST",
           {"action": "clearCooldown", "ids": [account_id] if account_id else []}, token)
     probe(base, "account export", "/admin/api/accounts/export?limit=5", "GET", None, token)
+    # Sign-in routes. The per-account ones go upstream, so any non-2xx is still
+    # a routed endpoint; what this checks is the path and the verb.
+    #
+    # `signin run` is a real sweep, not a dry run: on a populated pool it will
+    # check the accounts in now instead of at the scheduled minute. That is the
+    # feature working rather than a side effect to avoid, but it is worth saying
+    # out loud because this tool is otherwise read-only apart from the throwaway
+    # account it creates and deletes.
+    if account_id:
+        probe(base, "account signin", f"/admin/api/accounts/{account_id}/signin",
+              "POST", None, token, timeout=60)
+        probe(base, "account credit", f"/admin/api/accounts/{account_id}/credit",
+              "POST", None, token, timeout=60)
+    probe(base, "signin overview", "/admin/api/signin", "GET", None, token)
+    print("       (signin run is a real sweep - accounts get checked in early)")
+    probe(base, "signin run", "/admin/api/signin/run", "POST", None, token, timeout=180)
     # Snapshot the pool so the import below can be undone precisely. Matching on
     # the generated name instead would be brittle: the name is derived from the
     # token's own claims.

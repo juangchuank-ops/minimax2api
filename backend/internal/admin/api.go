@@ -18,6 +18,7 @@ import (
 	"minimax2api/internal/gateway"
 	"minimax2api/internal/minimax"
 	"minimax2api/internal/pool"
+	"minimax2api/internal/signin"
 	"minimax2api/internal/store"
 )
 
@@ -26,12 +27,13 @@ type API struct {
 	store    *store.Store
 	pool     *pool.Pool
 	client   *minimax.Client
+	signin   *signin.Service
 	settings func() config.Settings
 	started  time.Time
 }
 
-func New(st *store.Store, p *pool.Pool, client *minimax.Client, settings func() config.Settings) *API {
-	return &API{store: st, pool: p, client: client, settings: settings, started: time.Now()}
+func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signin.Service, settings func() config.Settings) *API {
+	return &API{store: st, pool: p, client: client, signin: signinSvc, settings: settings, started: time.Now()}
 }
 
 // Register installs every admin route on the mux.
@@ -56,6 +58,11 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/api/accounts/{id}", a.guard(a.deleteAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{id}/probe", a.guard(a.probeAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{id}/quota", a.guard(a.refreshQuota))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/signin", a.guard(a.signinAccount))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/credit", a.guard(a.refreshCredit))
+
+	mux.HandleFunc("GET /admin/api/signin", a.guard(a.signinOverview))
+	mux.HandleFunc("POST /admin/api/signin/run", a.guard(a.signinRun))
 
 	mux.HandleFunc("GET /admin/api/client-keys", a.guard(a.listClientKeys))
 	mux.HandleFunc("POST /admin/api/client-keys", a.guard(a.createClientKey))
@@ -1232,6 +1239,94 @@ func quotaPlan(account *store.Account) string {
 	return "MiniMax Agent（国际）"
 }
 
+// ------------------------------------------------------------------- signin
+
+// signinOverview reports the scheduler's state and the pool's check-in tally.
+//
+// Per-account detail is not repeated here: it already travels in the account
+// list, and a second copy would be one more thing to keep in step.
+func (a *API) signinOverview(w http.ResponseWriter, r *http.Request) {
+	settings := a.settings()
+	accounts := a.store.ListAccounts()
+	now := time.Now()
+
+	done, failed, skipped, exhausted := 0, 0, 0, 0
+	var totalPoints int64
+	for _, account := range accounts {
+		totalPoints += account.SigninTotal
+		switch account.SigninStatus {
+		case store.SigninOK, store.SigninAlready:
+			done++
+		case store.SigninFailed:
+			failed++
+		case store.SigninSkipped:
+			skipped++
+		}
+		if settings.Signin.SkipZeroCredit && account.Credit.Exhausted() &&
+			now.Sub(account.Credit.SyncedAt) < settings.CreditFresh() {
+			exhausted++
+		}
+	}
+
+	// A typed nil would serialise as null either way, but declaring it as
+	// *signin.Report keeps the "no run yet" case explicit at the call site.
+	var last *signin.Report = a.signin.LastReport()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":    settings.Signin.Enabled,
+		"running":    a.signin.Running(),
+		"nextRunAt":  a.signin.NextRun(now),
+		"lastRunAt":  a.signin.LastRunAt(),
+		"lastReport": last,
+		// The console needs this to know whether a zero balance is actually
+		// holding the account out of rotation, or merely being displayed.
+		"skipZeroCredit": settings.Signin.SkipZeroCredit,
+		"summary": map[string]any{
+			"total": len(accounts), "done": done, "failed": failed,
+			"skipped": skipped, "exhausted": exhausted, "totalPoints": totalPoints,
+		},
+	})
+}
+
+// signinRun triggers a sweep outside the schedule.
+func (a *API) signinRun(w http.ResponseWriter, r *http.Request) {
+	report := a.signin.Sweep(r.Context())
+	if report == nil {
+		writeError(w, http.StatusConflict, "已有签到任务在执行，请稍候")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"report":    report,
+		"nextRunAt": a.signin.NextRun(time.Now()),
+	})
+}
+
+// signinAccount checks in a single account.
+//
+// A skip is not an error: "this is a mainland account" is a complete and
+// correct answer, and returning 4xx for it would push the console into showing
+// a failure where the honest report is "nothing to do".
+func (a *API) signinAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	result, err := a.signin.CheckOne(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"result": result, "account": a.view(id)})
+}
+
+// refreshCredit re-reads one account's balance.
+func (a *API) refreshCredit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	credit, err := a.signin.RefreshCredit(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"credit": credit, "account": a.view(id)})
+}
+
 func (a *API) view(id string) *store.AccountView {
 	inflight := a.pool.Snapshot()
 	account, ok := a.store.AccountByID(id)
@@ -1456,6 +1551,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"routing": settings.Routing,
 		"audit":   settings.Audit,
 		"media":   settings.Media,
+		"signin":  settings.Signin,
 		"about": map[string]any{
 			"version": gateway.Version, "buildTime": a.started.Format(time.RFC3339),
 			"dataDir": a.store.DataDir(), "upstreamURL": settings.Upstream.BaseURL,
@@ -1470,6 +1566,7 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		Routing       *config.RoutingSettings  `json:"routing"`
 		Audit         *config.AuditSettings    `json:"audit"`
 		Media         *config.MediaSettings    `json:"media"`
+		Signin        *config.SigninSettings   `json:"signin"`
 		AdminPassword string                   `json:"adminPassword"`
 	}
 	if err := decode(r, &payload); err != nil {
@@ -1495,6 +1592,9 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.Media != nil {
 			settings.Media = *payload.Media
+		}
+		if payload.Signin != nil {
+			settings.Signin = *payload.Signin
 		}
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

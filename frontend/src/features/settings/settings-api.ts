@@ -42,6 +42,27 @@ export type SettingsDTO = {
     maxTotalSizeMB: number;
     autoDownload: boolean;
   };
+  signin: {
+    enabled: boolean;
+    hour: number;
+    minute: number;
+    gapSeconds: number;
+    timeoutSec: number;
+    skipZeroCredit: boolean;
+    creditFreshMin: number;
+    creditRefreshMin: number;
+    lang: string;
+    osName: string;
+    browserName: string;
+    browserLanguage: string;
+    browserPlatform: string;
+    deviceMemory: number;
+    cpuCoreNum: number;
+    timezoneOffsetMin: number;
+    statusPath: string;
+    claimPath: string;
+    creditPath: string;
+  };
   about: {
     version: string;
     buildTime: string;

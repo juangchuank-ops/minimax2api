@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
+  CalendarCheck,
   ChevronDown,
+  Coins,
   Download,
   FileUp,
   Pencil,
@@ -59,13 +61,17 @@ import {
   createAccount,
   deleteAccount,
   exportAccounts,
+  getSigninOverview,
   importAccounts,
   listAccountGroups,
   listAccounts,
   probeAccount,
   probeAllAccounts,
   refreshAllQuota,
+  refreshCredit,
   refreshQuota,
+  runSignin,
+  signinAccount,
   updateAccount,
   type AccountDTO,
   type AccountInput,
@@ -74,6 +80,7 @@ import {
 } from "@/features/accounts/accounts-api";
 import { AccountNameCell, AccountRoutingCell, AccountStatusCell } from "@/features/accounts/account-name-cell";
 import { AccountQuotaCell } from "@/features/accounts/account-quota";
+import { AccountCreditCell, AccountSigninCell } from "@/features/accounts/account-signin";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { EmptyState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
@@ -155,7 +162,7 @@ function advancedPayload(state: EditorState): AccountInput {
 }
 
 export function AccountsPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
@@ -193,6 +200,16 @@ export function AccountsPage() {
   });
 
   const groupsQuery = useQuery({ queryKey: ["account-groups"], queryFn: listAccountGroups });
+
+  // Scheduler state, shown in the toolbar so the operator can see when the next
+  // automatic sweep lands without opening the settings page.
+  const signinQuery = useQuery({
+    queryKey: ["signin"],
+    queryFn: getSigninOverview,
+    refetchInterval: 60_000,
+  });
+  const signinEnabled = signinQuery.data?.enabled ?? false;
+  const skipZeroCredit = signinQuery.data?.skipZeroCredit ?? false;
 
   const items = accountsQuery.data?.items ?? [];
   const summary: AccountSummary = accountsQuery.data?.summary ?? {
@@ -343,11 +360,54 @@ export function AccountsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  const signinOneMutation = useMutation({
+    mutationFn: (id: string) => signinAccount(id),
+    onSuccess: ({ result }) => {
+      // A skip is a complete answer, not a failure: mainland accounts are not
+      // covered by the check-in protocol, and reporting that as an error would
+      // send the operator hunting for a problem that does not exist.
+      if (result.status === "skipped") toast.info(result.error || t("accounts.signinSkipped"));
+      else if (result.status === "failed") toast.error(result.error || t("accounts.signinFailed"));
+      else if (result.status === "already") toast.success(t("accounts.signinAlreadyToast"));
+      else toast.success(t("accounts.signinClaimed", { points: result.points }));
+      invalidate();
+      void signinQuery.refetch();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const signinAllMutation = useMutation({
+    mutationFn: () => runSignin(),
+    onSuccess: ({ report }) => {
+      toast.success(
+        t("accounts.signinAllDone", {
+          claimed: report.claimed,
+          already: report.already,
+          failed: report.failed,
+          skipped: report.skipped,
+        }),
+      );
+      invalidate();
+      void signinQuery.refetch();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const creditMutation = useMutation({
+    mutationFn: (id: string) => refreshCredit(id),
+    onSuccess: () => {
+      toast.success(t("accounts.creditRefreshed"));
+      invalidate();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
   const busy =
     batchMutation.isPending ||
     probeAllMutation.isPending ||
     quotaAllMutation.isPending ||
-    cleanupMutation.isPending;
+    cleanupMutation.isPending ||
+    signinAllMutation.isPending;
 
   const regionOptions = useMemo(
     () => [
@@ -625,6 +685,10 @@ export function AccountsPage() {
                 </>
               ) : (
                 <>
+                  <Button variant="secondary" size="sm" disabled={busy} onClick={() => signinAllMutation.mutate()}>
+                    <CalendarCheck />
+                    {t("accounts.signinAll")}
+                  </Button>
                   <Button variant="secondary" size="sm" disabled={busy} onClick={() => quotaAllMutation.mutate()}>
                     <RefreshCw />
                     {t("accounts.refreshQuotaAll")}
@@ -640,6 +704,13 @@ export function AccountsPage() {
                 </>
               )}
             </div>
+            {signinEnabled && signinQuery.data?.nextRunAt ? (
+              <p className="mt-2 text-right text-[10px] text-muted-foreground">
+                {t("accounts.signinNextRun", {
+                  time: formatDateTime(signinQuery.data.nextRunAt, i18n.language),
+                })}
+              </p>
+            ) : null}
           </>
         }
         footer={
@@ -669,9 +740,12 @@ export function AccountsPage() {
               allPageSelected={allPageSelected}
               onToggleAccount={toggleAccount}
               onTogglePage={togglePage}
+              skipZeroCredit={skipZeroCredit}
               onEdit={openEdit}
               onProbe={(id) => probeMutation.mutate(id)}
               onQuota={(id) => quotaMutation.mutate(id)}
+              onSignin={(id) => signinOneMutation.mutate(id)}
+              onCredit={(id) => creditMutation.mutate(id)}
               onClearCooldown={(id) => batchMutation.mutate({ action: "clearCooldown", ids: [id] })}
               onToggleEnabled={(account) =>
                 updateMutation.mutate({
@@ -1121,11 +1195,14 @@ function AccountsTable({
   items,
   selected,
   allPageSelected,
+  skipZeroCredit,
   onToggleAccount,
   onTogglePage,
   onEdit,
   onProbe,
   onQuota,
+  onSignin,
+  onCredit,
   onClearCooldown,
   onToggleEnabled,
   onDelete,
@@ -1133,11 +1210,15 @@ function AccountsTable({
   items: AccountDTO[];
   selected: Set<string>;
   allPageSelected: boolean;
+  /** Whether the routing guard is actually acting on a zero balance. */
+  skipZeroCredit: boolean;
   onToggleAccount: (id: string, checked: boolean) => void;
   onTogglePage: (checked: boolean) => void;
   onEdit: (account: AccountDTO) => void;
   onProbe: (id: string) => void;
   onQuota: (id: string) => void;
+  onSignin: (id: string) => void;
+  onCredit: (id: string) => void;
   onClearCooldown: (id: string) => void;
   onToggleEnabled: (account: AccountDTO) => void;
   onDelete: (account: AccountDTO) => void;
@@ -1174,6 +1255,8 @@ function AccountsTable({
           <SortableTableHead field="status" align="center" className="whitespace-nowrap">
             {t("accounts.status")}
           </SortableTableHead>
+          <TableHead className="whitespace-nowrap">{t("accounts.signin")}</TableHead>
+          <TableHead className="whitespace-nowrap">{t("accounts.credit")}</TableHead>
           <TableHead className="whitespace-nowrap">{t("accounts.quota")}</TableHead>
           <TableHead className="whitespace-nowrap">{t("accounts.priority")}</TableHead>
           <SortableTableHead field="createdAt" initialOrder="desc" className="whitespace-nowrap">
@@ -1202,6 +1285,12 @@ function AccountsTable({
               <AccountStatusCell account={account} />
             </TableCell>
             <TableCell>
+              <AccountSigninCell account={account} />
+            </TableCell>
+            <TableCell>
+              <AccountCreditCell account={account} enforced={skipZeroCredit} />
+            </TableCell>
+            <TableCell>
               <AccountQuotaCell quota={account.quota} />
             </TableCell>
             <TableCell>
@@ -1221,6 +1310,14 @@ function AccountsTable({
                   <DropdownMenuItem onClick={() => onEdit(account)}>
                     <Pencil />
                     {t("common.edit")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onSignin(account.id)}>
+                    <CalendarCheck />
+                    {t("accounts.signinNow")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onCredit(account.id)}>
+                    <Coins />
+                    {t("accounts.refreshCredit")}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => onQuota(account.id)}>
                     <RefreshCw />

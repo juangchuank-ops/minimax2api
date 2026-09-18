@@ -6,9 +6,12 @@ import { cn } from "@/shared/lib/cn";
 import { formatDuration, formatRelative, hasInstant } from "@/shared/lib/format";
 
 /**
- * MiniMax Agent exposes no credit balance through its web API, so a probe can
- * only report reachability and latency. That is still the useful signal: it
- * separates "the token is dead" from "the account is merely slow".
+ * Probe result: reachability and latency.
+ *
+ * The balance lives in its own column — MiniMax does expose it, through
+ * /matrix/api/v1/commerce/get_membership_info. What this cell answers is the
+ * different question of whether the token and fingerprint pair is accepted at
+ * all, which separates "the token is dead" from "the account is merely slow".
  */
 export function AccountQuotaCell({ quota }: { quota: AccountQuota | null }) {
   const { t, i18n } = useTranslation();

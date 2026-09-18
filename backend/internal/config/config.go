@@ -48,6 +48,57 @@ type Settings struct {
 	Routing  RoutingSettings  `json:"routing"`
 	Audit    AuditSettings    `json:"audit"`
 	Media    MediaSettings    `json:"media"`
+	Signin   SigninSettings   `json:"signin"`
+}
+
+// SigninSettings drives the daily check-in sweep and the credit guard.
+//
+// Only the international deployment is implemented. MiniMax runs the check-in
+// under a different parameter set on the mainland host (it keys off
+// timezone_id rather than timezone_offset), and signing a mainland account with
+// the international protocol just earns a rejection, so those accounts are
+// skipped rather than guessed at.
+type SigninSettings struct {
+	Enabled bool `json:"enabled"`
+	// Hour and Minute are local wall-clock time for the daily sweep. The
+	// upstream resets the day at some unverified boundary, so a morning run
+	// keeps a healthy margin on either interpretation.
+	Hour   int `json:"hour"`
+	Minute int `json:"minute"`
+	// GapSeconds spaces out the per-account requests. Check-in is a
+	// risk-control sensitive endpoint; a burst of parallel calls from one IP is
+	// exactly the pattern that gets accounts flagged.
+	GapSeconds int `json:"gapSeconds"`
+	// TimeoutSec bounds a single check-in call.
+	TimeoutSec int `json:"timeoutSec"`
+	// SkipZeroCredit removes accounts whose last known balance is zero from
+	// scheduling. See CreditFreshMin for how stale a reading may be.
+	SkipZeroCredit bool `json:"skipZeroCredit"`
+	// CreditFreshMin is how long a balance reading stays actionable. Past it
+	// the account is scheduled again: refusing to use an account because of a
+	// day-old zero would strand capacity that a single request would refill.
+	CreditFreshMin int `json:"creditFreshMin"`
+	// CreditRefreshMin is how often balances are polled in the background. 0
+	// disables the poller, leaving manual refresh only.
+	CreditRefreshMin int `json:"creditRefreshMin"`
+
+	// Browser fingerprint reported to the check-in endpoints. The captured
+	// values are reproduced by default; they only have to stay self-consistent,
+	// since the signature covers whatever is actually sent.
+	Lang              string `json:"lang"`
+	OSName            string `json:"osName"`
+	BrowserName       string `json:"browserName"`
+	BrowserLanguage   string `json:"browserLanguage"`
+	BrowserPlatform   string `json:"browserPlatform"`
+	DeviceMemory      int    `json:"deviceMemory"`
+	CPUCoreNum        int    `json:"cpuCoreNum"`
+	TimezoneOffsetMin int    `json:"timezoneOffsetMin"`
+
+	// Paths are settings rather than constants for the same reason the agent
+	// paths are: a rename upstream should not need a rebuild.
+	StatusPath string `json:"statusPath"`
+	ClaimPath  string `json:"claimPath"`
+	CreditPath string `json:"creditPath"`
 }
 
 type ServerSettings struct {
@@ -148,6 +199,30 @@ func DefaultSettings(dataDir string) Settings {
 			MaxTotalSizeMB: 2048,
 			AutoDownload:   true,
 		},
+		Signin: SigninSettings{
+			// Off by default: it spends a request against every account in the
+			// pool and is only useful once the operator has accounts they are
+			// willing to automate.
+			Enabled:           false,
+			Hour:              9,
+			Minute:            5,
+			GapSeconds:        2,
+			TimeoutSec:        30,
+			SkipZeroCredit:    false,
+			CreditFreshMin:    360,
+			CreditRefreshMin:  30,
+			Lang:              "en",
+			OSName:            "Windows",
+			BrowserName:       "Chrome",
+			BrowserLanguage:   "en-US",
+			BrowserPlatform:   "Win32",
+			DeviceMemory:      16,
+			CPUCoreNum:        8,
+			TimezoneOffsetMin: 480,
+			StatusPath:        "/minimax-cloud/api/v1/signin/status",
+			ClaimPath:         "/minimax-cloud/api/v1/signin/claim",
+			CreditPath:        "/matrix/api/v1/commerce/get_membership_info",
+		},
 	}
 }
 
@@ -227,6 +302,64 @@ func (s *Settings) Normalize(dataDir string) {
 	if s.Media.MaxTotalSizeMB < 64 {
 		s.Media.MaxTotalSizeMB = def.Media.MaxTotalSizeMB
 	}
+
+	if s.Signin.Hour < 0 || s.Signin.Hour > 23 {
+		s.Signin.Hour = def.Signin.Hour
+	}
+	if s.Signin.Minute < 0 || s.Signin.Minute > 59 {
+		s.Signin.Minute = def.Signin.Minute
+	}
+	if s.Signin.GapSeconds < 0 {
+		s.Signin.GapSeconds = def.Signin.GapSeconds
+	}
+	if s.Signin.TimeoutSec < 5 {
+		s.Signin.TimeoutSec = def.Signin.TimeoutSec
+	}
+	if s.Signin.CreditFreshMin <= 0 {
+		// Zero is repaired rather than honoured: an unbounded freshness window
+		// would let one stale zero hold an account out of rotation forever,
+		// which is the failure this guard exists to avoid, not to create.
+		s.Signin.CreditFreshMin = def.Signin.CreditFreshMin
+	}
+	if s.Signin.CreditRefreshMin < 0 {
+		s.Signin.CreditRefreshMin = def.Signin.CreditRefreshMin
+	}
+	if s.Signin.DeviceMemory <= 0 {
+		s.Signin.DeviceMemory = def.Signin.DeviceMemory
+	}
+	if s.Signin.CPUCoreNum <= 0 {
+		s.Signin.CPUCoreNum = def.Signin.CPUCoreNum
+	}
+	if s.Signin.Lang == "" {
+		s.Signin.Lang = def.Signin.Lang
+	}
+	if s.Signin.OSName == "" {
+		s.Signin.OSName = def.Signin.OSName
+	}
+	if s.Signin.BrowserName == "" {
+		s.Signin.BrowserName = def.Signin.BrowserName
+	}
+	if s.Signin.BrowserLanguage == "" {
+		s.Signin.BrowserLanguage = def.Signin.BrowserLanguage
+	}
+	if s.Signin.BrowserPlatform == "" {
+		s.Signin.BrowserPlatform = def.Signin.BrowserPlatform
+	}
+	if s.Signin.StatusPath == "" {
+		s.Signin.StatusPath = def.Signin.StatusPath
+	}
+	if s.Signin.ClaimPath == "" {
+		s.Signin.ClaimPath = def.Signin.ClaimPath
+	}
+	if s.Signin.CreditPath == "" {
+		s.Signin.CreditPath = def.Signin.CreditPath
+	}
+	// TimezoneOffsetMin is deliberately not repaired here. A stored 0 cannot be
+	// told apart from an absent field, and signinParams already maps 0 onto the
+	// +8 default the capture used, so repairing it here would only add a second
+	// place to get the same answer. The cost is that exactly-UTC is not
+	// expressible; every other offset is, and the upstream appears to use this
+	// value for reporting rather than for deciding when the day rolls over.
 }
 
 func (s Settings) Clone() Settings {
@@ -271,6 +404,36 @@ func (s Settings) Retention() time.Duration {
 
 func (s Settings) MediaLimitBytes() int64 {
 	return int64(s.Media.MaxTotalSizeMB) * 1024 * 1024
+}
+
+// SigninClock is the configured local wall-clock time for the daily sweep,
+// expressed as an offset from midnight.
+func (s Settings) SigninClock() time.Duration {
+	return time.Duration(s.Signin.Hour)*time.Hour + time.Duration(s.Signin.Minute)*time.Minute
+}
+
+// SigninGap is the pause between two accounts during a sweep.
+func (s Settings) SigninGap() time.Duration {
+	return time.Duration(s.Signin.GapSeconds) * time.Second
+}
+
+// SigninTimeout bounds a single check-in call.
+func (s Settings) SigninTimeout() time.Duration {
+	seconds := s.Signin.TimeoutSec
+	if seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// CreditFresh is how long a balance reading stays actionable for routing.
+func (s Settings) CreditFresh() time.Duration {
+	return time.Duration(s.Signin.CreditFreshMin) * time.Minute
+}
+
+// CreditRefresh is the background balance polling interval.
+func (s Settings) CreditRefresh() time.Duration {
+	return time.Duration(s.Signin.CreditRefreshMin) * time.Minute
 }
 
 // ParseIntOrDefault is a small helper for query parameters.

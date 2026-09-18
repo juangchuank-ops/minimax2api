@@ -25,6 +25,41 @@ export type AccountQuota = {
   note: string;
 };
 
+/**
+ * Outcome of the last daily check-in attempt. "" means it has never been tried,
+ * which is a distinct state from "failed" and worth showing differently.
+ */
+export type AccountSigninStatus = "" | "ok" | "already" | "failed" | "skipped";
+
+/** One slot of the seven-day check-in cycle. */
+export type SigninDay = {
+  dayNo: number;
+  points: number;
+  status: number;
+  isToday: boolean;
+};
+
+export type AccountSigninPanel = {
+  scene: number;
+  days: SigninDay[];
+};
+
+/**
+ * Balance reported by the upstream.
+ *
+ * `total` is the number routing acts on. The upstream reports it as a string
+ * inside op_credit_summary; the backend parses it, so it arrives here as a
+ * number. `free` and `purchased` split that total by origin.
+ */
+export type AccountCredit = {
+  total: number;
+  free: number;
+  purchased: number;
+  planName: string;
+  planType: number;
+  syncedAt: string;
+};
+
 export type AccountDTO = {
   id: string;
   name: string;
@@ -54,6 +89,14 @@ export type AccountDTO = {
   updatedAt: string;
   tokenMasked: string;
   quota: AccountQuota | null;
+  signinAt: string;
+  signinStatus: AccountSigninStatus;
+  signinStreak: number;
+  signinPoints: number;
+  signinTotal: number;
+  signinError: string;
+  signinPanel: AccountSigninPanel | null;
+  credit: AccountCredit | null;
 };
 
 export type AccountSummary = {
@@ -179,4 +222,66 @@ export function cleanupAccounts(statuses: string[]): Promise<{ deleted: number }
 
 export function listAccountGroups(): Promise<{ groups: string[] }> {
   return apiRequest("/admin/api/accounts/groups");
+}
+
+// ------------------------------------------------------------------- sign-in
+
+export type SigninAccountResult = {
+  id: string;
+  name: string;
+  status: AccountSigninStatus;
+  points: number;
+  streak: number;
+  credit: number;
+  error: string;
+};
+
+export type SigninReport = {
+  startedAt: string;
+  endedAt: string;
+  total: number;
+  claimed: number;
+  already: number;
+  failed: number;
+  skipped: number;
+  points: number;
+  results: SigninAccountResult[];
+};
+
+export type SigninOverview = {
+  enabled: boolean;
+  running: boolean;
+  nextRunAt: string;
+  lastRunAt: string;
+  lastReport: SigninReport | null;
+  /** Whether a zero balance is actually holding accounts out of rotation. */
+  skipZeroCredit: boolean;
+  summary: {
+    total: number;
+    done: number;
+    failed: number;
+    skipped: number;
+    exhausted: number;
+    totalPoints: number;
+  };
+};
+
+export function getSigninOverview(): Promise<SigninOverview> {
+  return apiRequest("/admin/api/signin");
+}
+
+/**
+ * Triggers a sweep now. Rejects with a 409 when one is already in flight, which
+ * the caller should surface as "please wait" rather than as a failure.
+ */
+export function runSignin(): Promise<{ report: SigninReport; nextRunAt: string }> {
+  return apiRequest("/admin/api/signin/run", { method: "POST" });
+}
+
+export function signinAccount(id: string): Promise<{ result: SigninAccountResult; account: AccountDTO }> {
+  return apiRequest(`/admin/api/accounts/${id}/signin`, { method: "POST" });
+}
+
+export function refreshCredit(id: string): Promise<{ credit: AccountCredit; account: AccountDTO }> {
+  return apiRequest(`/admin/api/accounts/${id}/credit`, { method: "POST" });
 }

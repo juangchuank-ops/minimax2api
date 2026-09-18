@@ -391,6 +391,19 @@ func (a *Account) clone() *Account {
 		quota := *a.Quota
 		out.Quota = &quota
 	}
+	// Credit and SigninPanel are pointers, so the shallow copy above would let a
+	// caller mutate the store's own struct without holding the lock — and the
+	// panel's slice would share a backing array, so an append on either side
+	// could scribble over the other's view.
+	if a.Credit != nil {
+		credit := *a.Credit
+		out.Credit = &credit
+	}
+	if a.SigninPanel != nil {
+		panel := *a.SigninPanel
+		panel.Days = append([]SigninDay(nil), a.SigninPanel.Days...)
+		out.SigninPanel = &panel
+	}
 	return &out
 }
 
