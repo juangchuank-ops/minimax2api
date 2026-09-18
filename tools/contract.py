@@ -134,8 +134,15 @@ def main():
     probe(base, "account batch", "/admin/api/accounts/batch", "POST",
           {"action": "clearCooldown", "ids": [account_id] if account_id else []}, token)
     probe(base, "account export", "/admin/api/accounts/export?limit=5", "GET", None, token)
+    # Snapshot the pool so the import below can be undone precisely. Matching on
+    # the generated name instead would be brittle: the name is derived from the
+    # token's own claims.
+    _, before_pool = call(base, "/admin/api/accounts?pageSize=200", token=token)
+    before_ids = {item["id"] for item in before_pool.get("items", [])}
     probe(base, "account import", "/admin/api/accounts/import", "POST",
           {"tokens": CONTRACT_TOKEN + "2"}, token)
+    _, after_pool = call(base, "/admin/api/accounts?pageSize=200", token=token)
+    imported_ids = [item["id"] for item in after_pool.get("items", []) if item["id"] not in before_ids]
     probe(base, "probe all", "/admin/api/accounts/probe-all", "POST", None, token, timeout=60)
     probe(base, "quota all", "/admin/api/accounts/quota-all", "POST", None, token, timeout=60)
     probe(base, "account cleanup", "/admin/api/accounts/cleanup", "POST",
@@ -164,6 +171,12 @@ def main():
     probe(base, "audit clear", "/admin/api/audits", "DELETE", None, token)
     if account_id:
         probe(base, "account delete", f"/admin/api/accounts/{account_id}", "DELETE", None, token)
+    # The import above created accounts too. Leaving them behind would let a
+    # repeatedly-run check slowly fill the pool with dead credentials.
+    for imported_id in imported_ids:
+        call(base, f"/admin/api/accounts/{imported_id}", "DELETE", token=token)
+    if imported_ids:
+        print(f"  [ok] import artifacts removed              DELETE /admin/api/accounts/{{id}}  -> {len(imported_ids)} deleted")
     if key_id:
         probe(base, "key delete", f"/admin/api/client-keys/{key_id}", "DELETE", None, token)
 
