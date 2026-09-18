@@ -1,0 +1,55 @@
+#!/bin/sh
+# Refuse to commit credentials.
+#
+# Install once per clone (it is a repo-level setting, never global):
+#     git config core.hooksPath tools/hooks
+#
+# Only the tree pass runs here. History is deliberately skipped: it costs
+# seconds, it cannot change while a commit is being made, and the interesting
+# question at this moment is "is what I am about to commit clean".
+#
+# A hit is not proof of a leak -- test fixtures and documentation examples trip
+# the patterns too -- so the message points at the escape hatch rather than
+# pretending the tool is always right.
+
+set -u
+
+# Look for an interpreter instead of assuming one. On Windows a `python` on
+# PATH is often the Microsoft Store alias, which prints an install banner and
+# exits non-zero, so each candidate is actually executed before it is trusted.
+PY=""
+for candidate in python3 python py; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+       "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+        PY="$candidate"
+        break
+    fi
+done
+
+# Skipping is the right failure mode: a hook that blocks every commit because
+# the interpreter is missing teaches people to pass --no-verify by reflex,
+# which defeats the hook entirely.
+if [ -z "$PY" ]; then
+    echo "secret-scan: 没找到可用的 Python，跳过密钥扫描" >&2
+    exit 0
+fi
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+if output=$("$PY" "$root/tools/secret_scan.py" --tree-only --quiet 2>&1); then
+    exit 0
+fi
+
+echo "$output" >&2
+cat >&2 <<'MSG'
+
+提交被拦下：工作树里有看起来像凭据的内容。
+
+命中不等于真泄漏——测试桩令牌和文档示例都会被报出来。逐条看过、
+确认无害之后再提交：
+
+    git commit --no-verify
+
+如果确实是真凭据，先吊销/轮换它，再清历史。顺序反了没有意义。
+MSG
+exit 1
