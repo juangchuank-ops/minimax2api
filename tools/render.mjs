@@ -18,7 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const BASE = (process.argv[2] || "http://127.0.0.1:18080").replace(/\/$/, "");
+const BASE = (process.argv[2] || "http://127.0.0.1:8080").replace(/\/$/, "");
 const CDP = (process.argv[3] || "http://127.0.0.1:9222").replace(/\/$/, "");
 const PASSWORD = process.argv[4] || "admin12345";
 const SHOT_DIR = process.argv[5] || "";

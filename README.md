@@ -341,13 +341,24 @@ python tools/fields.py --base http://127.0.0.1:8080 --password 你的密码
 
 ```bash
 # 先起一个带调试端口的 headless Chrome
-chrome --headless=new --disable-gpu --remote-debugging-port=9222 \
+chrome --headless=new --disable-gpu --no-first-run --no-default-browser-check \
+       --remote-allow-origins=* --remote-debugging-port=9222 \
        --user-data-dir=/tmp/chrome-minimax about:blank
 
 node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码
 ```
 
+> **Windows 上 `--user-data-dir` 必须写 Windows 路径**（如 `"C:\Users\你\AppData\Local\Temp\chrome-minimax"`）。传 `/tmp/...` 时 Chrome 会照常启动、日志一片空白，但**调试端口永远不会监听**，`curl http://127.0.0.1:9222/json/version` 一直连接被拒——看起来像端口被占，实际是路径没被认。另外本地回环请求记得加 `--noproxy '*'`，否则环境里的 `http_proxy` 会把它塞给代理，同样是连不上的假象。
+
 前三个脚本都是 HTTP 层面的，看不见 React 渲染崩溃、未捕获的 Promise 异常或者一片空白。这个脚本通过 CDP 驱动真实 Chrome，逐页走一遍控制台，检查：有没有抛异常 / 有没有落到错误边界 / `#root` 是否为空 / 页面标题对不对。顺带验证鉴权守卫——已登录访问 `/login` 必须被弹回仪表盘。
+
+跑完记得收尾，否则会在后台留一堆进程和磁盘垃圾：
+
+```bash
+taskkill //F //IM chrome.exe //T     # Git Bash 里参数要写双斜杠
+```
+
+> 如果渲染检查报 `SecurityError: Failed to read the 'localStorage' property`，那是**目标站不可达**——导航失败后页面停在 `about:blank`，而它的 origin 是 opaque 的，读写 localStorage 一律被拒。先去 `curl <base>/health` 确认服务起来了，别去改 localStorage 相关代码。
 
 ---
 
@@ -416,4 +427,11 @@ location / {
 
 ## 免责声明
 
-本项目仅用于学习与技术研究，对接的是第三方服务的 Web 端接口。使用者需自行确保其使用方式符合目标服务的使用条款及所在地法律法规，因使用本项目产生的任何后果由使用者自行承担。
+本项目仅用于**学习与技术研究**，对接的是第三方服务的 Web 端接口，而该服务并未提供公开 API。使用者需自行确保其使用方式符合目标服务的服务条款及所在地法律法规，因使用本项目产生的任何后果由使用者自行承担。
+
+需要明确知道的几件事：
+
+- **签名算法是从前端 bundle 里逆向出来的**，其中的静态盐值是硬编码的。上游随时可能更换算法或盐值，届时本项目会失效——这不是 bug，是这类项目的固有属性。
+- **批量使用账号可能触发上游的风控**，导致账号被限制或封禁。请只使用你自己的账号，并自行评估风险。
+- 请勿用于**商业转售、二次分发额度**或任何绕过付费的用途。
+- 本项目与 MiniMax 官方无任何关联，未获其授权或认可。
