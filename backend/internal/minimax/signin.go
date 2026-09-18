@@ -70,6 +70,11 @@ type SigninClaim struct {
 	DayNo      int   `json:"dayNo"`
 	Points     int   `json:"points"`
 	ExpireAtMs int64 `json:"expireAtMs"`
+	// Panel is the board as it looks *after* the claim, when the upstream
+	// includes it. It is the authoritative post-claim state: storing the panel
+	// fetched before the claim would leave today showing as unclaimed next to a
+	// "claimed" status, which is a self-contradicting console.
+	Panel *SigninPanel `json:"panel"`
 }
 
 // IsDuplicate reports the idempotent "today was already claimed" answer.
@@ -313,7 +318,14 @@ func (c *Client) SigninStatus(ctx context.Context, cred Credential) (*SigninPane
 	if err != nil {
 		return nil, err
 	}
-	core := coreOf(payload)
+	return parsePanel(coreOf(payload)), nil
+}
+
+// parsePanel decodes the seven-day board out of an envelope body.
+//
+// Shared by /signin/status and the panel the claim endpoint echoes back, so the
+// two cannot drift apart in how they read a day.
+func parsePanel(core map[string]any) *SigninPanel {
 	panel := &SigninPanel{Scene: intOf(core["scene"])}
 	days, _ := core["days"].([]any)
 	for _, entry := range days {
@@ -334,7 +346,7 @@ func (c *Client) SigninStatus(ctx context.Context, cred Credential) (*SigninPane
 			panel.ClaimedToday = day.Status == SigninDayClaimed
 		}
 	}
-	return panel, nil
+	return panel
 }
 
 // SigninClaim claims today's credits.
@@ -362,6 +374,11 @@ func (c *Client) SigninClaim(ctx context.Context, cred Credential) (*SigninClaim
 		DayNo:      intOf(core["day_no"]),
 		Points:     intOf(core["points"]),
 		ExpireAtMs: int64Of(core["expire_at_ms"]),
+	}
+	if node, ok := core["panel"].(map[string]any); ok {
+		if parsed := parsePanel(node); len(parsed.Days) > 0 {
+			claim.Panel = parsed
+		}
 	}
 	return claim, nil
 }

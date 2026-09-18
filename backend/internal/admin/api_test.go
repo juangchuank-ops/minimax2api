@@ -3,9 +3,13 @@ package admin
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"minimax2api/internal/config"
 	"minimax2api/internal/store"
 )
 
@@ -205,5 +209,73 @@ func TestDescribeTokenMasksSecret(t *testing.T) {
 	described := describeToken(token)
 	if len(token) > 16 && strings.Contains(described, token[:20]) {
 		t.Fatalf("describeToken leaked the token: %q", described)
+	}
+}
+
+// jsonKeys returns a struct's json field names, skipping anything untagged.
+func jsonKeys(t *testing.T, value any) map[string]bool {
+	t.Helper()
+	kind := reflect.TypeOf(value)
+	keys := make(map[string]bool, kind.NumField())
+	for i := range kind.NumField() {
+		name := strings.Split(kind.Field(i).Tag.Get("json"), ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		keys[name] = true
+	}
+	return keys
+}
+
+// getSettings builds its response by hand rather than marshalling config.Settings.
+// That is deliberate — the console must not receive every internal knob — but it
+// means a new setting is invisible to the console until someone remembers to add
+// it here. This test is that reminder: it would have caught `userInfoPath` going
+// missing, which is exactly the kind of omission that shows up as a blank field
+// in the settings page and nowhere else.
+func TestGetSettingsExposesEveryUpstreamAndServerField(t *testing.T) {
+	st, err := store.Open(t.TempDir(), "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	settings := config.DefaultSettings(t.TempDir())
+	api := &API{
+		store:    st,
+		settings: func() config.Settings { return settings },
+		started:  time.Now(),
+	}
+
+	recorder := httptest.NewRecorder()
+	api.getSettings(recorder, httptest.NewRequest("GET", "/admin/api/settings", nil))
+
+	var body map[string]map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v (body=%s)", err, recorder.Body.String())
+	}
+
+	// Only the two sections that are written out field by field; the rest are
+	// handed to the encoder wholesale and cannot drift.
+	cases := []struct {
+		section string
+		value   any
+	}{
+		{"server", settings.Server},
+		{"upstream", settings.Upstream},
+	}
+	for _, tc := range cases {
+		want := jsonKeys(t, tc.value)
+		got := body[tc.section]
+		for key := range want {
+			if _, ok := got[key]; !ok {
+				t.Errorf("%s is missing %q, so the console cannot show or edit it", tc.section, key)
+			}
+		}
+		for key := range got {
+			if !want[key] {
+				t.Errorf("%s exposes %q, which is not a field of the settings struct", tc.section, key)
+			}
+		}
 	}
 }

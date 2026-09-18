@@ -25,6 +25,7 @@ type Draft = {
   agentID: string;
   sessionPath: string;
   messagePath: string;
+  userInfoPath: string;
   modelPayload: string;
   language: string;
   screenWidth: number;
@@ -128,6 +129,7 @@ export function SettingsPage() {
           agentID: value.agentID,
           sessionPath: value.sessionPath,
           messagePath: value.messagePath,
+          userInfoPath: value.userInfoPath,
           modelPayload: value.modelPayload,
           language: value.language,
           screenWidth: value.screenWidth,
@@ -271,6 +273,13 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.messagePath}
               onChange={(event) => set("messagePath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.userInfoPath")} help={t("settings.upstream.userInfoPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.userInfoPath}
+              onChange={(event) => set("userInfoPath", event.target.value)}
             />
           </Field>
           <Field label={t("settings.upstream.modelPayload")} help={t("settings.upstream.modelPayloadHelp")}>

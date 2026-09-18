@@ -1167,7 +1167,45 @@ func (a *API) syncQuotaDetached(id string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	// Identity first. Every signed call needs the realUserID in its query, and
+	// the probe below is such a call — running it first would spend a request on
+	// a guaranteed 401.
+	a.resolveIdentity(ctx, id)
 	_ = a.syncQuota(ctx, id)
+}
+
+// resolveIdentity fills in an account's realUserID when it is missing.
+//
+// The value is not in the token and cannot be derived from it: the JWT carries
+// a different id under user.id, and sending that one is rejected exactly like
+// sending nothing. Without it every endpoint answers a bare 401, which is
+// indistinguishable from an expired token — so an account would be retired as
+// invalid while being perfectly healthy. Reading it from the upstream on add is
+// what keeps a bare token usable.
+//
+// Best effort by design: an operator who pasted a realUserID+token pair already
+// has the value, and a failure here (no proxy, unreachable upstream) should
+// surface as a probe error rather than block the account from being created.
+func (a *API) resolveIdentity(ctx context.Context, id string) {
+	account, ok := a.store.AccountByID(id)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(account.UserID) != "" && account.UserID != "0" {
+		return
+	}
+	info, err := a.client.FetchUserInfo(ctx, gateway.CredentialOf(account))
+	if err != nil || info == nil || info.RealUserID == "" {
+		return
+	}
+	label := strings.TrimSpace(account.Identifier)
+	if label == "" {
+		label = info.Label()
+	}
+	_, _ = a.store.UpdateAccounts([]string{id}, func(target *store.Account) {
+		target.UserID = info.RealUserID
+		target.Identifier = label
+	})
 }
 
 // syncQuota runs a minimal upstream call and stores the observed health.
@@ -1541,6 +1579,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 			"baseURL": settings.Upstream.BaseURL, "baseURLCN": settings.Upstream.BaseURLCN,
 			"agentID":     settings.Upstream.AgentID,
 			"sessionPath": settings.Upstream.SessionPath, "messagePath": settings.Upstream.MessagePath,
+			"userInfoPath": settings.Upstream.UserInfoPath,
 			"modelPayload": settings.Upstream.ModelPayload,
 			"language":     settings.Upstream.Language,
 			"screenWidth":  settings.Upstream.ScreenWidth, "screenHeight": settings.Upstream.ScreenHeight,

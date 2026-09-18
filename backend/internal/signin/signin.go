@@ -317,18 +317,63 @@ func (s *Service) checkAccount(ctx context.Context, account *store.Account) Acco
 		result.Credit = credit
 	}
 
+	// Prefer the board the upstream echoed back from the claim: it is the state
+	// *after* the claim. The panel fetched a moment earlier still shows today as
+	// unclaimed, and storing that would leave the console displaying "claimed"
+	// beside an empty dot for today.
+	stored := claim.Panel
+	if stored == nil {
+		stored = claimPanel(panel, claim)
+	}
+
 	s.record(account.ID, func(target *store.Account) {
 		target.SigninAt = time.Now()
 		target.SigninStatus = result.Status
 		target.SigninStreak = claim.DayNo
 		target.SigninPoints = claim.Points
 		target.SigninError = ""
-		target.SigninPanel = panelOf(panel)
+		target.SigninPanel = panelOf(stored)
 		if !claim.IsDuplicate() && claim.Points > 0 {
 			target.SigninTotal += int64(claim.Points)
 		}
 	})
 	return result
+}
+
+// claimPanel folds a claim onto the board fetched just before it.
+//
+// Fallback for when the claim response carries no panel of its own. The only
+// thing a claim changes is today's slot, and the claim response names that slot
+// explicitly, so there is nothing to guess at.
+//
+// A duplicate answer ("already claimed today") still means today is served. We
+// only reach the claim at all when the earlier board said it was not, so the
+// board was the stale one — trust the claim about the claim.
+func claimPanel(before *minimax.SigninPanel, claim *minimax.SigninClaim) *minimax.SigninPanel {
+	if before == nil {
+		return nil
+	}
+	after := &minimax.SigninPanel{
+		Scene:        before.Scene,
+		TodayDayNo:   before.TodayDayNo,
+		TodayPoints:  before.TodayPoints,
+		ClaimedToday: before.ClaimedToday,
+		Days:         append([]minimax.SigninDay(nil), before.Days...),
+	}
+	for i, day := range after.Days {
+		if day.IsToday || (claim.DayNo > 0 && day.DayNo == claim.DayNo) {
+			after.Days[i].Status = minimax.SigninDayClaimed
+			// A duplicate answer may not restate the points; keep what the board
+			// already said rather than blanking a day that was worth something.
+			if claim.Points > 0 {
+				after.Days[i].Points = claim.Points
+			}
+			after.ClaimedToday = true
+			after.TodayPoints = after.Days[i].Points
+			after.TodayDayNo = after.Days[i].DayNo
+		}
+	}
+	return after
 }
 
 // fail records an unsuccessful attempt. The attempt timestamp is written even
@@ -363,6 +408,14 @@ func skipReason(account *store.Account) string {
 	}
 	if strings.TrimSpace(account.Token) == "" || account.UUID == "" || account.DeviceID == "" {
 		return "缺少令牌或设备指纹"
+	}
+	// Every signed endpoint needs user_id, and the upstream answers a bare 401
+	// without it — the same 401 a dead token produces. Attempting the call would
+	// therefore retire a healthy account as invalid, so refuse before spending
+	// the request. The value is usually filled in automatically when the account
+	// is added; reaching here means that discovery failed.
+	if strings.TrimSpace(account.UserID) == "" || account.UserID == "0" {
+		return "缺少 user_id（realUserID），未从上游取得，无法签到"
 	}
 	return ""
 }

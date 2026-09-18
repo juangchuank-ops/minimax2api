@@ -266,3 +266,106 @@ func TestCoreOfUnwrapsData(t *testing.T) {
 		t.Errorf("coreOf should pass a flat payload through, got %#v", core)
 	}
 }
+
+// TestParsePanelReadsTheEchoedBoard covers the panel the claim endpoint sends
+// back. It is the post-claim state, so the scheduler stores it instead of the
+// board it fetched a moment earlier — which still shows today as unclaimed.
+//
+// The shape is the one observed live on 2026-09-19: the day the claim landed on
+// carries status 3 and is_today, while the untouched days keep status 1.
+func TestParsePanelReadsTheEchoedBoard(t *testing.T) {
+	panel := parsePanel(map[string]any{
+		"scene": float64(2),
+		"days": []any{
+			map[string]any{"day_no": float64(1), "points": float64(400),
+				"status": float64(3), "is_today": false},
+			map[string]any{"day_no": float64(2), "points": float64(400),
+				"status": float64(3), "is_today": true},
+			map[string]any{"day_no": float64(3), "points": float64(400),
+				"status": float64(1), "is_today": false},
+		},
+	})
+
+	if panel.Scene != 2 {
+		t.Errorf("scene = %d, want 2", panel.Scene)
+	}
+	if len(panel.Days) != 3 {
+		t.Fatalf("days = %d, want 3", len(panel.Days))
+	}
+	if !panel.ClaimedToday {
+		t.Error("today is status 3 in the payload, so ClaimedToday should be true")
+	}
+	if panel.TodayDayNo != 2 || panel.TodayPoints != 400 {
+		t.Errorf("today = day %d / %d points, want day 2 / 400",
+			panel.TodayDayNo, panel.TodayPoints)
+	}
+	if panel.Days[2].Status != SigninDayUnclaimed {
+		t.Errorf("day 3 status = %d, want %d (the panel must not blanket-mark days)",
+			panel.Days[2].Status, SigninDayUnclaimed)
+	}
+}
+
+// TestParsePanelWithoutADataWrapper guards the envelope assumption: the board
+// fields sit at the top level of the claim's panel object, not inside another
+// data envelope.
+func TestParsePanelWithoutADataWrapper(t *testing.T) {
+	panel := parsePanel(map[string]any{})
+	if panel == nil {
+		t.Fatal("parsePanel should never return nil for a valid envelope")
+	}
+	if len(panel.Days) != 0 {
+		t.Errorf("an empty payload should yield no days, got %d", len(panel.Days))
+	}
+	if panel.ClaimedToday {
+		t.Error("nothing was claimed, so ClaimedToday must stay false")
+	}
+}
+
+// TestScalarOfKeepsLargeIDsExact pins the reason realUserID has to be read as a
+// string.
+//
+// The fixture is 2^53+1 rather than a real account id: it is the smallest
+// integer a float64 cannot represent, so it demonstrates the loss without
+// putting anybody's account number in the repository.
+func TestScalarOfKeepsLargeIDsExact(t *testing.T) {
+	const id = "9007199254740993" // 2^53 + 1
+
+	if got := scalarOf(id); got != id {
+		t.Errorf("string form = %q, want it unchanged", got)
+	}
+	if got := scalarOf("  " + id + "  "); got != id {
+		t.Errorf("whitespace should be trimmed, got %q", got)
+	}
+	// A JSON number of that magnitude is already lossy by the time it reaches
+	// any, which is exactly why the upstream sends a string. Assert the loss so
+	// that if this ever changes, the reason is visible.
+	if got := scalarOf(float64(9007199254740993)); got == id {
+		t.Errorf("a float64 cannot hold this id exactly; got %q — the upstream "+
+			"must keep sending it as a string", got)
+	}
+	if got := scalarOf(float64(42)); got != "42" {
+		t.Errorf("small numbers should render without a decimal point, got %q", got)
+	}
+	if got := scalarOf(nil); got != "" {
+		t.Errorf("missing values should be empty, got %q", got)
+	}
+}
+
+// TestUserInfoLabelPrefersAName keeps the console from labelling an account
+// with a bare number when something friendlier is available.
+func TestUserInfoLabelPrefersAName(t *testing.T) {
+	cases := []struct {
+		info UserInfo
+		want string
+	}{
+		{UserInfo{Name: "林汐音", RealUserID: "557"}, "林汐音"},
+		{UserInfo{Email: "a@b.c", RealUserID: "557"}, "a@b.c"},
+		{UserInfo{Phone: "+8613800138000", RealUserID: "557"}, "+8613800138000"},
+		{UserInfo{RealUserID: "557"}, "557"},
+	}
+	for _, item := range cases {
+		if got := item.info.Label(); got != item.want {
+			t.Errorf("Label() = %q, want %q", got, item.want)
+		}
+	}
+}

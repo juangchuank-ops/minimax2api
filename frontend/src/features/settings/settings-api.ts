@@ -12,6 +12,7 @@ export type SettingsDTO = {
     agentID: string;
     sessionPath: string;
     messagePath: string;
+    userInfoPath: string;
     modelPayload: string;
     language: string;
     screenWidth: number;

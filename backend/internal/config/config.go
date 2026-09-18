@@ -116,11 +116,16 @@ type ServerSettings struct {
 // the international host. Routing each account to the right host is what makes
 // both kinds of accounts work in a single pool.
 type UpstreamSettings struct {
-	BaseURL              string `json:"baseURL"`
-	BaseURLCN            string `json:"baseURLCN"`
-	AgentID              string `json:"agentID"`
-	SessionPath          string `json:"sessionPath"`
-	MessagePath          string `json:"messagePath"`
+	BaseURL     string `json:"baseURL"`
+	BaseURLCN   string `json:"baseURLCN"`
+	AgentID     string `json:"agentID"`
+	SessionPath string `json:"sessionPath"`
+	MessagePath string `json:"messagePath"`
+	// UserInfoPath is where an account's realUserID can be read. Every signed
+	// endpoint demands that value in its query and answers a bare 401 without
+	// it, and it appears nowhere in the token — so this call is the only way an
+	// account added as a bare JWT can ever become usable.
+	UserInfoPath         string `json:"userInfoPath"`
 	ModelPayload         string `json:"modelPayload"`
 	Language             string `json:"language"`
 	ScreenWidth          int    `json:"screenWidth"`
@@ -169,6 +174,7 @@ func DefaultSettings(dataDir string) Settings {
 			AgentID:              "general",
 			SessionPath:          "/agent/{agent_id}/session",
 			MessagePath:          "/archon/api/v1/session/{session_id}/message",
+			UserInfoPath:         "/v1/api/user/info",
 			ModelPayload:         "",
 			Language:             "zh-CN,zh;q=0.9,en;q=0.8",
 			ScreenWidth:          1920,
@@ -251,6 +257,9 @@ func (s *Settings) Normalize(dataDir string) {
 	}
 	if s.Upstream.MessagePath == "" {
 		s.Upstream.MessagePath = def.Upstream.MessagePath
+	}
+	if s.Upstream.UserInfoPath == "" {
+		s.Upstream.UserInfoPath = def.Upstream.UserInfoPath
 	}
 	if s.Upstream.ScreenWidth <= 0 {
 		s.Upstream.ScreenWidth = def.Upstream.ScreenWidth

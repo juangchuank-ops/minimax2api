@@ -3,6 +3,7 @@ package signin
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,79 @@ func TestSweepClaimsWhenUnclaimed(t *testing.T) {
 	}
 }
 
+// TestStoredPanelReflectsTheClaim pins the board written after a claim.
+//
+// The panel is fetched *before* the claim, so storing it unchanged leaves the
+// console showing a claimed status beside an empty dot for today. The upstream
+// echoes a post-claim board in the claim response; when it does, that is what
+// must be stored, and when it does not, today's slot still has to be marked.
+func TestStoredPanelReflectsTheClaim(t *testing.T) {
+	t.Run("prefers the board the claim echoed back", func(t *testing.T) {
+		f := newFixture(t, defaultSettings())
+		echoed := claimedPanel()
+		// A scene the pre-claim fetch never returned, so the assertion can tell
+		// the two boards apart rather than accepting either.
+		echoed.Scene = 99
+		f.client.claim = &minimax.SigninClaim{Result: 1, DayNo: 1, Points: 400, Panel: echoed}
+
+		f.service.Sweep(context.Background())
+
+		account, _ := f.store.AccountByID(f.account.ID)
+		if account.SigninPanel == nil {
+			t.Fatal("panel should be persisted")
+		}
+		if account.SigninPanel.Scene != 99 {
+			t.Errorf("scene = %d, want 99 — the claim's board, not the earlier fetch",
+				account.SigninPanel.Scene)
+		}
+		if account.SigninPanel.Days[0].Status != 3 {
+			t.Errorf("today should read as claimed, got status %d", account.SigninPanel.Days[0].Status)
+		}
+	})
+
+	t.Run("marks today when the claim carries no board", func(t *testing.T) {
+		f := newFixture(t, defaultSettings())
+		f.client.claim = &minimax.SigninClaim{Result: 1, DayNo: 1, Points: 400}
+
+		f.service.Sweep(context.Background())
+
+		account, _ := f.store.AccountByID(f.account.ID)
+		if account.SigninPanel == nil {
+			t.Fatal("panel should be persisted")
+		}
+		if account.SigninPanel.Days[0].Status != 3 {
+			t.Errorf("today should be marked claimed, got status %d", account.SigninPanel.Days[0].Status)
+		}
+		if !account.SigninPanel.Days[0].IsToday {
+			t.Error("the marked slot should be the one flagged as today")
+		}
+		// The fallback must not invent changes to days it was not told about.
+		if account.SigninPanel.Days[1].Status != 1 {
+			t.Errorf("tomorrow should be untouched, got status %d", account.SigninPanel.Days[1].Status)
+		}
+	})
+
+	t.Run("a duplicate answer still marks the day", func(t *testing.T) {
+		// Reached when the board said "unclaimed" but the claim says otherwise.
+		// The claim is the authority on the claim, so the stale board loses.
+		f := newFixture(t, defaultSettings())
+		f.client.claim = &minimax.SigninClaim{
+			Result: minimax.SigninClaimDuplicate, DayNo: 1, Points: 400,
+		}
+
+		f.service.Sweep(context.Background())
+
+		account, _ := f.store.AccountByID(f.account.ID)
+		if account.SigninStatus != store.SigninAlready {
+			t.Errorf("status = %q, want %q", account.SigninStatus, store.SigninAlready)
+		}
+		if account.SigninPanel == nil || account.SigninPanel.Days[0].Status != 3 {
+			t.Errorf("a duplicate answer must not leave today looking unclaimed, got %#v",
+				account.SigninPanel)
+		}
+	})
+}
+
 // TestSweepSkipsClaimWhenAlreadyDone asserts the status call actually gates the
 // claim: claiming every day regardless would be a needless second request
 // against a risk-control sensitive endpoint.
@@ -247,6 +321,46 @@ func TestSweepSkipsMainlandAccounts(t *testing.T) {
 	}
 	if account.Status != store.StatusActive {
 		t.Errorf("skipping must not disturb the account's health, got %q", account.Status)
+	}
+}
+
+// TestSweepSkipsAccountsWithoutUserID guards against a destructive
+// misdiagnosis.
+//
+// The upstream answers a bare 401 both for a dead token and for a missing
+// user_id, and a 401 is what retires an account as invalid. Attempting the call
+// on an account whose realUserID was never resolved would therefore destroy a
+// healthy account. Refusing up front keeps the account intact and says why.
+func TestSweepSkipsAccountsWithoutUserID(t *testing.T) {
+	for _, missing := range []string{"", "0"} {
+		f := newFixture(t, defaultSettings())
+		f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
+			target.UserID = missing
+		})
+
+		report := f.service.Sweep(context.Background())
+
+		if report.Skipped != 1 {
+			t.Errorf("UserID=%q: skipped = %d, want 1", missing, report.Skipped)
+		}
+		if f.client.statusCall != 0 {
+			t.Errorf("UserID=%q: must not spend a request that is certain to 401, got %d calls",
+				missing, f.client.statusCall)
+		}
+
+		account, _ := f.store.AccountByID(f.account.ID)
+		if account.Status != store.StatusActive {
+			t.Errorf("UserID=%q: the account must not be retired, got status %q",
+				missing, account.Status)
+		}
+		if account.SigninStatus != store.SigninSkipped {
+			t.Errorf("UserID=%q: status = %q, want %q",
+				missing, account.SigninStatus, store.SigninSkipped)
+		}
+		if !strings.Contains(account.SigninError, "user_id") {
+			t.Errorf("UserID=%q: the reason should name the missing field, got %q",
+				missing, account.SigninError)
+		}
 	}
 }
 
