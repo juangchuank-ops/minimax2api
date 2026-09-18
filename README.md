@@ -341,9 +341,16 @@ python tools/fields.py --base http://127.0.0.1:8080 --password 你的密码
 
 ```bash
 # 先起一个带调试端口的 headless Chrome
+# macOS / Linux：
 chrome --headless=new --disable-gpu --no-first-run --no-default-browser-check \
        --remote-allow-origins=* --remote-debugging-port=9222 \
        --user-data-dir=/tmp/chrome-minimax about:blank
+
+# Windows（Git Bash）——--user-data-dir 必须用 Windows 路径，见下方说明：
+"/c/Program Files/Google/Chrome/Application/chrome.exe" --headless=new --disable-gpu \
+       --no-first-run --no-default-browser-check --remote-allow-origins=* \
+       --remote-debugging-port=9222 \
+       --user-data-dir="C:\Users\你的用户名\AppData\Local\Temp\chrome-minimax" about:blank
 
 node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码
 ```
