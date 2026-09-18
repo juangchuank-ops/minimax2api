@@ -362,6 +362,7 @@ tools/
   fields.py             DTO 字段契约检查（响应字段 / TS 类型）
   signin_e2e.py         签到 + 积分链路端到端（内置假上游）
   render.mjs            真实浏览器渲染检查（CDP，需本机 Chrome）
+  secret_scan.py        工作树 + 全历史密钥扫描（推送前跑）
 ```
 
 ### 持久化设计
@@ -468,6 +469,19 @@ taskkill //F //IM chrome.exe //T     # Git Bash 里参数要写双斜杠
 ```
 
 > 如果渲染检查报 `SecurityError: Failed to read the 'localStorage' property`，那是**目标站不可达**——导航失败后页面停在 `about:blank`，而它的 origin 是 opaque 的，读写 localStorage 一律被拒。先去 `curl <base>/health` 确认服务起来了，别去改 localStorage 相关代码。
+
+### 推送前：密钥扫描
+
+```bash
+python tools/secret_scan.py              # 工作树 + 全部历史（178 个 blob）
+python tools/secret_scan.py --tree-only  # 只扫工作树，够快，可以放进 pre-commit
+```
+
+这个仓库的历史上曾经躺着**一个可用的 MiniMax JWT**（旧 Python 版的 `config.json`，已清除）。所以扫描器**默认走完整历史**，而不只是当前工作树——`git filter-repo` 只重写你指给它的那些提交，密钥躺在**另一个文件**里就会被完整地漏过去，只有把每个可达 blob 都读一遍才知道结果。
+
+退出码为 1 表示有命中，可以直接用来卡住推送。**命中不等于真泄漏**：手工造的测试令牌和文档示例长得跟真凭据一模一样，所以脚本把每条命中（**打码后**）连同路径与 blob 一起打出来，由人判断。占位符（`your-…`、`admin12345`、i18n 里的 `password: "Password"`、桩令牌那种 4 字符签名）会被过滤掉——一个天天误报的扫描器会训练人无视它，那比不扫还糟。
+
+> 真出现命中时的处理顺序：**先吊销/轮换那个凭据**，这才是真正堵住口子的动作；重写历史是次要的，而且强推后的旧对象**仍可按 SHA 访问**，要等 GitHub Support 在服务端跑一次 GC 才真正消失。
 
 ---
 
