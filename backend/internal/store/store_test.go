@@ -1,6 +1,9 @@
 package store
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -269,5 +272,80 @@ func TestAccountByIDReturnsDetachedCopy(t *testing.T) {
 
 	if _, ok := st.AccountByID("nope"); ok {
 		t.Fatal("unknown id reported as found")
+	}
+}
+
+// --- repairing a settings file an older build wrote -------------------------
+
+// TestOpeningARepairedSettingsFileWritesTheRepairBack covers the half of a
+// settings migration that is easy to leave out.
+//
+// Normalize fixes the value in memory, which is enough to make the process work
+// — but the file keeps the old value, so the file describes a configuration the
+// process is not using. That disagreement is not cosmetic: it is precisely how a
+// broken default outlives a fix to the default, because the next reader sees a
+// perfectly ordinary-looking path and concludes the fix did not apply.
+func TestOpeningARepairedSettingsFileWritesTheRepairBack(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a settings file the way an earlier build would have left it: the
+	// whole default set written out, including the two values that cannot work.
+	//
+	// The rest of the state is seeded too, and that part is not decoration. An
+	// empty admin makes Open write a snapshot of its own while creating the
+	// account, which would carry the repaired settings to disk by accident and
+	// let this test pass with the write-back removed.
+	seeded := config.DefaultSettings(dir)
+	seeded.Upstream.SessionPath = "/agent/{agent_id}/session"
+	seeded.Upstream.AgentID = "general"
+	raw, err := json.Marshal(State{
+		Version:  schemaVersion,
+		Admin:    Admin{Username: "admin", Salt: "seeded", PasswordHash: "seeded"},
+		Settings: seeded,
+		Models:   BuiltinModels(),
+	})
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, stateFile), raw, 0o644); err != nil {
+		t.Fatalf("seed %s: %v", stateFile, err)
+	}
+
+	st, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// The live settings are repaired...
+	live := st.Settings()
+	if live.Upstream.SessionPath != config.DefaultSettings(dir).Upstream.SessionPath {
+		t.Errorf("live session path = %q, want it repaired", live.Upstream.SessionPath)
+	}
+	if live.Upstream.AgentID == "general" {
+		t.Errorf("live agent id is still the role name %q", live.Upstream.AgentID)
+	}
+
+	// ...and so is the file, which is what this test is about. The write is
+	// queued rather than immediate, so give the loop a moment.
+	var onDisk config.Settings
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		content, readErr := os.ReadFile(filepath.Join(dir, stateFile))
+		if readErr == nil {
+			var got State
+			if json.Unmarshal(content, &got) == nil {
+				onDisk = got.Settings
+				if onDisk.Upstream.SessionPath == live.Upstream.SessionPath &&
+					onDisk.Upstream.AgentID == live.Upstream.AgentID {
+					break
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the repair never reached %s: sessionPath=%q agentID=%q",
+				stateFile, onDisk.Upstream.SessionPath, onDisk.Upstream.AgentID)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

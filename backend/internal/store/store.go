@@ -89,7 +89,13 @@ func Open(dataDir, adminUser, adminPassword string) (*Store, error) {
 		store.state.Settings = config.DefaultSettings(dataDir)
 	}
 	store.state.Version = schemaVersion
-	store.state.Settings.Normalize(dataDir)
+	// A repair has to be written back, not just applied in memory: leaving the
+	// file describing a value the process is not using is exactly how a broken
+	// default survived a fix to the default itself. The write is queued here and
+	// picked up by the loop started below.
+	if store.state.Settings.Normalize(dataDir) {
+		store.markDirtyLocked()
+	}
 	store.settings.Store(store.state.Settings)
 	if len(store.state.Models) == 0 {
 		store.state.Models = BuiltinModels()

@@ -238,3 +238,45 @@ func TestTheDefaultAgentIDIsNotARoleName(t *testing.T) {
 		t.Errorf("the config default agent id is the role name %q", got)
 	}
 }
+
+// TestAgentIDIgnoresARoleName pins the read-time half of a repair that also
+// happens in Normalize.
+//
+// A settings file written by an earlier build holds `general` as the agent id,
+// because that was that build's default. The upstream answers a role name with a
+// 200 that opens no session, so using one makes every request look successful
+// and produce nothing. Ignoring it here means the stale value cannot take effect
+// even on an instance that has not been restarted through Normalize yet.
+func TestAgentIDIgnoresARoleName(t *testing.T) {
+	settings := config.DefaultSettings(t.TempDir())
+	settings.Upstream.AgentID = DefaultAgentRole
+
+	client := &Client{settings: func() config.Settings { return settings }}
+
+	// The account's own id is discovered, so it must win over the stale global.
+	if got := client.agentID(settings, Credential{AgentID: "443154487857417"}); got != "443154487857417" {
+		t.Errorf("agentID = %q, want the account's own id", got)
+	}
+	// With nothing discovered, the role name must not be handed back as an id —
+	// returning it is exactly the failure this guards.
+	if got := client.agentID(settings, Credential{}); got != "" {
+		t.Errorf("agentID = %q, want empty rather than the role name %q", got, DefaultAgentRole)
+	}
+	// A per-account value is not exempt: it came from the same settings file.
+	if got := client.agentID(settings, Credential{AgentID: DefaultAgentRole}); got != "" {
+		t.Errorf("agentID = %q, want empty rather than the role name", got)
+	}
+}
+
+// TestAgentIDKeepsARealID: the guard must reject role names without rejecting
+// ids that merely contain one.
+func TestAgentIDKeepsARealID(t *testing.T) {
+	for _, id := range []string{"443154487857417", "general-purpose-1", "0"} {
+		settings := config.DefaultSettings(t.TempDir())
+		settings.Upstream.AgentID = id
+		client := &Client{settings: func() config.Settings { return settings }}
+		if got := client.agentID(settings, Credential{}); got != id {
+			t.Errorf("agentID = %q, want the configured id %q kept", got, id)
+		}
+	}
+}

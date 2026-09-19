@@ -177,12 +177,20 @@ func (c *Client) baseURL(settings config.Settings, cred Credential) string {
 	return strings.TrimRight(settings.Upstream.BaseURL, "/")
 }
 
+// agentID resolves the agent to drive: the account's own id, else the global
+// setting, else the default.
+//
+// A role name is never an id, and is skipped rather than used. The upstream
+// answers one with a 200 that carries no session, so accepting `general` here
+// makes every request look successful and produce nothing — and a settings file
+// written by an earlier build holds exactly that value, because it was that
+// build's default. Skipping it means such a file cannot take effect even before
+// Normalize has repaired it.
 func (c *Client) agentID(settings config.Settings, cred Credential) string {
-	if cred.AgentID != "" {
-		return cred.AgentID
-	}
-	if settings.Upstream.AgentID != "" {
-		return settings.Upstream.AgentID
+	for _, candidate := range []string{cred.AgentID, settings.Upstream.AgentID} {
+		if id := strings.TrimSpace(candidate); id != "" && !isAgentRole(id) {
+			return id
+		}
 	}
 	return DefaultAgentID
 }

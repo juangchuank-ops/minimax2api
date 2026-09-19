@@ -27,6 +27,26 @@ const (
 // AgentID setting, which takes precedence over discovery.
 const DefaultAgentRole = "general"
 
+// knownAgentRoles are the agent *kinds* the upstream uses.
+//
+// They are listed rather than inferred because the distinction cannot be made
+// from the value alone: `general` is a perfectly ordinary-looking string and an
+// earlier build shipped it as the default agent id. The upstream answers it with
+// a 200 that opens no session, so accepting it makes every request look
+// successful and produce nothing.
+var knownAgentRoles = map[string]bool{
+	"general":  true,
+	"coder":    true,
+	"chat":     true,
+	"mavis":    true,
+	"verifier": true,
+}
+
+// isAgentRole reports whether value names an agent kind rather than an agent.
+func isAgentRole(value string) bool {
+	return knownAgentRoles[strings.ToLower(strings.TrimSpace(value))]
+}
+
 // Agent is one entry from an account's agent list.
 type Agent struct {
 	// ID is the numeric handle that every URL wants.

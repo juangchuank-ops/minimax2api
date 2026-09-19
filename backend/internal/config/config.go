@@ -179,6 +179,26 @@ type MediaSettings struct {
 	AutoDownload   bool   `json:"autoDownload"`
 }
 
+// Settings an earlier build shipped as its own defaults and that turned out to
+// be wrong. They are listed so Normalize can recognise and repair them.
+//
+// Repairing is necessary because Normalize otherwise only fills in *empty*
+// settings, and a fresh install freezes a copy of every default into the
+// settings file. A default that is later found to be wrong therefore stays wrong
+// on every existing install, with no symptom — which is how both of these
+// survived a fix to the defaults themselves.
+//
+// Neither value can work, so overwriting one is never a loss of intent:
+//
+//   - the session path resolves to the site's SPA fallback, which answers 200
+//     with a full page of HTML rather than a session;
+//   - `general` is an agent *role*, which the upstream answers with a 200 that
+//     opens no session at all.
+const (
+	legacyDefaultSessionPath = "/agent/{agent_id}/session"
+	legacyDefaultAgentID     = "general"
+)
+
 // DefaultSettings returns the built-in runtime configuration.
 func DefaultSettings(dataDir string) Settings {
 	return Settings{
@@ -264,7 +284,15 @@ func DefaultSettings(dataDir string) Settings {
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
 // Normalize repairs out-of-range values coming from a stored config file.
-func (s *Settings) Normalize(dataDir string) {
+// Normalize fills in absent settings and repairs the known-broken legacy
+// defaults, and reports whether it changed anything.
+//
+// The report matters because a repair that is not written back leaves the
+// settings file describing a configuration the process is not using — and a file
+// that disagrees with the running process is how a broken value survives a fix
+// in the first place.
+func (s *Settings) Normalize(dataDir string) bool {
+	before := *s
 	def := DefaultSettings(dataDir)
 	if s.Server.MaxConcurrentRequests <= 0 {
 		s.Server.MaxConcurrentRequests = def.Server.MaxConcurrentRequests
@@ -283,6 +311,16 @@ func (s *Settings) Normalize(dataDir string) {
 	}
 	if s.Upstream.SessionPath == "" {
 		s.Upstream.SessionPath = def.Upstream.SessionPath
+	}
+	// Repair the two known-broken legacy defaults. Kept next to the empty-value
+	// repairs above rather than in a version-keyed migration table, because there
+	// are two of them and a reader should be able to see at a glance what is
+	// being changed and why. See the constants for what each one costs.
+	if s.Upstream.SessionPath == legacyDefaultSessionPath {
+		s.Upstream.SessionPath = def.Upstream.SessionPath
+	}
+	if s.Upstream.AgentID == legacyDefaultAgentID {
+		s.Upstream.AgentID = def.Upstream.AgentID
 	}
 	if s.Upstream.MessagePath == "" {
 		s.Upstream.MessagePath = def.Upstream.MessagePath
@@ -410,6 +448,7 @@ func (s *Settings) Normalize(dataDir string) {
 	// place to get the same answer. The cost is that exactly-UTC is not
 	// expressible; every other offset is, and the upstream appears to use this
 	// value for reporting rather than for deciding when the day rolls over.
+	return *s != before
 }
 
 func (s Settings) Clone() Settings {
