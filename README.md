@@ -47,6 +47,7 @@ MiniMax 的国内站（`agent.minimaxi.com`）和国际站（`agent.minimax.io`�
 - 积分用完的账号在请求中**自动跳过**，不用手工停用
 - 单账号可手动「立即签到」/「刷新积分」，也可一键「全部签到」
 - 跳过的账号记 `skipped` 而不是 `failed`——**国内站账号会被明确跳过**，因为国内站的签到参数是另一套（用 `timezone_id` 而不是 `timezone_offset`），拿国际协议去签只会得到一个和「令牌失效」长得一模一样的拒绝
+- 领取前会先跑一遍 agent 侧初始化，领完再对一次账——**这两步都不是可选的**，省掉第一步积分会静默不到账，省掉第二步「报成功但没发」就永远看不见（见「上游初始化」与「签到与积分」）
 
 > 签到是**国际站专属**能力。国内站账号会被跳过并给出原因，而不是被判为失败。
 
@@ -57,6 +58,16 @@ MiniMax 的每个 API 请求都要带一个 `yy` 签名，而这个签名是**�
 - 加号时留空则自动生成一组自洽的指纹，大多数情况够用
 - 想复刻抓包到的原始会话，可以在「高级设置」里填真实值
 - 指纹不完整（缺 `uuid` 或 `device_id`）的账号会被判定为**不可调度**，而不是被选中后在上游失败
+
+> **两个字段的形状不一样，`device_id` 必须是纯数字。**
+>
+> 网页端把指纹放在两处：`localStorage.UNIQUE_USER_ID`（`uuid`，带横杠的 UUID）和 `sessionStorage.tab_device_id`（`device_id`，一个八位数字，bundle 在 sessionStorage 为空时的兜底是 `1e7 + rand(9e7)`）。上游对 `uuid` 宽容，对 `device_id` 不宽容：**非数字的 `device_id` 会让所有 `/minimax-cloud/…` 请求返回**
+>
+> ```
+> 400 {"error":"internal error","code":"UNEXPECTED_ERROR","base_resp":{"status_code":1406011050}}
+> ```
+>
+> 而这个报错**没有提到任何字段**，读起来像上游故障。更麻烦的是它**只影响 `/minimax-cloud/…`**：`/v1/api/user/info` 和签到端点照样 200。所以「签到一直好好的、一发消息就 400」正是它的表现——生成指纹时给两个字段共用一个 32 位 hex 生成器就会踩到这里。
 
 **管理台**
 - 仪表盘：调用量趋势、模型分布、账号排行、资源占用
@@ -178,7 +189,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 以下配置存在 `data/app.json` 里，可在管理台「系统设置」直接改，改完即时生效：
 
 - **服务**：最大并发请求数、管理员用户名
-- **上游**：国际站/国内站地址、默认 Agent ID、会话与消息路径、`model` 字段模板、默认屏幕尺寸、语言、请求超时、流空闲超时、**代理（国际站必填，见「出口 IP」）**、身份查询路径、User-Agent
+- **上游**：国际站/国内站地址、默认 Agent ID、会话与消息路径、**agent 列表 / 初始化 / 连接列表三条路径**、`model` 字段模板、默认屏幕尺寸、语言、请求超时、流空闲超时、**代理（国际站必填，见「出口 IP」）**、身份查询路径、User-Agent
 - **路由**：调度策略、冷却基数/上限、最大重试次数、容量等待、粘性会话 TTL、是否优先空闲账号
 - **审计**：保留天数、最大记录数、是否记录请求体、请求体长度上限
 - **媒体**：生成文件目录、公开访问前缀、总容量上限、是否自动转存
@@ -241,14 +252,35 @@ MiniMax Agent 没有公开 API，这里是把它 Web 端的调用方式复刻出
 
 排查时注意别被本地环境骗了：Windows / Git Bash 下如果设了 `http_proxy`，**连本机回环的请求也会被塞给代理**，`curl` 会显示连不上（`000`），看着像服务没起来。测本地端口记得加 `--noproxy '*'`。
 
+网关自己不会犯这个错：**发往回环地址的上游请求一律绕过代理**（`127.0.0.0/8`、`::1`、`localhost`）。代理是用来上外网的，而 `127.0.0.1` 按定义不在外网上；把它塞过去只会拿回一个**空 body 的 `502`**，同样读起来像上游挂了。私有网段（`10.x` 等）**不**绕过——那些地址往往正是要靠代理才能到达。
+
 ### 调用流程
 
 ```
-POST {base}/agent/{agent_id}/session          → 建会话，拿 session_id
-POST {base}/archon/api/v1/session/{id}/message → SSE 流，取 msg_content
+POST {base}/minimax-cloud/api/v1/agent/{agent_id}/session       → 建会话，拿 session_id
+POST {base}/archon/api/v1/session/{session_id}/message          → SSE 流，取 msg_content
 ```
 
 两条路径都能在「系统设置 → 上游」里改（`sessionPath` / `messagePath`，支持 `{agent_id}`、`{session_id}` 占位符）。
+
+**`{agent_id}` 是一个数字，不是角色名。** 上游把 agent 的*角色*（`general` / `coder` / `mavis` …）和它的*编号*分得很开：编号在 agent 列表的 `name` 字段里（这个字段名起得有误导性，它装的其实是数字 id，人类可读的名字在 `display_name` 里）。把 `general` 当 id 传上去，上游会回一个 **200 但不给你 `session_id`** —— 请求看起来完全成功，实际什么都没开。所以加号时后台会调 `GET /minimax-cloud/api/v1/agent` 把这个数字问回来，存在账号上；缺它的账号会被判定为**不可调度**，不会拿一个注定空转的请求去换一个假成功。
+
+### 上游初始化（`/config`）
+
+**发消息和签到之前，都必须先跑一遍 agent 侧的初始化序列**，顺序不能反：
+
+```
+GET /minimax-cloud/api/v1/config              ← 创建/激活账号在 agent 侧的用户记录
+GET /minimax-cloud/api/v1/agent               ← agent 列表（顺带拿到数字 id）
+GET /minimax-cloud/api/v1/channel/connections
+```
+
+两个后果，都很难自己查出来：
+
+- **不调它，新号发消息会 500**，错误文案是 `[1400010501] Environment Variables not configured` —— 通篇没提「你没初始化」，看着像环境变量配错了。
+- **顺序反了（先签到后 `/config`）积分会静默丢失，且事后补调救不回来。** 领取接口照样回 `claim_result=1`，所以失败和成功长得一模一样。所以签到流程里这一步失败会**直接跳过领取**并写明原因 —— 丢掉一天是可见、可重跑的；顺序错了则是丢掉一天还报成功。
+
+三条路径都能在「系统设置 → 上游」里改（`configPath` / `agentListPath` / `connectionsPath`）。
 
 ### 流式解析
 
@@ -275,7 +307,12 @@ MiniMax 的附件走的是带签名的上传通道，无法从外部复刻，因
 GET  {base}/minimax-cloud/api/v1/signin/status    → 七日面板与今日状态
 POST {base}/minimax-cloud/api/v1/signin/claim     → 领取（请求体固定为 {}）
 POST {base}/matrix/api/v1/commerce/get_membership_info → 剩余积分
+GET  {base}/minimax-cloud/api/v1/credit/details   → 发放明细（用于对账，见下）
 ```
+
+**顺序**：每次签到先跑一遍 agent 侧初始化序列（`/config` → `/agent` → `/channel/connections`），再读面板、再领取、再读余额。这一步不是仪式感，见上面「上游初始化」。
+
+**对账**：领取接口会回 `claim_result=1`，**不管积分有没有真的发下来**。所以领完之后会去 `credit/details` 看有没有一笔发放时间落在这次领取之后的记录——没有就标记 `unpaid` 并在控制台写明，让「报成功但没到账」这件事可见。判定看的是**发放时间**而不是余额：一笔被花到 0 的发放仍然证明积分到过账。发放列表有可见性延迟（实测超过一分钟），所以领完有一个宽限期，期内不下结论；这个标记是可撤销的，发放出现后会自动清掉。
 
 签到查询里的坑比普通请求多，这里记下三条，都是照着抓包逐字节对出来的：
 
@@ -347,7 +384,7 @@ backend/
   internal/config/      启动参数 + 运行时设置模型
   internal/store/       状态与持久化（含回归测试）
   internal/pool/        号池调度
-  internal/minimax/     上游协议客户端（签名、会话、SSE、令牌解析、签到/积分）
+  internal/minimax/     上游协议客户端（签名、会话、SSE、令牌解析、签到/积分、身份与 agent 发现）
   internal/signin/      每日签到调度 + 积分轮询（不含 HTTP，客户端注入）
   internal/gateway/     OpenAI 兼容层 + 限流
   internal/admin/       管理台 API
@@ -388,8 +425,9 @@ go vet ./...
 | --- | --- |
 | `internal/store` | 配置快照的并发读写、写锁内重入读配置（死锁回归）、快照隔离 |
 | `internal/pool` | 账号筛选（禁用/失效/无令牌/无指纹/冷却过期）、四种调度策略、粘性会话、退避与封顶 |
-| `internal/minimax` | 签名公式与逐字符的 `encodeURIComponent` 对照、query 顺序与编码、按区域选主机、SSE 帧解析（推理/正文分离、媒体收集、错误识别）、JWT 令牌解析、签到两条 query 串的差异（签名含 `op_ticket=undefined`、请求不含）、真实抓包的 `x-signature` 对照 |
-| `internal/signin` | 错过的时间点补签、重复领取记为「已签」、国内站账号跳过、失效令牌退役、失败也占掉当天（避免上游故障变成请求循环）、积分接口故障不牵连账号健康、扫描不可重入 |
+| `internal/minimax` | 签名公式与逐字符的 `encodeURIComponent` 对照、query 顺序与编码、按区域选主机、SSE 帧解析（推理/正文分离、媒体收集、错误识别）、JWT 令牌解析、签到两条 query 串的差异（签名含 `op_ticket=undefined`、请求不含）、真实抓包的 `x-signature` 对照、回环地址绕过代理、生成的 `device_id` 必须是纯数字、`uuid` 是 v4 UUID、会话响应是 HTML 页面时拒绝当成 `session_id`、`/config` 返回体决定 agent id、配置默认值不得与包内常量漂移 |
+| `internal/signin` | 错过的时间点补签、重复领取记为「已签」、国内站账号跳过、失效令牌退役、失败也占掉当天（避免上游故障变成请求循环）、积分接口故障不牵连账号健康、扫描不可重入、**初始化序列跑在领取之前且失败即跳过领取**、领取面板用上游回显的那一份、对账只认发放时间不认余额、宽限期内不下结论 |
+| `internal/admin` | 设置接口逐字段与 struct 的 json tag 比对（防新设置漏接线）、生成的指纹形状、区域推断、令牌解析 |
 | `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝 |
 | `internal/gateway`（上游桩） | 用 `httptest` 顶替上游，因此不需要真实令牌就能覆盖完整链路 |
 
@@ -410,7 +448,9 @@ python tools/smoke.py --base http://127.0.0.1:8080 --password 你的密码 --ski
 python tools/signin_e2e.py --base http://127.0.0.1:8080 --password 你的密码
 ```
 
-签到没有账号就测不了，所以这个脚本在**自己进程里**起一个假上游，把两个一次性账号的 `baseURL` 指过去，再从外部驱动真实的管理台接口。它验的是单测覆盖不到的那部分：两条 query 串在经过真实 HTTP 客户端之后仍然一条含 `op_ticket=undefined`、一条不含；余额确实是从 `op_credit_summary.total_remaining_amount` 读的（含它发字符串这件事）；零积分账号真的会离开调度池、而读数过期后又会回来；国内站账号是被跳过而不是被发错协议。
+签到没有账号就测不了，所以这个脚本在**自己进程里**起一个假上游，把两个一次性账号的 `baseURL` 指过去，再从外部驱动真实的管理台接口。它验的是单测覆盖不到的那部分：两条 query 串在经过真实 HTTP 客户端之后仍然一条含 `op_ticket=undefined`、一条不含；余额确实是从 `op_credit_summary.total_remaining_amount` 读的（含它发字符串这件事）；零积分账号真的会离开调度池、而读数过期后又会回来；国内站账号是被跳过而不是被发错协议；agent 侧初始化序列真的跑在领取**之前**；以及 `{agent_id}` 是从上游问回来的数字而不是角色名。
+
+> 假上游必须实现整条初始化序列（`/config`、`/agent`、`/channel/connections`）。签到流程第一步就是它，缺一个就会让每次签到都变成「初始化失败、跳过领取」——那是正确行为，但作为测试毫无信息量。这个坑踩过一次：加了初始化前置之后，`signin_e2e.py` 从 62/62 掉到 29/51，原因全在假上游。
 
 加 `--recon` 还能顺手做一次**跨实现签名对照**——把服务实际发出去的请求喂给逆向工作区那份独立验证过 12/12 的 Python 签名器，两个实现算出同一个 `yy` 才算过：
 
@@ -545,6 +585,21 @@ location / {
 
 **Q：流式响应是一坨出来的，不是逐字？**
 反代开了响应缓冲。参考上面的 Nginx 配置关掉 `proxy_buffering`。
+
+**Q：签到一直是好的，一发消息就 400 `internal error` / `errorCode 50001`？**
+先查 `device_id` 是不是纯数字。上游对 `uuid` 宽容、对 `device_id` 不宽容，而非数字的 `device_id` 只让 `/minimax-cloud/…` 挂掉，`/v1/api/user/info` 和签到端点照常 200 —— 所以表现就是「签到没事、聊天全废」。这个报错不点名任何字段，看着像上游故障。老版本给两个指纹字段共用一个 32 位 hex 生成器，正是这个坑；现在 `device_id` 固定生成八位数字（`uuid` 保持带横杠的 UUID）。已有账号在号池管理里编辑一下、清空 `device_id` 让系统重新生成即可。
+
+**Q：日志里是 `400 {"error":"internal error"...}` 或者 `400` 带一串 `status_code`？**
+和 `400 invalid signature` 不是一回事：**签名错会明说 `invalid signature`**。没说的 `400` 基本是请求里的某个字段格式不对——最典型的就是 `device_id` 非数字。别回头怀疑盐值。
+
+**Q：`/config` 是什么，为什么签到之前要调它？**
+agent 侧的初始化。不调它新号发消息会 500（报 `Environment Variables not configured`，文案完全误导）；而**签到前不调它、或者顺序反了，积分会静默丢失且事后补不回来**。所以网关把这条序列放在每次签到的最前面，失败就跳过领取并写明原因。详见「上游初始化」一节。
+
+**Q：`agentID` 填 `general` 行不行？**
+不行。`general` 是 agent 的*角色*，不是*编号*。传角色名上去上游会回 **200 但不返回 `session_id`** —— 请求看起来完全成功，实际什么都没开。加号时后台会自己去 `/minimax-cloud/api/v1/agent` 把数字编号问回来，一般不用手填。
+
+**Q：配了代理之后，指向本机/内网的上游地址连不上（空 body `502`）？**
+老版本会把发往回环地址的请求也塞给代理，而代理按定义到不了 `127.0.0.1`，于是返回一个空 body 的 `502`，读起来像上游挂了。现在回环地址（`127.0.0.0/8`、`::1`、`localhost`）一律绕过代理；私有网段不绕过，因为那些地址往往正是要靠代理才能到。
 
 **Q：上游改版后全部 404 / 400？**
 上游路径变了。重新抓一次包，在「系统设置 → 上游」里更新会话路径、消息路径和 `model` 字段模板，不用重新编译。

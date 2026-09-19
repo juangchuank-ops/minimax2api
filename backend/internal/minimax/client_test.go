@@ -185,11 +185,34 @@ func TestSessionIDFromAcceptsSeveralShapes(t *testing.T) {
 		{`{"data":{"sessionId":"c"}}`, "c"},
 		{`"d"`, "d"},
 		{``, ""},
-		{`not json`, "not json"},
+		{`   `, ""},
+		{`{"base_resp":{"status_code":0}}`, ""},
 	}
 	for _, tc := range cases {
 		if got := sessionIDFrom([]byte(tc.body)); got != tc.want {
 			t.Errorf("sessionIDFrom(%q) = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}
+
+// TestSessionIDFromRefusesAnythingButJSON pins the fix for a bug that hid
+// itself well: a wrong session path is answered by the SPA's catch-all route
+// with **200 and a page of HTML**, and the extractor used to return that page as
+// the session id. The result was a request URL containing an entire web page,
+// which the edge rejected with a 400 that read like an upstream block — so the
+// mistake pointed everywhere except at the path.
+//
+// Refusing to guess turns that into an honest failure at the source.
+func TestSessionIDFromRefusesAnythingButJSON(t *testing.T) {
+	cases := []string{
+		`<!DOCTYPE html><html><head><title>MiniMax</title></head></html>`,
+		`not json`,
+		`<html>`,
+		`{"unterminated":`,
+	}
+	for _, body := range cases {
+		if got := sessionIDFrom([]byte(body)); got != "" {
+			t.Errorf("sessionIDFrom(%.40q) = %q, want an empty id", body, got)
 		}
 	}
 }
@@ -273,5 +296,33 @@ func TestParseTokenWithoutClaims(t *testing.T) {
 	}
 	if info.Region != RegionGlobal {
 		t.Fatalf("region = %q, want the global default", info.Region)
+	}
+}
+
+// TestLoopbackHostsAreRecognised pins the decision that keeps a configured proxy
+// from swallowing a request to a local upstream.
+//
+// A proxy is set to reach the internet, and an upstream on 127.0.0.1 is not on
+// the internet. Routing it anyway gets `502` with an empty body back from the
+// proxy, which reads as the upstream being down — the failure gives no hint that
+// the request never left the machine.
+func TestLoopbackHostsAreRecognised(t *testing.T) {
+	loopback := []string{"127.0.0.1", "127.1.2.3", "localhost", "LOCALHOST", "::1"}
+	for _, host := range loopback {
+		if !isLoopbackHost(host) {
+			t.Errorf("isLoopbackHost(%q) = false, want true", host)
+		}
+	}
+	// The real upstreams, plus the shapes that merely look local.
+	remote := []string{
+		"agent.minimax.io", "agent.minimaxi.com",
+		"127.0.0.1.example.com", // resolves elsewhere despite the prefix
+		"10.0.0.1",              // private, but a proxy is the only way to reach it
+		"", "0.0.0.0",
+	}
+	for _, host := range remote {
+		if isLoopbackHost(host) {
+			t.Errorf("isLoopbackHost(%q) = true, want false", host)
+		}
 	}
 }

@@ -150,6 +150,10 @@ func (h *harness) addAccount(t *testing.T, name, token string, priority int) *st
 	account := &store.Account{
 		Name: name, Token: token, Region: store.RegionGlobal,
 		UUID: "uuid-" + name, DeviceID: "device-" + name,
+		// Prepared, because an account that is not is held out of rotation: a
+		// missing realUserID answers a bare 401, which this pool reads as a dead
+		// token, and a missing agent id opens no session at all.
+		UserID: "1", AgentID: "443154487857417",
 		Priority: priority, MaxConcurrent: 2, Enabled: true,
 	}
 	if err := h.store.AddAccount(account); err != nil {

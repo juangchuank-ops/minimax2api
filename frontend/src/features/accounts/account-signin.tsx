@@ -14,6 +14,7 @@ const STATUS_TONE: Record<AccountSigninStatus, string> = {
   already: "text-muted-foreground",
   failed: "text-destructive",
   skipped: "text-amber-500",
+  unpaid: "text-amber-500",
 };
 
 const STATUS_LABEL: Record<AccountSigninStatus, string> = {
@@ -22,6 +23,7 @@ const STATUS_LABEL: Record<AccountSigninStatus, string> = {
   already: "accounts.signinAlready",
   failed: "accounts.signinFailed",
   skipped: "accounts.signinSkipped",
+  unpaid: "accounts.signinUnpaid",
 };
 
 /**

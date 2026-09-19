@@ -43,6 +43,13 @@ const (
 	SigninAlready = "already" // upstream said today's credits were taken
 	SigninFailed  = "failed"
 	SigninSkipped = "skipped" // mainland account, disabled, or no fingerprint
+	// SigninUnpaid means the claim was accepted and the points never arrived.
+	//
+	// It is a distinct state because the claim endpoint cannot express it: it
+	// answers success either way. Only the credit grants can tell the two apart,
+	// and only well after the fact — the balance takes a minute to catch up, so
+	// this is decided by a later reading, never at claim time.
+	SigninUnpaid = "unpaid"
 )
 
 // SigninDay is one slot of the seven-day check-in cycle.

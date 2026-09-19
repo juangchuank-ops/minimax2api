@@ -255,18 +255,31 @@ func (c *Client) callSignin(ctx context.Context, settings config.Settings, cred 
 		return nil, err
 	}
 	defer resp.Body.Close()
+	return decodeJSONResponse(resp, "signin")
+}
 
+// decodeJSONResponse applies the rules every JSON endpoint on this upstream
+// shares, so the check-in and agent-side calls cannot disagree about what a
+// failure looks like.
+//
+// The order matters. A 401 is checked before the body is even read: the
+// upstream answers one with an empty body, and that is the only signal it
+// gives that the credential is dead.
+func decodeJSONResponse(resp *http.Response, label string) (map[string]any, error) {
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return nil, ErrInvalidCredential
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("minimax signin HTTP %d: %s", resp.StatusCode, snippet(raw))
+		return nil, fmt.Errorf("minimax %s HTTP %d: %s", label, resp.StatusCode, snippet(raw))
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("minimax signin 返回非 JSON: %s", snippet(raw))
+		// A 200 that is not JSON means the request never reached the API — the
+		// SPA's HTML shell is the usual culprit, and saying so saves the next
+		// person from reading a page of markup in a log.
+		return nil, fmt.Errorf("minimax %s 返回非 JSON: %s", label, snippet(raw))
 	}
 	if err := envelopeError(payload); err != nil {
 		return nil, err
@@ -425,6 +438,69 @@ func (c *Client) Credit(ctx context.Context, cred Credential) (*CreditInfo, erro
 	return info, nil
 }
 
+// ------------------------------------------------------------------ grants
+
+// DefaultCreditDetailsPath is the per-grant breakdown of an account's credits.
+const DefaultCreditDetailsPath = "/minimax-cloud/api/v1/credit/details"
+
+// CreditGrant is one batch of credits and the moment it was issued.
+//
+// The check-in payout appears here as a grant dated the day it was claimed, and
+// that is what makes a claim auditable. The claim endpoint answers
+// `claim_result=1` whether or not the points were ever issued — the failure is
+// silent by design — so the grant, not the claim, is the evidence that the
+// points arrived.
+type CreditGrant struct {
+	GrantedAt time.Time
+	ExpiresAt time.Time
+	// Granted is the amount issued and Remaining what is left of it.
+	//
+	// Reconciliation looks at GrantedAt rather than at these: a grant that has
+	// been spent down to zero still proves the points were issued, and an
+	// account that legitimately spent everything must not be reported as unpaid.
+	Granted   float64
+	Remaining float64
+}
+
+// CreditGrants reads the per-grant breakdown of an account's credits.
+//
+// GET, not POST — the POST form of this path answers 404, which is easy to
+// mistake for "the endpoint is gone".
+func (c *Client) CreditGrants(ctx context.Context, cred Credential) ([]CreditGrant, error) {
+	settings := c.settings()
+	ctx, cancel := context.WithTimeout(ctx, signinTimeout(settings))
+	defer cancel()
+
+	path := strings.TrimSpace(settings.Signin.CreditDetailsPath)
+	if path == "" {
+		path = DefaultCreditDetailsPath
+	}
+	payload, err := c.callSignin(ctx, settings, cred, http.MethodGet, path, "")
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := coreOf(payload)["details"].([]any)
+	if !ok {
+		// An account with no credits answers `{"total_count":0}` and omits the
+		// array entirely, so a missing list means empty, not broken.
+		return nil, nil
+	}
+	grants := make([]CreditGrant, 0, len(raw))
+	for _, item := range raw {
+		node, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		grants = append(grants, CreditGrant{
+			GrantedAt: timeFromMillis(node["granted_at_ms"]),
+			ExpiresAt: timeFromMillis(node["expire_at_ms"]),
+			Granted:   floatOf(node["granted_amount"]),
+			Remaining: floatOf(node["remaining_amount"]),
+		})
+	}
+	return grants, nil
+}
+
 // ------------------------------------------------------------------ helpers
 
 // signinTimeout bounds a check-in call. These endpoints answer immediately, so
@@ -501,6 +577,35 @@ func stringOf(value any) string {
 		return text
 	}
 	return ""
+}
+
+// floatOf reads a decimal that may arrive as a string or a number.
+//
+// The credit amounts come back quoted ("400.00") because they are money.
+func floatOf(value any) float64 {
+	switch node := value.(type) {
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(node), 64)
+		if err != nil {
+			return 0
+		}
+		return parsed
+	case float64:
+		return node
+	default:
+		return 0
+	}
+}
+
+// timeFromMillis reads an epoch-milliseconds field. A missing or unusable value
+// becomes the zero time rather than "now", so a caller comparing against it can
+// tell the difference between "no timestamp" and "just now".
+func timeFromMillis(value any) time.Time {
+	millis, ok := value.(float64)
+	if !ok || millis <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(millis))
 }
 
 func boolOf(value any) bool {

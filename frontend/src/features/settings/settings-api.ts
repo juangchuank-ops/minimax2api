@@ -13,6 +13,9 @@ export type SettingsDTO = {
     sessionPath: string;
     messagePath: string;
     userInfoPath: string;
+    agentListPath: string;
+    configPath: string;
+    connectionsPath: string;
     modelPayload: string;
     language: string;
     screenWidth: number;
@@ -63,6 +66,7 @@ export type SettingsDTO = {
     statusPath: string;
     claimPath: string;
     creditPath: string;
+    creditDetailsPath: string;
   };
   about: {
     version: string;

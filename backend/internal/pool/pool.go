@@ -196,6 +196,21 @@ func routable(account *store.Account, inflight int, now time.Time, settings conf
 	if account.Token == "" || account.UUID == "" || account.DeviceID == "" {
 		return false
 	}
+	// An account that has not been prepared is worse than unusable, because of
+	// how it fails.
+	//
+	// Without the realUserID every signed call answers a bare 401 — the same 401
+	// a dead token produces — and this pool retires an account that reports one.
+	// So routing an unprepared account would delete a healthy account from the
+	// pool. Without the agent id the session handshake answers 200 and opens
+	// nothing, which burns a request to learn nothing.
+	//
+	// Both are filled in when the account is added or probed; an account that
+	// still lacks them is held out of rotation rather than handed a request that
+	// can only produce a false verdict.
+	if account.UserID == "" || account.UserID == "0" || account.AgentID == "" {
+		return false
+	}
 	// A spent account is held out of rotation, but only while the reading is
 	// recent. Past CreditFresh the balance counts as unknown and the account is
 	// scheduled again: a day-old zero would otherwise strand capacity that a

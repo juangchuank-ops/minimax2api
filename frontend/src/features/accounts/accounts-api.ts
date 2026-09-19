@@ -28,8 +28,12 @@ export type AccountQuota = {
 /**
  * Outcome of the last daily check-in attempt. "" means it has never been tried,
  * which is a distinct state from "failed" and worth showing differently.
+ *
+ * "unpaid" is the one the upstream cannot report itself: the claim endpoint
+ * answers success whether or not the points were issued, so it is decided later
+ * from the credit grants.
  */
-export type AccountSigninStatus = "" | "ok" | "already" | "failed" | "skipped";
+export type AccountSigninStatus = "" | "ok" | "already" | "failed" | "skipped" | "unpaid";
 
 /** One slot of the seven-day check-in cycle. */
 export type SigninDay = {

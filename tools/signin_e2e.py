@@ -76,6 +76,14 @@ class MockUpstream:
         self.log: list[dict] = []
         self.credit = "0"
         self.claimed_today = True
+        # What `/v1/api/user/info` reports as the account's realUserID. Only
+        # consulted when an account is added without one — the value is not in
+        # the token and cannot be derived from it, so this endpoint is the only
+        # way a bare token becomes usable.
+        #
+        # A synthetic value, not a captured one: the id is past 2^53, so it also
+        # has to be carried as a string rather than a JSON number.
+        self.real_user_id = "9007199254740993"
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
@@ -154,6 +162,34 @@ class MockUpstream:
                         {"day_no": 6, "points": 400, "status": 1, "is_today": False},
                         {"day_no": 7, "points": 1000, "status": 1, "is_today": False},
                     ]}})
+                    return
+
+                # The agent-side opening sequence. The check-in flow runs it
+                # before the claim and refuses to claim if it fails, so a mock
+                # without these answers every check-in with "initialisation
+                # failed" — which is the correct behaviour and a useless test.
+                if path.endswith("/api/v1/config"):
+                    self._reply({"base_resp": {"status_code": 0, "status_msg": "ok"}, "models": []})
+                    return
+
+                if path.endswith("/api/v1/agent"):
+                    # `name` is the numeric handle, `agent_role` the kind — the
+                    # upstream's naming, not a mistake here.
+                    self._reply({"agents": [{
+                        "name": "443154487857417", "agent_role": "general",
+                        "root_session_id": "443155700445473",
+                    }]})
+                    return
+
+                if path.endswith("/channel/connections"):
+                    self._reply({"base_resp": {"status_code": 0, "status_msg": "ok"}})
+                    return
+
+                if path.endswith("/v1/api/user/info"):
+                    self._reply({"data": {"userInfo": {
+                        "realUserID": upstream.real_user_id,
+                        "name": "mock", "userID": "mock-handle",
+                    }}})
                     return
 
                 if path.endswith("/signin/claim"):
@@ -356,7 +392,7 @@ def main():
             "name": "e2e-global", "token": GLOBAL_TOKEN, "region": "global",
             "baseURL": mock_url, "userID": "123456",
             "uuid": "11111111-2222-3333-4444-555555555555",
-            "deviceID": "device-e2e-0001", "screenWidth": 1920, "screenHeight": 1080,
+            "deviceID": "41873026", "screenWidth": 1920, "screenHeight": 1080,
         })
         global_id = (created.get("account") or {}).get("id", "")
         check("global account created", status == 200 and bool(global_id), f"status={status}")
@@ -365,18 +401,41 @@ def main():
             "name": "e2e-cn", "token": CN_TOKEN, "region": "cn",
             "baseURL": mock_url, "userID": "654321",
             "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "deviceID": "device-e2e-0002", "screenWidth": 1920, "screenHeight": 1080,
+            "deviceID": "75201943", "screenWidth": 1920, "screenHeight": 1080,
         })
         cn_id = (created.get("account") or {}).get("id", "")
         check("mainland account created", status == 200 and bool(cn_id), f"status={status}")
         if not (global_id and cn_id):
             return 1
 
-        # Creating an account kicks off a detached probe that runs a full
-        # Completion, which the mock does not implement, so both accounts land
-        # in cooldown. Clear it, or the routing assertions below would be
-        # measuring the cooldown instead of the credit guard.
-        time.sleep(1.5)
+        # Creating an account kicks off a detached preparation that has to
+        # finish before the account is routable at all: without the realUserID
+        # every signed call answers a bare 401 (which the pool reads as a dead
+        # token), and without the agent id the session handshake answers 200 and
+        # opens nothing. Both are discovered from the upstream, so this waits for
+        # them rather than asserting on an account that is still being set up.
+        def wait_for_preparation(account_id, seconds=30):
+            deadline = time.time() + seconds
+            row = {}
+            while time.time() < deadline:
+                listing = console.call("GET", "/admin/api/accounts?pageSize=100")[1]
+                row = next((r for r in listing.get("items", []) if r.get("id") == account_id), {})
+                if row.get("agentID"):
+                    return row
+                time.sleep(0.5)
+            return row
+
+        global_row = wait_for_preparation(global_id)
+        cn_row = wait_for_preparation(cn_id)
+        check("the agent id is discovered, not assumed", bool(global_row.get("agentID")),
+              f"agentID={global_row.get('agentID')!r}")
+        check("the discovered agent id is not the role name",
+              global_row.get("agentID") not in ("", "general"), global_row.get("agentID"))
+
+        # The same detached preparation runs a full Completion, which the mock
+        # does not implement, so both accounts land in cooldown. Clear it, or the
+        # routing assertions below would be measuring the cooldown instead of the
+        # credit guard.
         console.call("POST", "/admin/api/accounts/batch",
                      {"action": "clearCooldown", "ids": [global_id, cn_id]})
         time.sleep(0.3)
@@ -387,7 +446,8 @@ def main():
         mock.set_credit("0")
         status, payload = console.call("POST", f"/admin/api/accounts/{global_id}/credit")
         credit = payload.get("credit") or {}
-        check("credit refresh succeeds", status == 200, f"status={status}")
+        check("credit refresh succeeds", status == 200,
+              f"status={status} body={json.dumps(payload, ensure_ascii=False)[:200] if status != 200 else ''}")
         check("balance read from the string field", credit.get("total") == 0,
               f"total={credit.get('total')!r} (the flat pre-migration fields also read 0)")
 

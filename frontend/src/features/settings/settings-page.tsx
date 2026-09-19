@@ -26,6 +26,9 @@ type Draft = {
   sessionPath: string;
   messagePath: string;
   userInfoPath: string;
+  agentListPath: string;
+  configPath: string;
+  connectionsPath: string;
   modelPayload: string;
   language: string;
   screenWidth: number;
@@ -72,6 +75,7 @@ type Draft = {
   signinStatusPath: string;
   signinClaimPath: string;
   signinCreditPath: string;
+  signinCreditDetailsPath: string;
 };
 
 function toDraft(settings: SettingsDTO): Draft {
@@ -102,6 +106,7 @@ function toDraft(settings: SettingsDTO): Draft {
     signinStatusPath: signin.statusPath,
     signinClaimPath: signin.claimPath,
     signinCreditPath: signin.creditPath,
+    signinCreditDetailsPath: signin.creditDetailsPath,
   };
 }
 
@@ -130,6 +135,9 @@ export function SettingsPage() {
           sessionPath: value.sessionPath,
           messagePath: value.messagePath,
           userInfoPath: value.userInfoPath,
+          agentListPath: value.agentListPath,
+          configPath: value.configPath,
+          connectionsPath: value.connectionsPath,
           modelPayload: value.modelPayload,
           language: value.language,
           screenWidth: value.screenWidth,
@@ -180,6 +188,7 @@ export function SettingsPage() {
           statusPath: value.signinStatusPath,
           claimPath: value.signinClaimPath,
           creditPath: value.signinCreditPath,
+          creditDetailsPath: value.signinCreditDetailsPath,
         },
         ...(value.adminPassword ? { adminPassword: value.adminPassword } : {}),
       }),
@@ -280,6 +289,27 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.userInfoPath}
               onChange={(event) => set("userInfoPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.agentListPath")} help={t("settings.upstream.agentListPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.agentListPath}
+              onChange={(event) => set("agentListPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.configPath")} help={t("settings.upstream.configPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.configPath}
+              onChange={(event) => set("configPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.connectionsPath")} help={t("settings.upstream.connectionsPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.connectionsPath}
+              onChange={(event) => set("connectionsPath", event.target.value)}
             />
           </Field>
           <Field label={t("settings.upstream.modelPayload")} help={t("settings.upstream.modelPayloadHelp")}>
@@ -544,6 +574,16 @@ export function SettingsPage() {
           </Field>
           <Field label={t("settings.signin.creditPath")} help={t("settings.signin.pathHelp")}>
             <Input value={draft.signinCreditPath} onChange={(event) => set("signinCreditPath", event.target.value)} />
+          </Field>
+          <Field
+            label={t("settings.signin.creditDetailsPath")}
+            help={t("settings.signin.creditDetailsPathHelp")}
+          >
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.signinCreditDetailsPath}
+              onChange={(event) => set("signinCreditDetailsPath", event.target.value)}
+            />
           </Field>
         </SettingsGroup>
 

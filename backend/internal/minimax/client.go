@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -31,15 +33,37 @@ const (
 // bundle is free to rename them; a capture that disagrees can be pasted into
 // the console without a rebuild.
 const (
-	DefaultSessionPath = "/agent/{agent_id}/session"
+	// DefaultSessionPath opens a conversation.
+	//
+	// The `/minimax-cloud/api/v1` prefix is load-bearing. Drop it and the
+	// request still answers **200 — with a page of the SPA's HTML** — because it
+	// lands on the Next.js catch-all route. Nothing about that response says
+	// "wrong path", so the mistake survives every check that only looks at the
+	// status code.
+	DefaultSessionPath = "/minimax-cloud/api/v1/agent/{agent_id}/session"
 	DefaultMessagePath = "/archon/api/v1/session/{session_id}/message"
 )
 
-// DefaultAgentID is the general-purpose agent the web client opens by default.
-const DefaultAgentID = "general"
+// DefaultAgentID is deliberately empty.
+//
+// The obvious-looking "general" is an agent *role*, not an id. The upstream
+// accepts it with a 200 that carries no session at all — a failure shaped
+// exactly like a success. The real id is a number (`443154487857417` for the
+// general agent of one account) and differs per account, so it is discovered
+// from the agent list rather than guessed. See Client.FetchAgents.
+const DefaultAgentID = ""
 
 // ErrInvalidCredential marks a token the upstream rejected.
 var ErrInvalidCredential = errors.New("minimax credential rejected")
+
+// ErrAgentIDUnknown marks an account whose agent id has not been resolved yet.
+//
+// It is separate from ErrInvalidCredential on purpose. Both look like "this
+// account cannot be used", but one is the token's fault and the other is a
+// missing piece of preparation — and the pool retires an account that reports
+// the first. An account that has simply never been prepared must not be
+// retired for it.
+var ErrAgentIDUnknown = errors.New("minimax agent id unknown")
 
 // MediaRef is a generated image or video returned inside the SSE stream.
 type MediaRef struct {
@@ -260,13 +284,40 @@ func (c *Client) do(req *http.Request, settings config.Settings) (*http.Response
 	}
 	client := &http.Client{
 		Transport: &http.Transport{
-			Proxy:               http.ProxyURL(proxyURL),
+			Proxy: func(target *http.Request) (*url.URL, error) {
+				// Loopback never goes through the proxy.
+				//
+				// A proxy is configured to reach the internet, and an upstream
+				// on 127.0.0.1 is by definition not there. Sending it anyway
+				// hands the request to a proxy that cannot reach it and gets
+				// back `502` with an empty body — which reads as the upstream
+				// being down rather than as a misrouted request. That is
+				// exactly how a local test upstream fails when the console has
+				// a proxy set, and it is worth being correct about beyond the
+				// test: a per-account base URL pointing at a local mirror is a
+				// supported thing to configure.
+				if isLoopbackHost(target.URL.Hostname()) {
+					return nil, nil
+				}
+				return proxyURL, nil
+			},
 			MaxIdleConns:        64,
 			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
 	return client.Do(req)
+}
+
+// isLoopbackHost reports whether a host names the local machine.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // ------------------------------------------------------------ session create
@@ -280,6 +331,12 @@ func (c *Client) CreateSession(ctx context.Context, cred Credential) (string, er
 	settings := c.settings()
 	if strings.TrimSpace(cred.Token) == "" {
 		return "", ErrInvalidCredential
+	}
+	// Refuse before spending a request. An empty agent id makes the URL
+	// `/…/agent//session`, which the SPA catch-all answers with HTML and a 200 —
+	// so the call would "succeed" while producing nothing usable.
+	if agentID := c.agentID(settings, cred); strings.TrimSpace(agentID) == "" {
+		return "", fmt.Errorf("%w: agent id unknown; the account has not been prepared", ErrAgentIDUnknown)
 	}
 	rawURL := c.buildURL(settings, cred, sessionPath(settings), "")
 
@@ -309,7 +366,15 @@ func (c *Client) CreateSession(ctx context.Context, cred Credential) (string, er
 		return "", fmt.Errorf("minimax session HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 
-	return sessionIDFrom(body), nil
+	id := sessionIDFrom(body)
+	if id == "" {
+		// A 200 without a session id is never a usable session: either the path
+		// is wrong (an HTML shell came back) or the agent id is one the upstream
+		// does not recognise. Say so, because the response itself will not.
+		return "", fmt.Errorf("minimax session: no session id in the response (path %q, agent %q): %s",
+			sessionPath(settings), c.agentID(settings, cred), snippet(body))
+	}
+	return id, nil
 }
 
 // sessionIDFrom digs a session identifier out of a create-session response.
@@ -322,12 +387,18 @@ func sessionIDFrom(body []byte) string {
 	if trimmed == "" {
 		return ""
 	}
-	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
-		return strings.Trim(trimmed, `"`)
-	}
 	var parsed any
 	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		// Not JSON at all. A wrong path is answered with the SPA's HTML shell
+		// and a 200, and treating that page as the session id builds a URL out
+		// of an entire web page — which the edge then rejects with a 400 that
+		// looks like an upstream block rather than a bug on this side. Refuse
+		// to guess instead.
 		return ""
+	}
+	// A bare JSON string is a legitimate shape for this field upstream.
+	if text, ok := parsed.(string); ok {
+		return strings.TrimSpace(text)
 	}
 	for _, key := range []string{"session_id", "sessionId", "id", "sessionID"} {
 		if found := deepString(parsed, key); found != "" {

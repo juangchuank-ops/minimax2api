@@ -99,6 +99,10 @@ type SigninSettings struct {
 	StatusPath string `json:"statusPath"`
 	ClaimPath  string `json:"claimPath"`
 	CreditPath string `json:"creditPath"`
+	// CreditDetailsPath lists each credit grant separately. It is what makes a
+	// check-in auditable: the claim endpoint reports success whether or not the
+	// points were issued, so the grant is the only evidence they arrived.
+	CreditDetailsPath string `json:"creditDetailsPath"`
 }
 
 type ServerSettings struct {
@@ -125,7 +129,22 @@ type UpstreamSettings struct {
 	// endpoint demands that value in its query and answers a bare 401 without
 	// it, and it appears nowhere in the token — so this call is the only way an
 	// account added as a bare JWT can ever become usable.
-	UserInfoPath         string `json:"userInfoPath"`
+	UserInfoPath string `json:"userInfoPath"`
+	// AgentListPath is where an account's agents are listed. It is what turns
+	// the `general` *role* into the numeric agent *id* every URL needs; without
+	// it a session cannot be opened at all.
+	AgentListPath string `json:"agentListPath"`
+	// ConfigPath is the agent-side initialisation call. A freshly registered
+	// account refuses to answer messages until it has run once, and says so
+	// with a message about environment variables that mentions none of this.
+	//
+	// It also has to run before a check-in, not after: a claim made before the
+	// account's agent-side record exists is registered and never paid out, and
+	// running the sequence afterwards does not recover it.
+	ConfigPath string `json:"configPath"`
+	// ConnectionsPath completes the opening sequence the web client runs when
+	// it opens the agent page.
+	ConnectionsPath      string `json:"connectionsPath"`
 	ModelPayload         string `json:"modelPayload"`
 	Language             string `json:"language"`
 	ScreenWidth          int    `json:"screenWidth"`
@@ -169,12 +188,21 @@ func DefaultSettings(dataDir string) Settings {
 			AdminUsername:         "admin",
 		},
 		Upstream: UpstreamSettings{
-			BaseURL:              "https://agent.minimax.io",
-			BaseURLCN:            "https://agent.minimaxi.com",
-			AgentID:              "general",
-			SessionPath:          "/agent/{agent_id}/session",
+			BaseURL:   "https://agent.minimax.io",
+			BaseURLCN: "https://agent.minimaxi.com",
+			// Empty on purpose: `general` is an agent *role*, not an id, and the
+			// upstream accepts it with a 200 that opens no session. The real id
+			// is a per-account number, discovered when the account is prepared.
+			AgentID: "",
+			// Must agree with minimax.DefaultSessionPath — this package cannot
+			// import it (the dependency runs the other way), so the agreement is
+			// pinned by a test in the minimax package instead.
+			SessionPath:          "/minimax-cloud/api/v1/agent/{agent_id}/session",
 			MessagePath:          "/archon/api/v1/session/{session_id}/message",
 			UserInfoPath:         "/v1/api/user/info",
+			AgentListPath:        "/minimax-cloud/api/v1/agent",
+			ConfigPath:           "/minimax-cloud/api/v1/config",
+			ConnectionsPath:      "/minimax-cloud/api/v1/channel/connections",
 			ModelPayload:         "",
 			Language:             "zh-CN,zh;q=0.9,en;q=0.8",
 			ScreenWidth:          1920,
@@ -228,6 +256,7 @@ func DefaultSettings(dataDir string) Settings {
 			StatusPath:        "/minimax-cloud/api/v1/signin/status",
 			ClaimPath:         "/minimax-cloud/api/v1/signin/claim",
 			CreditPath:        "/matrix/api/v1/commerce/get_membership_info",
+			CreditDetailsPath: "/minimax-cloud/api/v1/credit/details",
 		},
 	}
 }
@@ -260,6 +289,15 @@ func (s *Settings) Normalize(dataDir string) {
 	}
 	if s.Upstream.UserInfoPath == "" {
 		s.Upstream.UserInfoPath = def.Upstream.UserInfoPath
+	}
+	if s.Upstream.AgentListPath == "" {
+		s.Upstream.AgentListPath = def.Upstream.AgentListPath
+	}
+	if s.Upstream.ConfigPath == "" {
+		s.Upstream.ConfigPath = def.Upstream.ConfigPath
+	}
+	if s.Upstream.ConnectionsPath == "" {
+		s.Upstream.ConnectionsPath = def.Upstream.ConnectionsPath
 	}
 	if s.Upstream.ScreenWidth <= 0 {
 		s.Upstream.ScreenWidth = def.Upstream.ScreenWidth
@@ -362,6 +400,9 @@ func (s *Settings) Normalize(dataDir string) {
 	}
 	if s.Signin.CreditPath == "" {
 		s.Signin.CreditPath = def.Signin.CreditPath
+	}
+	if s.Signin.CreditDetailsPath == "" {
+		s.Signin.CreditDetailsPath = def.Signin.CreditDetailsPath
 	}
 	// TimezoneOffsetMin is deliberately not repaired here. A stored 0 cannot be
 	// told apart from an absent field, and signinParams already maps 0 onto the

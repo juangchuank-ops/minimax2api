@@ -3,7 +3,6 @@ package admin
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -580,11 +579,11 @@ func buildAccount(payload accountPayload) (*store.Account, error) {
 
 	uuid := strings.TrimSpace(payload.UUID)
 	if uuid == "" {
-		uuid = newFingerprint()
+		uuid = newUUID()
 	}
 	deviceID := strings.TrimSpace(payload.DeviceID)
 	if deviceID == "" {
-		deviceID = newFingerprint()
+		deviceID = newDeviceID()
 	}
 
 	enabled := true
@@ -611,13 +610,58 @@ func buildAccount(payload accountPayload) (*store.Account, error) {
 	}, nil
 }
 
-// newFingerprint produces a device identifier in the shape the site uses.
-func newFingerprint() string {
+// newUUID produces the value the site keeps in `localStorage.UNIQUE_USER_ID`.
+//
+// The site generates a dashed UUID there, and while the upstream does not appear
+// to validate its shape, matching the real one costs nothing and keeps a
+// generated fingerprint indistinguishable from a captured one.
+func newUUID() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%d%08x", time.Now().UnixNano(), time.Now().UnixNano()&0xffffffff)
+		return fallbackDeviceID()
 	}
-	return hex.EncodeToString(buf)
+	// Version 4 and the RFC 4122 variant, so the value parses as a UUID anywhere
+	// it is fed back into a UUID parser.
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+// newDeviceID produces the value the site keeps in `sessionStorage.tab_device_id`.
+//
+// It has to be **all digits**, and that is not cosmetic. The upstream parses it
+// as a number and answers
+//
+//	400 {"error":"internal error","errorCode":50001,"base_resp":{"status_code":1406011050}}
+//
+// for anything else — including a 32-character hex string, which is what this
+// used to generate for both fields. The error names nothing, so it reads as an
+// upstream outage rather than a malformed field, and it only affects the
+// `/minimax-cloud/…` family: `/v1/api/user/info` and the check-in endpoints
+// accept a hex value, which is why check-in worked while every agent-side call
+// failed.
+//
+// The bundle falls back to `1e7 + rand(9e7)` when sessionStorage is empty, so
+// eight digits is the shape to match. Any digit string is accepted — a measured
+// 4-digit, 8-digit and 12-digit value all answered 200 — but the site's own
+// fallback is the least surprising choice.
+func newDeviceID() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fallbackDeviceID()
+	}
+	// 10000000..99999999, i.e. always eight digits with no leading zero.
+	span := uint64(0)
+	for _, b := range buf {
+		span = span<<8 | uint64(b)
+	}
+	return strconv.FormatUint(10_000_000+span%90_000_000, 10)
+}
+
+// fallbackDeviceID is the last resort when the system CSPRNG fails. It is still
+// digits, because a non-numeric value is rejected outright.
+func fallbackDeviceID() string {
+	return strconv.FormatInt(10_000_000+time.Now().UnixNano()%90_000_000, 10)
 }
 
 // defaultAccountName labels an account by what it is registered with, which is
@@ -1062,13 +1106,21 @@ func (a *API) exportAccounts(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) probeAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	account, ok := a.store.AccountByID(id)
-	if !ok {
+	if _, ok := a.store.AccountByID(id); !ok {
 		writeError(w, http.StatusNotFound, "账号不存在")
 		return
 	}
 	probeCtx, cancel := context.WithTimeout(r.Context(), probeTimeout(a.settings()))
 	defer cancel()
+	// The probe is the console's remedy for a half-configured account, so it has
+	// to prepare one first — otherwise the button that should fix an account is
+	// the one that reports it broken.
+	a.prepareAccount(probeCtx, id)
+	account, ok := a.store.AccountByID(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
 	started := time.Now()
 	_, err := a.client.Probe(probeCtx, gateway.CredentialOf(account))
 	latency := time.Since(started).Milliseconds()
@@ -1108,7 +1160,15 @@ func (a *API) probeAll(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), probeTimeout(a.settings()))
-		_, err := a.client.Probe(ctx, gateway.CredentialOf(account))
+		a.prepareAccount(ctx, account.ID)
+		// Re-read: preparation may have just supplied the user id and the agent
+		// id, and this loop's copy predates that.
+		current, ok := a.store.AccountByID(account.ID)
+		if !ok {
+			cancel()
+			continue
+		}
+		_, err := a.client.Probe(ctx, gateway.CredentialOf(current))
 		cancel()
 		if err != nil {
 			unhealthy++
@@ -1135,6 +1195,9 @@ func (a *API) probeAll(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) refreshQuota(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Prepare first, for the same reason the probe does: refreshing an account
+	// that was never prepared would just report it as broken.
+	a.prepareAccount(r.Context(), id)
 	if err := a.syncQuota(r.Context(), id); err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -1149,6 +1212,7 @@ func (a *API) quotaAll(w http.ResponseWriter, r *http.Request) {
 		if !account.Enabled {
 			continue
 		}
+		a.prepareAccount(r.Context(), account.ID)
 		if err := a.syncQuota(r.Context(), account.ID); err != nil {
 			failed++
 			continue
@@ -1167,45 +1231,82 @@ func (a *API) syncQuotaDetached(id string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	// Identity first. Every signed call needs the realUserID in its query, and
-	// the probe below is such a call — running it first would spend a request on
-	// a guaranteed 401.
-	a.resolveIdentity(ctx, id)
+	// Preparation first. Every signed call needs the realUserID in its query,
+	// the probe below is such a call, and it cannot open a session until the
+	// agent id is known — running it first would spend requests on calls that
+	// are guaranteed to fail.
+	a.prepareAccount(ctx, id)
 	_ = a.syncQuota(ctx, id)
 }
 
-// resolveIdentity fills in an account's realUserID when it is missing.
+// prepareAccount fills in everything an account needs before it can hold a
+// conversation, and runs the agent-side opening sequence.
 //
-// The value is not in the token and cannot be derived from it: the JWT carries
-// a different id under user.id, and sending that one is rejected exactly like
-// sending nothing. Without it every endpoint answers a bare 401, which is
-// indistinguishable from an expired token — so an account would be retired as
-// invalid while being perfectly healthy. Reading it from the upstream on add is
-// what keeps a bare token usable.
+// Three things happen here, in this order:
 //
-// Best effort by design: an operator who pasted a realUserID+token pair already
-// has the value, and a failure here (no proxy, unreachable upstream) should
+//  1. realUserID. Every signed call needs it in its query and answers a bare
+//     401 without it — indistinguishable from an expired token, so an account
+//     would be retired as invalid while being perfectly healthy. It is not in
+//     the token and cannot be derived from it: the JWT carries a *different* id
+//     under user.id, and sending that one is rejected exactly like sending
+//     nothing.
+//  2. `/config`, the agent-side initialisation. A freshly registered account
+//     answers messages with "Environment Variables not configured" until the
+//     web client has opened the agent page once, and that message mentions
+//     none of this.
+//  3. The agent id. The upstream's agent *roles* are names (`general`) but the
+//     id in every URL is a number, and the role name is accepted with a 200
+//     that opens no session — so guessing it yields a failure shaped like a
+//     success.
+//
+// Best effort by design: an operator who pasted a prepared account already has
+// these values, and a failure here (no proxy, unreachable upstream) should
 // surface as a probe error rather than block the account from being created.
-func (a *API) resolveIdentity(ctx context.Context, id string) {
+func (a *API) prepareAccount(ctx context.Context, id string) {
 	account, ok := a.store.AccountByID(id)
 	if !ok {
 		return
 	}
-	if strings.TrimSpace(account.UserID) != "" && account.UserID != "0" {
-		return
+	cred := gateway.CredentialOf(account)
+
+	if strings.TrimSpace(account.UserID) == "" || account.UserID == "0" {
+		info, err := a.client.FetchUserInfo(ctx, cred)
+		if err != nil || info == nil || info.RealUserID == "" {
+			// Nothing below can succeed without the id: the query would carry
+			// user_id=0 and every call would come back 401. Stop here rather
+			// than spend requests to collect failures.
+			return
+		}
+		label := strings.TrimSpace(account.Identifier)
+		if label == "" {
+			label = info.Label()
+		}
+		if _, err := a.store.UpdateAccounts([]string{id}, func(target *store.Account) {
+			target.UserID = info.RealUserID
+			target.Identifier = label
+		}); err != nil {
+			return
+		}
+		// Re-read: the calls below sign a query built from the account, and the
+		// copy in hand still carries the empty user id.
+		if refreshed, ok := a.store.AccountByID(id); ok {
+			account = refreshed
+			cred = gateway.CredentialOf(account)
+		}
 	}
-	info, err := a.client.FetchUserInfo(ctx, gateway.CredentialOf(account))
-	if err != nil || info == nil || info.RealUserID == "" {
-		return
+
+	// The agent-side opening sequence. Idempotent and cheap, and it is both what
+	// lets a brand new account answer a message at all and what has to have
+	// happened before any check-in can pay out.
+	prepared, _ := a.client.Prepare(ctx, cred)
+
+	if strings.TrimSpace(account.AgentID) == "" {
+		if agentID := prepared.AgentID(); agentID != "" {
+			_, _ = a.store.UpdateAccounts([]string{id}, func(target *store.Account) {
+				target.AgentID = agentID
+			})
+		}
 	}
-	label := strings.TrimSpace(account.Identifier)
-	if label == "" {
-		label = info.Label()
-	}
-	_, _ = a.store.UpdateAccounts([]string{id}, func(target *store.Account) {
-		target.UserID = info.RealUserID
-		target.Identifier = label
-	})
 }
 
 // syncQuota runs a minimal upstream call and stores the observed health.
@@ -1579,10 +1680,13 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 			"baseURL": settings.Upstream.BaseURL, "baseURLCN": settings.Upstream.BaseURLCN,
 			"agentID":     settings.Upstream.AgentID,
 			"sessionPath": settings.Upstream.SessionPath, "messagePath": settings.Upstream.MessagePath,
-			"userInfoPath": settings.Upstream.UserInfoPath,
-			"modelPayload": settings.Upstream.ModelPayload,
-			"language":     settings.Upstream.Language,
-			"screenWidth":  settings.Upstream.ScreenWidth, "screenHeight": settings.Upstream.ScreenHeight,
+			"userInfoPath":    settings.Upstream.UserInfoPath,
+			"agentListPath":   settings.Upstream.AgentListPath,
+			"configPath":      settings.Upstream.ConfigPath,
+			"connectionsPath": settings.Upstream.ConnectionsPath,
+			"modelPayload":    settings.Upstream.ModelPayload,
+			"language":        settings.Upstream.Language,
+			"screenWidth":     settings.Upstream.ScreenWidth, "screenHeight": settings.Upstream.ScreenHeight,
 			"requestTimeoutSec":    settings.Upstream.RequestTimeoutSec,
 			"streamIdleTimeoutSec": settings.Upstream.StreamIdleTimeoutSec,
 			"proxy":                settings.Upstream.Proxy, "userAgent": settings.Upstream.UserAgent,

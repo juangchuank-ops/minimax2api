@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -92,8 +94,17 @@ func TestBuildAccountGeneratesFingerprint(t *testing.T) {
 	// The signature covers uuid and device_id, so an account without them can
 	// never be routed. Generating a self-consistent pair is what makes a bare
 	// token paste work.
-	if len(account.UUID) != 32 || len(account.DeviceID) != 32 {
-		t.Fatalf("fingerprint = %q / %q, want 32 hex chars each", account.UUID, account.DeviceID)
+	//
+	// The two fields have *different* shapes, and this test used to assert the
+	// opposite — 32 hex characters each — because one generator was used for
+	// both. That assertion is what kept the defect invisible: it described the
+	// implementation instead of the upstream, so it passed while every
+	// `/minimax-cloud/…` call failed with an error that named no field.
+	if _, err := strconv.Atoi(account.DeviceID); err != nil {
+		t.Fatalf("device id %q is not a number: %v", account.DeviceID, err)
+	}
+	if !strings.Contains(account.UUID, "-") {
+		t.Fatalf("uuid = %q, want the site's dashed UUID shape", account.UUID)
 	}
 	if account.UUID == account.DeviceID {
 		t.Fatal("uuid and device_id should not be identical")
@@ -277,5 +288,68 @@ func TestGetSettingsExposesEveryUpstreamAndServerField(t *testing.T) {
 				t.Errorf("%s exposes %q, which is not a field of the settings struct", tc.section, key)
 			}
 		}
+	}
+}
+
+// --- generated device fingerprints -----------------------------------------
+
+// TestGeneratedDeviceIDIsAllDigits pins the one property the upstream checks.
+//
+// A device id that is not a number answers
+//
+//	400 {"error":"internal error","errorCode":50001,"base_resp":{"status_code":1406011050}}
+//
+// on every `/minimax-cloud/…` call, and nothing in that response says which
+// field is wrong — it reads as an upstream outage. The check-in endpoints and
+// `/v1/api/user/info` accept anything, so a wrong value here fails exactly the
+// requests that were never exercised against the real server.
+func TestGeneratedDeviceIDIsAllDigits(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		got := newDeviceID()
+		if _, err := strconv.Atoi(got); err != nil {
+			t.Fatalf("device id %q is not a number: %v", got, err)
+		}
+		// The site's own fallback is `1e7 + rand(9e7)`, so eight digits and no
+		// leading zero. Any digit string is accepted, but matching the site
+		// keeps a generated value indistinguishable from a captured one.
+		if len(got) != 8 {
+			t.Fatalf("device id %q has %d digits, want 8", got, len(got))
+		}
+		if got[0] == '0' {
+			t.Fatalf("device id %q has a leading zero, so it renders as fewer than eight digits", got)
+		}
+	}
+}
+
+// TestGeneratedUUIDLooksLikeAUUID: the upstream tolerates any string here, but a
+// value in the site's own shape is worth keeping — a future stricter check
+// should not be able to tell a generated fingerprint from a captured one.
+func TestGeneratedUUIDLooksLikeAUUID(t *testing.T) {
+	pattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	seen := make(map[string]bool, 200)
+	for i := 0; i < 200; i++ {
+		got := newUUID()
+		if !pattern.MatchString(got) {
+			t.Fatalf("uuid %q is not a v4 UUID", got)
+		}
+		if seen[got] {
+			t.Fatalf("uuid %q was generated twice", got)
+		}
+		seen[got] = true
+	}
+}
+
+// TestTheTwoFingerprintFieldsAreNotInterchangeable guards the actual defect: one
+// generator was used for both fields, so the device id came out as 32 hex
+// characters. Sharing a generator is the obvious-looking thing to do and is
+// wrong.
+func TestTheTwoFingerprintFieldsAreNotInterchangeable(t *testing.T) {
+	device := newDeviceID()
+	if strings.ContainsAny(device, "abcdef") {
+		t.Errorf("the device id %q contains hex letters, so it is not a number", device)
+	}
+	uuid := newUUID()
+	if _, err := strconv.Atoi(uuid); err == nil {
+		t.Errorf("the uuid %q parses as a number; the two fields have different shapes", uuid)
 	}
 }

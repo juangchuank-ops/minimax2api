@@ -11,6 +11,7 @@ package signin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -28,6 +29,12 @@ type Client interface {
 	SigninStatus(ctx context.Context, cred minimax.Credential) (*minimax.SigninPanel, error)
 	SigninClaim(ctx context.Context, cred minimax.Credential) (*minimax.SigninClaim, error)
 	Credit(ctx context.Context, cred minimax.Credential) (*minimax.CreditInfo, error)
+	// Prepare runs the agent-side opening sequence. It has to happen before a
+	// claim rather than after — see checkAccount for what goes wrong otherwise.
+	Prepare(ctx context.Context, cred minimax.Credential) (*minimax.PrepareResult, error)
+	// CreditGrants reads the per-grant breakdown, which is the only evidence
+	// that a claimed payout was actually issued.
+	CreditGrants(ctx context.Context, cred minimax.Credential) ([]minimax.CreditGrant, error)
 }
 
 // AccountResult is one account's outcome within a sweep.
@@ -269,6 +276,28 @@ func (s *Service) checkAccount(ctx context.Context, account *store.Account) Acco
 
 	cred := s.credOf(account)
 	timeout := s.settings().SigninTimeout()
+
+	// The agent-side opening sequence runs first — before the status read as well
+	// as before the claim, matching the order the web client uses.
+	//
+	// `/config` is what creates the account's record on the agent side. A claim
+	// made before that record exists is registered and never paid out: the
+	// endpoint still answers `claim_result=1`, so the failure is completely
+	// silent, and running the sequence afterwards does not bring the points
+	// back. Measured on fresh accounts, the correct order paid out 4/4 times
+	// (within seconds) while the reverse order left two accounts at zero for
+	// good.
+	//
+	// So a failure here stops the check-in. Losing a day to a visible failure is
+	// recoverable — the operator can re-run the sweep — whereas a claim in the
+	// wrong order loses the day and reports success.
+	prepareCtx, cancelPrepare := context.WithTimeout(ctx, timeout)
+	_, prepareErr := s.client.Prepare(prepareCtx, cred)
+	cancelPrepare()
+	if prepareErr != nil {
+		return s.fail(account, result, fmt.Errorf("agent 侧初始化失败，已跳过领取以免积分静默丢失: %w", prepareErr))
+	}
+
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -298,6 +327,7 @@ func (s *Service) checkAccount(ctx context.Context, account *store.Account) Acco
 		return result
 	}
 
+	// The opening sequence already ran, above the status read.
 	claimCtx, cancelClaim := context.WithTimeout(ctx, timeout)
 	defer cancelClaim()
 	claim, err := s.client.SigninClaim(claimCtx, cred)
@@ -438,6 +468,88 @@ func panelOf(panel *minimax.SigninPanel) *store.SigninPanel {
 	return out
 }
 
+// ---------------------------------------------------------------- reconciling
+
+// reconcileGrace is how long a payout is given to show up after a claim.
+//
+// The grant list lags the claim. A payout has been observed as fast as zero
+// seconds, but a reading taken five seconds later still showed nothing and one
+// case took over a minute to appear. Judging any sooner than this would report a
+// perfectly healthy check-in as unpaid.
+const reconcileGrace = 5 * time.Minute
+
+// reconcile decides whether today's claimed points were actually issued.
+//
+// The claim endpoint cannot answer this. It reports `claim_result=1` whether or
+// not the points were ever created — when the account's agent-side record did
+// not exist at claim time they are dropped, silently and permanently — so the
+// only evidence is a credit grant dated today.
+//
+// The decision reads the grant's *timestamp*, never its balance. An account that
+// legitimately spent everything still has the grant, and must not be reported as
+// unpaid for having used what it was given.
+//
+// Costs one request per account per balance refresh, and only while a claim is
+// outstanding for the current day; the balance poller is off by default.
+func (s *Service) reconcile(ctx context.Context, account *store.Account) {
+	if account.Region != store.RegionGlobal || account.SigninAt.IsZero() {
+		return
+	}
+	switch account.SigninStatus {
+	case store.SigninOK, store.SigninAlready, store.SigninUnpaid:
+	default:
+		return
+	}
+	// Only today's claim is judgeable: a grant list cannot say which day a
+	// missing payout belonged to, and yesterday's is already beyond recovery.
+	if !sameLocalDay(account.SigninAt, time.Now()) {
+		return
+	}
+	if time.Since(account.SigninAt) < reconcileGrace {
+		return
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
+	defer cancel()
+	grants, err := s.client.CreditGrants(callCtx, s.credOf(account))
+	if err != nil {
+		// A read failure says nothing about the payout. Leave the state alone
+		// rather than flagging an account on a hiccup.
+		return
+	}
+
+	for _, grant := range grants {
+		if sameLocalDay(grant.GrantedAt, account.SigninAt) {
+			// Paid. Clear a flag set by an earlier pass, which is possible
+			// because the grant can take a minute to appear. The distinction
+			// between ok and already is not worth preserving here; the claim is
+			// confirmed either way.
+			if account.SigninStatus == store.SigninUnpaid {
+				s.record(account.ID, func(target *store.Account) {
+					target.SigninStatus = store.SigninOK
+					target.SigninError = ""
+				})
+			}
+			return
+		}
+	}
+
+	s.record(account.ID, func(target *store.Account) {
+		target.SigninStatus = store.SigninUnpaid
+		target.SigninError = "签到返回成功，但上游没有发放积分：credit/details 里没有今天的发放记录（顺序或风控问题，次日重试）"
+	})
+}
+
+// sameLocalDay reports whether two instants fall on the same calendar day.
+func sameLocalDay(a, b time.Time) bool {
+	if a.IsZero() || b.IsZero() {
+		return false
+	}
+	ay, am, ad := a.Local().Date()
+	by, bm, bd := b.Local().Date()
+	return ay == by && am == bm && ad == bd
+}
+
 // ------------------------------------------------------------------- credit
 
 // refreshCredit reads the balance and stores it, returning the new total or -1
@@ -450,6 +562,10 @@ func (s *Service) refreshCredit(ctx context.Context, account *store.Account) int
 	if account.Region != store.RegionGlobal {
 		return -1
 	}
+	// Independent of the balance read: a claim that paid out is worth confirming
+	// even when the balance endpoint is unhappy.
+	s.reconcile(ctx, account)
+
 	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
 	defer cancel()
 
@@ -475,6 +591,7 @@ func (s *Service) RefreshCredit(ctx context.Context, id string) (*store.Credit, 
 	if account.Region != store.RegionGlobal {
 		return nil, errors.New("余额接口仅支持国际站账号")
 	}
+	s.reconcile(ctx, account)
 	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
 	defer cancel()
 

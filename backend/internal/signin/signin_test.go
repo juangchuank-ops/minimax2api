@@ -25,9 +25,41 @@ type stubClient struct {
 	creditErr  error
 	statusCall int
 	claimCall  int
+
+	// prepareErr makes the agent-side opening sequence fail.
+	prepareErr error
+	// grants is what CreditGrants returns; nil means "no grants".
+	grants []minimax.CreditGrant
+	// grantsErr makes the grant read fail.
+	grantsErr error
+	// prepared records that the opening sequence ran, and calls records the
+	// order of every upstream call so the sequence can be asserted rather than
+	// assumed.
+	prepared bool
+	calls    []string
+}
+
+func (s *stubClient) note(name string) { s.calls = append(s.calls, name) }
+
+func (s *stubClient) Prepare(context.Context, minimax.Credential) (*minimax.PrepareResult, error) {
+	s.note("prepare")
+	s.prepared = true
+	if s.prepareErr != nil {
+		return nil, s.prepareErr
+	}
+	return &minimax.PrepareResult{}, nil
+}
+
+func (s *stubClient) CreditGrants(context.Context, minimax.Credential) ([]minimax.CreditGrant, error) {
+	s.note("grants")
+	if s.grantsErr != nil {
+		return nil, s.grantsErr
+	}
+	return s.grants, nil
 }
 
 func (s *stubClient) SigninStatus(context.Context, minimax.Credential) (*minimax.SigninPanel, error) {
+	s.note("status")
 	s.statusCall++
 	if s.statusErr != nil {
 		return nil, s.statusErr
@@ -36,6 +68,7 @@ func (s *stubClient) SigninStatus(context.Context, minimax.Credential) (*minimax
 }
 
 func (s *stubClient) SigninClaim(context.Context, minimax.Credential) (*minimax.SigninClaim, error) {
+	s.note("claim")
 	s.claimCall++
 	if s.claimErr != nil {
 		return nil, s.claimErr
@@ -44,6 +77,7 @@ func (s *stubClient) SigninClaim(context.Context, minimax.Credential) (*minimax.
 }
 
 func (s *stubClient) Credit(context.Context, minimax.Credential) (*minimax.CreditInfo, error) {
+	s.note("credit")
 	if s.creditErr != nil {
 		return nil, s.creditErr
 	}
@@ -466,5 +500,191 @@ func TestRefreshCreditParsesStoredValue(t *testing.T) {
 	account, _ := f.store.AccountByID(f.account.ID)
 	if account.Credit == nil || account.Credit.Total != 1234 {
 		t.Errorf("credit should be persisted, got %#v", account.Credit)
+	}
+}
+
+// --- the agent-side opening sequence ---------------------------------------
+
+// TestClaimWaitsForTheOpeningSequence pins an ordering rule that is easy to get
+// wrong and impossible to notice once it is.
+//
+// The sequence creates the account's record on the agent side. A claim made
+// before that record exists is registered and never paid out, while the endpoint
+// still answers "success" — so getting the order wrong costs the day and looks
+// exactly like getting it right.
+func TestClaimWaitsForTheOpeningSequence(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+
+	f.service.Sweep(context.Background())
+
+	want := "prepare,status,claim,credit"
+	if got := strings.Join(f.client.calls, ","); got != want {
+		t.Errorf("upstream call order = %q, want %q", got, want)
+	}
+	if !f.client.prepared {
+		t.Error("the opening sequence never ran")
+	}
+}
+
+// TestAFailedOpeningSequenceSkipsTheClaim is the safety half of that rule.
+//
+// If the sequence cannot run, the claim is not attempted at all. A skipped day
+// is visible and re-runnable; a claim in the wrong order loses the day and
+// reports success, which is strictly worse.
+func TestAFailedOpeningSequenceSkipsTheClaim(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	f.client.prepareErr = errors.New("upstream unreachable")
+
+	report := f.service.Sweep(context.Background())
+
+	if f.client.claimCall != 0 {
+		t.Errorf("claim was attempted %d times despite a failed opening sequence", f.client.claimCall)
+	}
+	if f.client.statusCall != 0 {
+		t.Errorf("the status read was attempted %d times; nothing past the sequence can be trusted",
+			f.client.statusCall)
+	}
+	if report.Failed != 1 {
+		t.Errorf("failed = %d, want 1", report.Failed)
+	}
+	account, _ := f.store.AccountByID(f.account.ID)
+	if account.SigninStatus != store.SigninFailed {
+		t.Errorf("status = %q, want %q", account.SigninStatus, store.SigninFailed)
+	}
+	if !strings.Contains(account.SigninError, "初始化") {
+		t.Errorf("the reason should name the opening sequence, got %q", account.SigninError)
+	}
+	if account.Status != store.StatusActive {
+		t.Errorf("an unreachable upstream is not a dead token; status = %q", account.Status)
+	}
+}
+
+// --- reconciling -----------------------------------------------------------
+
+// claimAgo backdates the account's last claim so the reconciliation grace period
+// has elapsed.
+func claimAgo(t *testing.T, f *fixture, d time.Duration, status string) {
+	t.Helper()
+	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
+		target.SigninAt = time.Now().Add(-d)
+		target.SigninStatus = status
+	})
+}
+
+// TestReconcileFlagsAClaimThatNeverPaidOut pins the only defence against the
+// silent failure the claim endpoint is capable of: it reports success whether or
+// not the points were ever issued, so the credit grants are the only evidence
+// that they were.
+func TestReconcileFlagsAClaimThatNeverPaidOut(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	claimAgo(t, f, 30*time.Minute, store.SigninOK)
+	f.client.grants = nil
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	f.service.reconcile(context.Background(), account)
+
+	updated, _ := f.store.AccountByID(f.account.ID)
+	if updated.SigninStatus != store.SigninUnpaid {
+		t.Errorf("status = %q, want %q", updated.SigninStatus, store.SigninUnpaid)
+	}
+	if !strings.Contains(updated.SigninError, "credit/details") {
+		t.Errorf("the note should say where to look, got %q", updated.SigninError)
+	}
+}
+
+// TestReconcileReadsTheGrantTimestampNotTheBalance keeps a thrifty account from
+// being reported as unpaid: a grant that has been spent down to zero still
+// proves the points arrived, and using them is not the same as never getting
+// them.
+func TestReconcileReadsTheGrantTimestampNotTheBalance(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	claimAgo(t, f, 30*time.Minute, store.SigninOK)
+	f.client.grants = []minimax.CreditGrant{
+		{GrantedAt: time.Now().Add(-29 * time.Minute), Granted: 400, Remaining: 0},
+	}
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	f.service.reconcile(context.Background(), account)
+
+	updated, _ := f.store.AccountByID(f.account.ID)
+	if updated.SigninStatus != store.SigninOK {
+		t.Errorf("a fully spent grant still proves the payout; status = %q", updated.SigninStatus)
+	}
+}
+
+// TestReconcileWaitsForThePayoutToAppear guards against the false alarm the
+// visibility delay would otherwise cause. The grant list lags the claim — one
+// measured payout took over a minute to show up — so judging straight after a
+// claim reports healthy check-ins as unpaid.
+func TestReconcileWaitsForThePayoutToAppear(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	claimAgo(t, f, time.Minute, store.SigninOK)
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	f.service.reconcile(context.Background(), account)
+
+	if len(f.client.calls) != 0 {
+		t.Errorf("inside the grace period nothing should be read, got %v", f.client.calls)
+	}
+	updated, _ := f.store.AccountByID(f.account.ID)
+	if updated.SigninStatus != store.SigninOK {
+		t.Errorf("status = %q, want it left alone", updated.SigninStatus)
+	}
+}
+
+// TestReconcileOnlyJudgesTodaysClaim: a grant list cannot say which day a
+// missing payout belonged to, and an older one is already beyond recovery.
+func TestReconcileOnlyJudgesTodaysClaim(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	claimAgo(t, f, 30*time.Hour, store.SigninOK)
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	f.service.reconcile(context.Background(), account)
+
+	if len(f.client.calls) != 0 {
+		t.Errorf("yesterday's claim is not judgeable, got %v", f.client.calls)
+	}
+}
+
+// TestReconcileClearsAFlagWhenTheGrantTurnsUp: the flag can be set by a pass
+// that ran before the payout became visible, so it has to be retractable.
+func TestReconcileClearsAFlagWhenTheGrantTurnsUp(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	claimAgo(t, f, 30*time.Minute, store.SigninUnpaid)
+	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
+		target.SigninError = "an earlier pass gave up too early"
+	})
+	f.client.grants = []minimax.CreditGrant{
+		{GrantedAt: time.Now().Add(-30 * time.Minute), Granted: 400, Remaining: 400},
+	}
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	f.service.reconcile(context.Background(), account)
+
+	updated, _ := f.store.AccountByID(f.account.ID)
+	if updated.SigninStatus != store.SigninOK {
+		t.Errorf("status = %q, want the flag cleared", updated.SigninStatus)
+	}
+	if updated.SigninError != "" {
+		t.Errorf("the note should be cleared with it, got %q", updated.SigninError)
+	}
+}
+
+// TestReconcileIgnoresAReadFailure: a hiccup in the grant endpoint says nothing
+// about whether the points arrived, so it must not raise the flag.
+func TestReconcileIgnoresAReadFailure(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	claimAgo(t, f, 30*time.Minute, store.SigninOK)
+	f.client.grantsErr = errors.New("upstream unreachable")
+
+	account, _ := f.store.AccountByID(f.account.ID)
+	f.service.reconcile(context.Background(), account)
+
+	updated, _ := f.store.AccountByID(f.account.ID)
+	if updated.SigninStatus != store.SigninOK {
+		t.Errorf("status = %q, want it left alone", updated.SigninStatus)
+	}
+	if updated.SigninError != "" {
+		t.Errorf("a failed read must not write a note, got %q", updated.SigninError)
 	}
 }

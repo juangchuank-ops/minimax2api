@@ -63,8 +63,13 @@ func (f *fixture) addAccountWith(t *testing.T, id string, priority int, token st
 		// A credential is only routable when it carries a fingerprint too, so
 		// the helper derives a deterministic one from the id. Tests that need a
 		// half-formed account build it by hand.
-		UUID:          "uuid-" + id,
-		DeviceID:      "device-" + id,
+		UUID:     "uuid-" + id,
+		DeviceID: "device-" + id,
+		// Prepared, like any account the console has finished adding: every
+		// signed call needs the realUserID, and a session cannot be opened
+		// without the agent id, so an account missing either is unroutable.
+		UserID:        "1",
+		AgentID:       "443154487857417",
 		Enabled:       true,
 		Priority:      priority,
 		MaxConcurrent: maxConcurrent,
@@ -225,6 +230,8 @@ func TestRoutableTreatsZeroMaxConcurrentAsOne(t *testing.T) {
 		Token:         "token-x",
 		UUID:          "uuid-x",
 		DeviceID:      "device-x",
+		UserID:        "1",
+		AgentID:       "443154487857417",
 		Status:        store.StatusActive,
 		MaxConcurrent: 0,
 	}
@@ -244,6 +251,7 @@ func TestRoutableSkipsSpentAccounts(t *testing.T) {
 	now := time.Now()
 	base := &store.Account{
 		Enabled: true, Token: "token-x", UUID: "uuid-x", DeviceID: "device-x",
+		UserID: "1", AgentID: "443154487857417",
 		Status: store.StatusActive, MaxConcurrent: 1,
 	}
 
