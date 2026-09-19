@@ -22,6 +22,18 @@ const BASE = (process.argv[2] || "http://127.0.0.1:8080").replace(/\/$/, "");
 const CDP = (process.argv[3] || "http://127.0.0.1:9222").replace(/\/$/, "");
 const PASSWORD = process.argv[4] || "admin12345";
 const SHOT_DIR = process.argv[5] || "";
+
+// A token-shaped string for the add-account flow check.
+//
+// Synthetic on purpose: the flow only needs the value to pass the backend's
+// shape checks, and a real token has no business being in a test file. The
+// payload carries a `user_id` so the account arrives already "prepared" and the
+// check does not spend a pointless upstream round-trip trying to discover one —
+// the id is 2^53+1, which no account can have, so it is unmistakably a fixture.
+const SYNTHETIC_TOKEN =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" +
+  ".eyJ1c2VyX2lkIjoiOTAwNzE5OTI1NDc0MDk5MyIsImV4cCI6MTc5MzIwNTMyOH0" +
+  ".c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU";
 const USERNAME = "admin";
 const TOKEN_KEY = "minimax2api:admin-token";
 
@@ -183,6 +195,118 @@ async function checkPage(session, label, route, opts = {}) {
   }
 }
 
+// Click the first visible control whose label contains `text`.
+const CLICK = (text) => `(() => {
+  const wanted = ${JSON.stringify(text)};
+  const nodes = [...document.querySelectorAll("button,[role=menuitem],[role=option],a")];
+  const hit = nodes.find((n) => (n.innerText || "").includes(wanted) && n.offsetParent !== null);
+  if (!hit) return "not-found";
+  hit.click();
+  return "clicked";
+})()`;
+
+// checkAddAccountFlow exercises one console flow end to end, because a route
+// that renders is not a flow that works.
+//
+// The specific defect this pins: the dialog required a name, while the backend
+// names an account after its identifier when the field is blank and the README
+// tells the operator to paste a token and save. Clicking save therefore produced
+// a bare "此项必填" toast and nothing else — every route still rendered cleanly,
+// so nothing else in this file noticed.
+//
+// It creates an account and deletes it again, so it is re-runnable. The account
+// carries a synthetic token: the probe that follows creation will fail against
+// the real upstream, which is expected and does not stop the account existing.
+async function checkAddAccountFlow(session, adminToken) {
+  if (!adminToken) {
+    console.log("  [skip] no admin token");
+    return;
+  }
+  const before = await evaluate(
+    session,
+    `(async () => {
+      const res = await fetch("/admin/api/accounts?pageSize=200", {
+        headers: { authorization: "Bearer " + localStorage.getItem(${JSON.stringify(TOKEN_KEY)}) },
+      });
+      const data = await res.json();
+      return { total: data.total ?? -1, ids: (data.items || []).map((i) => i.id) };
+    })()`,
+  ).catch(() => ({ total: -1, ids: [] }));
+
+  await navigate(session, BASE + "/accounts");
+  await evaluate(session, CLICK("添加账号") + `; "ok"`).catch(() => {});
+  await sleep(700);
+  await evaluate(session, CLICK("Token 登录") + `; "ok"`).catch(() => {});
+  await sleep(900);
+
+  const opened = await evaluate(session, `!!document.querySelector("[role=dialog]")`);
+  if (!opened) {
+    problems.push("add-account dialog did not open");
+    console.log("  [FAIL] dialog never opened");
+    return;
+  }
+
+  // Paste a token and leave every other field alone.
+  await evaluate(
+    session,
+    `(() => {
+      const area = document.querySelector("#account-token");
+      if (!area) return "no-field";
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+      setter.call(area, ${JSON.stringify(SYNTHETIC_TOKEN)});
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+      return "filled";
+    })()`,
+  ).catch(() => {});
+  await sleep(400);
+
+  await evaluate(session, CLICK("保存") + `; "ok"`).catch(() => {});
+  await sleep(2500);
+
+  const after = await evaluate(
+    session,
+    `(async () => {
+      const res = await fetch("/admin/api/accounts?pageSize=200", {
+        headers: { authorization: "Bearer " + localStorage.getItem(${JSON.stringify(TOKEN_KEY)}) },
+      });
+      const data = await res.json();
+      return { total: data.total ?? -1, ids: (data.items || []).map((i) => i.id) };
+    })()`,
+  ).catch(() => ({ total: -1, ids: [] }));
+
+  if (after.total === before.total + 1) {
+    console.log(`  [ok]   token-only save created an account  -> ${before.total} -> ${after.total}`);
+  } else {
+    problems.push(`token-only save did not create an account (${before.total} -> ${after.total})`);
+    console.log(`  [FAIL] token-only save did not create an account  -> ${before.total} -> ${after.total}`);
+  }
+
+  const stillOpen = await evaluate(session, `!!document.querySelector("[role=dialog]")`);
+  if (stillOpen) {
+    problems.push("the dialog stayed open after a successful save");
+    console.log("  [FAIL] the dialog stayed open");
+  } else {
+    console.log("  [ok]   the dialog closed");
+  }
+
+  // Clean up, so a second run starts from the same place. The account just
+  // created is the only one not present before.
+  const created = after.ids.filter((id) => !before.ids.includes(id));
+  for (const id of created) {
+    await evaluate(
+      session,
+      `(async () => {
+        await fetch("/admin/api/accounts/" + ${JSON.stringify(id)}, {
+          method: "DELETE",
+          headers: { authorization: "Bearer " + localStorage.getItem(${JSON.stringify(TOKEN_KEY)}) },
+        });
+        return "ok";
+      })()`,
+    ).catch(() => {});
+  }
+  if (created.length) console.log(`  [ok]   test account removed (${created.length})`);
+}
+
 async function main() {
   console.log("MiniMax2API real-browser render check");
   console.log(`base = ${BASE}`);
@@ -276,6 +400,9 @@ async function main() {
 
   console.log("\nroot redirect");
   await checkPage(session, "root -> dashboard", "/", { expectText: "仪表盘" });
+
+  console.log("\nconsole flow: add an account from a token alone");
+  await checkAddAccountFlow(session, token);
 
   await session.send("Page.captureScreenshot", { format: "png" }).catch(() => {});
   session.close();

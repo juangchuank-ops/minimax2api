@@ -775,13 +775,17 @@ export function AccountsPage() {
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="account-name">{t("accounts.name")}</Label>
+              <Label htmlFor="account-name">
+                {t("accounts.name")}
+                <span className="ml-2 text-[10px] text-muted-foreground">{t("common.optional")}</span>
+              </Label>
               <Input
                 id="account-name"
                 value={editor.name}
                 onChange={(event) => setEditor((current) => ({ ...current, name: event.target.value }))}
                 placeholder="global-01"
               />
+              <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.nameHelp")}</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="account-token">
@@ -942,10 +946,11 @@ export function AccountsPage() {
               size="sm"
               disabled={createMutation.isPending || updateMutation.isPending}
               onClick={() => {
-                if (!editor.name.trim()) {
-                  toast.error(t("errors.required"));
-                  return;
-                }
+                // The name is deliberately not required. The backend names an
+                // account after its identifier when the field is blank, and
+                // keeps the existing name on edit — so demanding one here
+                // blocked the flow the README describes (paste a token, save)
+                // with a toast that says only "此项必填".
                 if (editor.mode === "create" && !editor.token.trim()) {
                   toast.error(t("errors.required"));
                   return;
