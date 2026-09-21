@@ -17,6 +17,8 @@ export type SettingsDTO = {
     agentListPath: string;
     configPath: string;
     connectionsPath: string;
+    summariesPath: string;
+    driveFilePath: string;
     modelPayload: string;
     language: string;
     screenWidth: number;

@@ -694,6 +694,7 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	var (
 		lastErr     error
 		accountName string
+		usedCred    minimax.Credential
 		result      *minimax.Result
 	)
 
@@ -704,12 +705,14 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		accountName = displayName(lease.Account)
+		usedCred = CredentialOf(lease.Account)
 		result, err = g.client.Completion(r.Context(), minimax.Options{
-			Credential:  CredentialOf(lease.Account),
-			Text:        prompt,
-			Images:      images,
-			Timeout:     settings.VideoTimeout(),
-			IdleTimeout: settings.StreamIdleTimeout(),
+			Credential:   usedCred,
+			Text:         prompt,
+			Images:       images,
+			ClientIntent: minimax.VideoClientIntent,
+			Timeout:      settings.VideoTimeout(),
+			IdleTimeout:  settings.StreamIdleTimeout(),
 		})
 		lease.Release(err)
 		lastErr = err
@@ -722,6 +725,20 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", lastErr.Error())
 		writeError(out, http.StatusBadGateway, lastErr.Error())
 		return
+	}
+
+	// The file a video turn produces is not in the stream. It lands in the
+	// account's drive and is announced by a separate lookup, so a turn can
+	// succeed and still look empty from here. Both sources are merged rather
+	// than one replacing the other: the stream has been known to carry a cover
+	// image, and dropping it because the drive answered too would lose the only
+	// thing that did arrive. A failed lookup is swallowed on purpose — the
+	// turn's own result is the answer, and a broken lookup must not become an
+	// error the caller has to decode.
+	if result.SessionID != "" {
+		if fromDrive, err := g.client.SessionMedia(r.Context(), usedCred, result.SessionID, started.UnixMilli()); err == nil {
+			result.Media = mergeMedia(result.Media, fromDrive)
+		}
 	}
 
 	urls := g.persistMediaList(result.Media, request.Prompt, model.ID, accountName)
@@ -845,6 +862,30 @@ func (g *Gateway) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 // ------------------------------------------------------------- media helper
+
+// mergeMedia concatenates two media lists, keeping the first occurrence of each
+// URL.
+//
+// The stream and the drive describe the same turn from two angles, so an overlap
+// is expected rather than exceptional — and a caller that receives the same video
+// twice has no way to tell a duplicate from a second render.
+func mergeMedia(primary, extra []minimax.MediaRef) []minimax.MediaRef {
+	if len(extra) == 0 {
+		return primary
+	}
+	seen := make(map[string]bool, len(primary)+len(extra))
+	out := make([]minimax.MediaRef, 0, len(primary)+len(extra))
+	for _, list := range [][]minimax.MediaRef{primary, extra} {
+		for _, item := range list {
+			if item.URL == "" || seen[item.URL] {
+				continue
+			}
+			seen[item.URL] = true
+			out = append(out, item)
+		}
+	}
+	return out
+}
 
 func (g *Gateway) persistMediaList(media []minimax.MediaRef, prompt, model, account string) []string {
 	urls := make([]string, 0, len(media))

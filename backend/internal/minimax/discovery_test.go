@@ -215,6 +215,8 @@ func TestConfigDefaultsAgreeWithThePackageConstants(t *testing.T) {
 		{"agent list path", upstream.AgentListPath, DefaultAgentListPath},
 		{"config path", upstream.ConfigPath, DefaultConfigPath},
 		{"connections path", upstream.ConnectionsPath, DefaultConnectionsPath},
+		{"summaries path", upstream.SummariesPath, DefaultSummariesPath},
+		{"drive file path", upstream.DriveFilePath, DefaultDriveFilePath},
 		{"credit details path", settings.Signin.CreditDetailsPath, DefaultCreditDetailsPath},
 		{"credit path", settings.Signin.CreditPath, DefaultCreditPath},
 	}

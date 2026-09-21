@@ -922,3 +922,155 @@ func TestVideoGenerationsRequiresAPrompt(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
+
+// captureMessageBodies records the whole body of every message turn.
+//
+// captureMessages keeps only `content`, which is enough for the prompt-shaped
+// part of the integration. The parts that live in their own request fields —
+// `client_intent` above all — are invisible to it.
+func (h *harness) captureMessageBodies(t *testing.T) *[]map[string]any {
+	t.Helper()
+	var seen []map[string]any
+	original := h.upstream.Config.Handler
+	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/message") {
+			raw, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			if json.Unmarshal(raw, &payload) == nil {
+				seen = append(seen, payload)
+			}
+		}
+		original.ServeHTTP(w, r)
+	})
+	return &seen
+}
+
+func (h *harness) video(t *testing.T, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.VideoGenerations(rec, req)
+	return rec
+}
+
+// A video turn has to carry `client_intent`, and a chat turn must not.
+//
+// The two can send byte-identical `content` — same plugin mention, same options
+// block — and the intent is the only thing that decides whether the backend
+// dispatches the turn to the video service or hands it to the agent to reason
+// about. The agent path answers honestly, produces nothing, and bills the same.
+func TestVideoTurnsCarryTheVideoClientIntent(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("已提交")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	// The chat turn is sent first so its absence is asserted on the same run,
+	// rather than assumed from a separate one.
+	if rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "你好"}},
+	}, h.key); rec.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := h.video(t, map[string]any{"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴"}); rec.Code != http.StatusOK {
+		t.Fatalf("video status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(*bodies) != 2 {
+		t.Fatalf("captured %d turns, want 2", len(*bodies))
+	}
+	if got, present := (*bodies)[0]["client_intent"]; present {
+		t.Errorf("an ordinary chat turn carried client_intent = %v", got)
+	}
+	if got := (*bodies)[1]["client_intent"]; got != minimax.VideoClientIntent {
+		t.Errorf("video turn client_intent = %v, want %q", got, minimax.VideoClientIntent)
+	}
+}
+
+// A finished video is not in the conversation stream, and a gateway that only
+// reads the stream reports a success as emptiness.
+//
+// The file lands in the account's drive and is announced by a separate lookup:
+// the turn's summaries carry its node id, and the drive's `download-url`
+// sub-resource turns that node into a signed link. Both are plain GETs, so the
+// cost of looking is one extra round trip on a turn that already cost points.
+func TestVideoGenerationsFindsAFileThatOnlyTheDriveKnowsAbout(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/message"):
+			w.Header().Set("content-type", "text/event-stream")
+			_, _ = io.WriteString(w, upstreamText("已提交，正在生成"))
+		case strings.HasSuffix(r.URL.Path, "/input-summaries"):
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"summaries":[{"artifacts":[`+
+				`{"category":"videos","file_ext":"mp4","mime_type":"video/mp4",`+
+				`"name":"444160978935873.mp4","node_id":"444166461083748",`+
+				`"size_bytes":801051,"created_at":9999999999999}]}],`+
+				`"base_resp":{"status_code":0,"status_msg":"ok"}}`)
+		case strings.HasSuffix(r.URL.Path, "/download-url"):
+			w.Header().Set("content-type", "application/json")
+			// The drive answers without a scheme; the gateway has to add one.
+			_, _ = io.WriteString(w, `{"download_url":"matrix-internal.oss.example/Mavis/1/files/2/3.mp4?sig=x",`+
+				`"base_resp":{"status_code":0,"status_msg":"ok"}}`)
+		default:
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"session_id":"sess_test"}`)
+		}
+	})
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.video(t, map[string]any{"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["status"] != "succeeded" {
+		t.Fatalf("status = %v, want succeeded (body %s)", payload["status"], rec.Body.String())
+	}
+	if _, present := payload["detail"]; present {
+		t.Errorf("a succeeded turn still carried prose: %v", payload["detail"])
+	}
+	data, _ := payload["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data = %v, want one video", payload["data"])
+	}
+	first, _ := data[0].(map[string]any)
+	if first["url"] != "https://matrix-internal.oss.example/Mavis/1/files/2/3.mp4?sig=x" {
+		t.Errorf("url = %v, want the drive link with a scheme", first["url"])
+	}
+}
+
+// A drive lookup that fails must not turn a good turn into an error, and must
+// not be mistaken for "this turn produced nothing" either — the turn's own
+// answer is what the caller gets.
+func TestVideoGenerationsSurvivesADriveThatDoesNotAnswer(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/message"):
+			w.Header().Set("content-type", "text/event-stream")
+			_, _ = io.WriteString(w, upstreamText("已提交"))
+		case strings.HasSuffix(r.URL.Path, "/input-summaries"):
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "boom")
+		default:
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"session_id":"sess_test"}`)
+		}
+	})
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.video(t, map[string]any{"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a broken lookup is not the caller's error: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["status"] != "pending" {
+		t.Errorf("status = %v, want pending", payload["status"])
+	}
+	if detail, _ := payload["detail"].(string); !strings.Contains(detail, "已提交") {
+		t.Errorf("the agent's own answer was dropped: %v", payload["detail"])
+	}
+}

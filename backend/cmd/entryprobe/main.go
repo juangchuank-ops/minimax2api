@@ -31,11 +31,11 @@ import (
 func main() {
 	proxy := os.Getenv("MM_PROXY")
 	cred := minimax.Credential{
-		Region:       minimax.RegionGlobal,
-		Token:        os.Getenv("MM_TOKEN"),
-		UserID:       os.Getenv("MM_USER_ID"),
-		DeviceID:     os.Getenv("MM_DEVICE_ID"),
-		UUID:         os.Getenv("MM_UUID"),
+		Region:   minimax.RegionGlobal,
+		Token:    os.Getenv("MM_TOKEN"),
+		UserID:   os.Getenv("MM_USER_ID"),
+		DeviceID: os.Getenv("MM_DEVICE_ID"),
+		UUID:     os.Getenv("MM_UUID"),
 		// The captured browser was 1536x864; the screen size is part of `yy`.
 		ScreenWidth:  1536,
 		ScreenHeight: 864,

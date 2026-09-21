@@ -180,7 +180,14 @@ type UpstreamSettings struct {
 	ConfigPath string `json:"configPath"`
 	// ConnectionsPath completes the opening sequence the web client runs when
 	// it opens the agent page.
-	ConnectionsPath      string `json:"connectionsPath"`
+	ConnectionsPath string `json:"connectionsPath"`
+	// SummariesPath lists a session's turns together with the files each one
+	// produced. Generated media is not announced in the conversation stream, so
+	// this is the only place a finished video is visible from.
+	SummariesPath string `json:"summariesPath"`
+	// DriveFilePath addresses one drive node. Its `download-url` sub-resource is
+	// what turns a node into a playable link.
+	DriveFilePath        string `json:"driveFilePath"`
 	ModelPayload         string `json:"modelPayload"`
 	Language             string `json:"language"`
 	ScreenWidth          int    `json:"screenWidth"`
@@ -279,6 +286,8 @@ func DefaultSettings(dataDir string) Settings {
 			AgentListPath:        "/minimax-cloud/api/v1/agent",
 			ConfigPath:           "/minimax-cloud/api/v1/config",
 			ConnectionsPath:      "/minimax-cloud/api/v1/channel/connections",
+			SummariesPath:        "/minimax-cloud/api/v1/session/{session_id}/input-summaries",
+			DriveFilePath:        "/minimax-cloud/api/v1/drive/file/{node_id}",
 			ModelPayload:         "",
 			Language:             "zh-CN,zh;q=0.9,en;q=0.8",
 			ScreenWidth:          1920,
@@ -412,6 +421,12 @@ func (s *Settings) Normalize(dataDir string) bool {
 	}
 	if s.Upstream.ConnectionsPath == "" {
 		s.Upstream.ConnectionsPath = def.Upstream.ConnectionsPath
+	}
+	if s.Upstream.SummariesPath == "" {
+		s.Upstream.SummariesPath = def.Upstream.SummariesPath
+	}
+	if s.Upstream.DriveFilePath == "" {
+		s.Upstream.DriveFilePath = def.Upstream.DriveFilePath
 	}
 	if s.Upstream.ScreenWidth <= 0 {
 		s.Upstream.ScreenWidth = def.Upstream.ScreenWidth

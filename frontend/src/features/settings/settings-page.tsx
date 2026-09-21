@@ -30,6 +30,8 @@ type Draft = {
   agentListPath: string;
   configPath: string;
   connectionsPath: string;
+  summariesPath: string;
+  driveFilePath: string;
   modelPayload: string;
   language: string;
   screenWidth: number;
@@ -153,6 +155,8 @@ export function SettingsPage() {
           agentListPath: value.agentListPath,
           configPath: value.configPath,
           connectionsPath: value.connectionsPath,
+          summariesPath: value.summariesPath,
+          driveFilePath: value.driveFilePath,
           modelPayload: value.modelPayload,
           language: value.language,
           screenWidth: value.screenWidth,
@@ -340,6 +344,20 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.connectionsPath}
               onChange={(event) => set("connectionsPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.summariesPath")} help={t("settings.upstream.summariesPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.summariesPath}
+              onChange={(event) => set("summariesPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.driveFilePath")} help={t("settings.upstream.driveFilePathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.driveFilePath}
+              onChange={(event) => set("driveFilePath", event.target.value)}
             />
           </Field>
           <Field label={t("settings.upstream.modelPayload")} help={t("settings.upstream.modelPayloadHelp")}>

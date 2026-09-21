@@ -1686,6 +1686,8 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 			"agentListPath":   settings.Upstream.AgentListPath,
 			"configPath":      settings.Upstream.ConfigPath,
 			"connectionsPath": settings.Upstream.ConnectionsPath,
+			"summariesPath":   settings.Upstream.SummariesPath,
+			"driveFilePath":   settings.Upstream.DriveFilePath,
 			"modelPayload":    settings.Upstream.ModelPayload,
 			"language":        settings.Upstream.Language,
 			"screenWidth":     settings.Upstream.ScreenWidth, "screenHeight": settings.Upstream.ScreenHeight,

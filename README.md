@@ -186,11 +186,12 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - H3 挂在 `video-creater` 插件下（`GET /minimax-cloud/api/v1/plugins/enabled`）。在网页端，它是通过输入框里的**引用 chip** 触发的，不是通过 model 字段。
 - 网页端**没有任何视频端点**：真正提交生成的是 Agent 服务端的 Connector 工具（`connector__matrix__submit_video_generation`），客户端从不直接调用它。
 
-所以这个网关能控制的，只有「把这一轮话说成什么样」。而实测下来那就是全部的接入面：
+所以这个网关能控制的，只有「把这一轮话说成什么样」——外加一个请求字段。实测下来这就是全部的接入面：
 
 1. chip 在纯文本里序列化成 `@video-creater`，插件自己的 skill 就写着「用户显式 @video-creater 时使用」。
    **已对真上游验证**：一条纯文本 `@video-creater` 消息确实路由到了插件，它按自己的说明答出了能力契约。
 2. 生成参数走消息末尾的 `<video-generation-options>` 块，不在请求体里。
+3. **请求体里的 `client_intent: "video_generation"`**。这是「这一轮交给视频服务」和「这一轮交给 Agent 让它自己想」的分界线：两条路可以带**逐字节相同**的 `content`，区别只在这个字段。它的取值来自 bundle 自己的工具类型表——四个视频工具（`BatchTextToVideo`、`BatchImageToVideo`、`VideosRead`、`VideosUnderstand`）全都映射到这一个字符串，同表里还有 `generate_image`、`audio_generation`、`describe_image`，所以它是一套路由词汇而不是一个孤立的魔法值。
 
 ```jsonc
 // POST /v1/videos/generations
@@ -204,7 +205,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 }
 ```
 
-上游实际收到的这一轮话长这样：
+上游实际收到的这一轮话长这样（`client_intent` 是同一请求的字段，不在文本里）：
 
 ```
 @video-creater 一只猫在弹钢琴
@@ -215,6 +216,22 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 块的格式不是猜的：它是网页端 bundle 里**写和读这一对函数**共同定义的形状，而两者互相吻合（写入端 `` `<${tag}>\n${JSON}\n</${tag}>` `` 前面空一行；读取端正则锚定在消息**末尾**）。`internal/minimax/video_test.go` 把上游那个正则原样搬过来，跑在本地写入端的输出上——改写格式会让它直接红。
+
+### ★ 成品不在对话流里
+
+**生成的视频不会出现在 SSE 流里。** 这是最容易误判的一环：一轮真的成功过（Agent 提交了任务、文件真的存在、积分真的扣了），从 completion 接口看却可能是**零 media**——因为文件写进了账号的网盘，而流里只说了话。
+
+文件由两步免费 GET 报出来：
+
+| 步骤 | 接口 | 给出什么 |
+| --- | --- | --- |
+| 1 | `GET /minimax-cloud/api/v1/session/{id}/input-summaries` | `summaries[].artifacts[]`，含 `node_id`、`category`（`videos`）、`mime_type`、`name`、`size_bytes`、`created_at` |
+| 2 | `GET /minimax-cloud/api/v1/drive/file/{node_id}/download-url` | 一条**带签名的 OSS 直链**，有效期约两小时 |
+
+两个坑：第 2 步返回的 `download_url` **不带 scheme**（`matrix-internal.oss-….aliyuncs.com/Mavis/…`），必须补上 `https://`；而且它是一条**带过期的凭据**，不该被缓存或写进日志。
+
+网关在每轮视频之后都会查一次，按 `created_at >= 本轮开始时刻` 过滤，所以同一个会话里旧轮次的文件不会被当成这一轮的产出。查询失败**不影响**这一轮的结果——那一轮自己的答复才是答案。这两个路径在「系统设置 → 上游」里分别叫**会话摘要路径**与**网盘文件路径**。
+
 
 **响应**：
 
@@ -233,33 +250,49 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 > 把慢模型当成快模型处理，只会把「一个可用的中间答复」变成「一个网关超时」。所以这里不假装能同步等到。
 
-### ⚠️ 实测结论：格式已验证，入口已按抓包修正，执行通道仍待确认
+### ⚠️ 实测结论：格式与账号能力都已验证，剩下的是调度与取件
 
-这个接入面被真上游验证过三次（同一账号、境外出口、`MiniMax-H3-Max` / 5s / 16:9 / 768P）：
+这个接入面被真上游验证过四次（同一账号、境外出口、`MiniMax-H3-Max` / 5s / 16:9 / 768P）：
 
 - ✅ **`@video-creater` 确实路由到插件**，options 块**四个参数一个不差被解析**——Agent 会原样复述
   `user-specified model MiniMax-H3-Max, duration 5, ratio 16:9, resolution 768P`。
   这段文本上游完全消化得了，**格式不需要再猜**。
-- ❌ **三次都没产出 mp4**。前两次查到的原因是 Agent 自己的容器里没有可用的执行通道：它逐个查过四个位置，
+- ✅ **账号侧能力是有的**。免费 GET 直接读到：
+
+  ```json
+  {"plugins":[{"name":"video-creater","display_name":"video-creator",
+               "icon_url":"agent-cdn.minimax.io/plugin-marketplace/v1/icons/video-creater/1.4.2/…"}]}
+  ```
+
+  `GET /minimax-cloud/api/v1/skill` 也照常列出 `mcode-tools-master`（描述里写明它是「调用任何
+  Connector 工具、以及多模态生成的主要入口」，CLI 就在 Agent 容器的 PATH 上）。
+  **所以「账号没装插件」这条假设可以划掉了。**
+- ⚠️ **`GET /channel/connections` 返回空是正常的**，别把它当成缺能力：它是初始化序列的第三步，
+  列的是飞书 / Telegram / 微信这类**绑定的聊天通道**，账号没绑过任何 IM 就是空表。
+- ❌ **四次都没在同步接口里拿到 mp4**。前两次的原因是 Agent 容器里没有可用的执行通道：它逐个查过四个位置，
   全空——PATH 上的 `mcode-tools`、`<connected-app-tools>`、`<plugin-mcp-tools>`、`mavis`。
   它按插件 skill 的要求拒绝改用裸 HTTP，也拒绝在拿不到成品时谎报成功，只留下自己的原话：
 
   > The plugin skill lists `video-creater:write-h3-prompts` only, with no connected-app-tools or plugin-mcp-tools.
 
-- 🔁 **第三次之后，一次抓包把入口本身推翻了**。网页端发消息用的是
+- 🔁 **一次抓包把入口本身推翻了**。网页端发消息用的是
   `POST agent-stream.minimax.io/minimax-cloud/api/v1/session/{id}/message`，而网关当时用的是
   `agent.minimax.io` + `/archon/api/v1/session/{id}/message` —— **`/archon/` 这个前缀在网页端 17 个业务接口里一个都不存在**。
   同时查到的还有：query 是 **22 个参数**而不是当时的 6 个；网页端开会话用的是 **mavis** agent，不是 `general`。
 
-  三条都已按抓包改掉（含存量实例的迁移）。**但「换了入口就能拿到执行通道」仍然是假设**，尚未在真上游验证过。
-  另一条未排除的可能：该账号的 `video-creater` 插件只装了 skill 文档、没装 Connector，那需要到网页端插件市场确认。
+  三条都已按抓包改掉（含存量实例的迁移）。
 
-**★ 扣费与产出是解耦的**：三次共消耗 **542 积分**（1187 → 1161 → 1137 → 1089 → 597，最后一轮 492），**零产出**。
+**还差什么**：`client_intent` 与取件两步都是**照着证据补齐**的，尚未在真上游跑过一次完整的成功轮次。
+网页端那条成功记录（同一账号、`tool_call_count=5`、网盘里留下一个 801 KB 的 mp4）是它们成立的依据，
+但它证明的是「网页端能」，不是「这个网关现在能」。要确认，需要再花一轮积分发一次真实请求。
+
+**★ 扣费与产出是解耦的**：四次共消耗 **575 积分**（1187 → 1161 → 1137 → 1089 → 597 → 564），**零产出**。
 第三轮贵在「让 Agent 自己想办法」——它会反复思考。**不要把「余额下降」当成「生成成功」的证据。**
 排查这类问题时，先用不花钱的 `GET`（`/config`、`/skill`、`/plugins/enabled`）确认账号能力，再决定要不要花钱发消息。
 
 **判断到底发生了什么，只能读 `detail`**——也就是 Agent 的原话，它是唯一可信的状态源。
-`status: "pending"` 加上一段「我没有这个工具 / 我无法提交」的解释，意思是上游拒了，不是网关吞了，而且**不会稍后变成功**。
+`status: "pending"` 加上一段「我没有这个工具 / 我无法提交」的解释，意思是上游拒了，不是网关吞了。
+注意这句话在「这一轮没产出」时是准确的，但它**不能**推出「以后也不会产出」——成品在网盘里，见上一节。
 
 **参数为什么要填满**：插件自己的 skill 会**先问清楚没指定的项再开始生成**，而接口调用没人可答。所以少一个参数不是「走上游默认值」，而是这一轮什么都不产出。调用方没传的项会用设置里的默认值补齐（`video.defaultDuration` / `defaultRatio` / `defaultResolution`）。
 
@@ -386,7 +419,7 @@ GET /minimax-cloud/api/v1/channel/connections
 - **不调它，新号发消息会 500**，错误文案是 `[1400010501] Environment Variables not configured` —— 通篇没提「你没初始化」，看着像环境变量配错了。
 - **顺序反了（先签到后 `/config`）积分会静默丢失，且事后补调救不回来。** 领取接口照样回 `claim_result=1`，所以失败和成功长得一模一样。所以签到流程里这一步失败会**直接跳过领取**并写明原因 —— 丢掉一天是可见、可重跑的；顺序错了则是丢掉一天还报成功。
 
-三条路径都能在「系统设置 → 上游」里改（`configPath` / `agentListPath` / `connectionsPath`）。
+三条路径都能在「系统设置 → 上游」里改（`configPath` / `agentListPath` / `connectionsPath`）。视频取件用的另外两条同理（`summariesPath` / `driveFilePath`，支持 `{session_id}`、`{node_id}`），详见「视频生成 → 成品不在对话流里」。
 
 ### 流式解析
 
@@ -553,11 +586,11 @@ go vet ./...
 | --- | --- |
 | `internal/store` | 配置快照的并发读写、写锁内重入读配置（死锁回归）、快照隔离、**打开旧设置文件时把已知坏值迁移并写回磁盘** |
 | `internal/pool` | 账号筛选（禁用/失效/无令牌/无指纹/冷却过期）、四种调度策略、粘性会话、退避与封顶 |
-| `internal/minimax` | 签名公式与逐字符的 `encodeURIComponent` 对照、query 顺序与编码、按区域选主机、SSE 帧解析（推理/正文分离、媒体收集、错误识别）、JWT 令牌解析、签到两条 query 串的差异（签名含 `op_ticket=undefined`、请求不含）、真实抓包的 `x-signature` 对照、回环地址绕过代理、生成的 `device_id` 必须是纯数字、`uuid` 是 v4 UUID、会话响应是 HTML 页面时拒绝当成 `session_id`、`/config` 返回体决定 agent id、配置默认值不得与包内常量漂移 |
+| `internal/minimax` | 签名公式与逐字符的 `encodeURIComponent` 对照、query 顺序与编码、按区域选主机、SSE 帧解析（推理/正文分离、媒体收集、错误识别）、JWT 令牌解析、签到两条 query 串的差异（签名含 `op_ticket=undefined`、请求不含）、真实抓包的 `x-signature` 对照、回环地址绕过代理、生成的 `device_id` 必须是纯数字、`uuid` 是 v4 UUID、会话响应是 HTML 页面时拒绝当成 `session_id`、`/config` 返回体决定 agent id、配置默认值不得与包内常量漂移、传输层错误里不得出现令牌、**产物清单按 `created_at` 过滤出本轮的文件、`download_url` 补 scheme、取不到链接的产物不冒充媒体** |
 | `internal/signin` | 错过的时间点补签、重复领取记为「已签」、国内站账号跳过、失效令牌退役、失败也占掉当天（避免上游故障变成请求循环）、积分接口故障不牵连账号健康、扫描不可重入、**初始化序列跑在领取之前且失败即跳过领取**、领取面板用上游回显的那一份、对账只认发放时间不认余额、宽限期内不下结论 |
 | `internal/admin` | 设置接口逐字段与 struct 的 json tag 比对（防新设置漏接线）、生成的指纹形状、区域推断、令牌解析 |
 | `internal/config` | 已知坏默认值的迁移（旧会话路径、`agentID = general`、旧消息路径）、迁移不误伤刻意的覆盖值 |
-| `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝 |
+| `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝、**视频轮次带 `client_intent` 而普通对话不带**、**只存在于网盘的成品也能被取回**、取件失败不污染这一轮的结果 |
 | `internal/gateway`（上游桩） | 用 `httptest` 顶替上游，因此不需要真实令牌就能覆盖完整链路 |
 
 > `pool` 里的死锁与并发用例用 `channel + timeout` 断言，而不是裸 `t.Fatal`——测试进程卡住时，超时能给出失败信息而不是整体挂起。

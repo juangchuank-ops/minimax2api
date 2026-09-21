@@ -315,6 +315,23 @@ type AgentProbe struct {
 //
 // The path may carry its own query string.
 func (c *Client) ProbeEndpoint(ctx context.Context, cred Credential, method, path string, body []byte, stream bool) (AgentProbe, error) {
+	return c.FetchRaw(ctx, cred, method, path, body, stream, probeBodyLimit)
+}
+
+// probeBodyLimit keeps a probe's output short enough to read on screen. A wrong
+// path is answered with a whole HTML page, and none of it is worth printing.
+const probeBodyLimit = 4096
+
+// FetchRaw makes one signed request and returns the body as it came.
+//
+// Same plumbing as ProbeEndpoint, different appetite: the endpoints that describe
+// an account's *artefacts* rather than its errors answer with documents of a few
+// hundred kilobytes. Truncating those at probeBodyLimit would cut off exactly the
+// part worth reading, so the caller sets the limit.
+//
+// Diagnostics only. It has no place on the request path, where every response is
+// either streamed or rejected.
+func (c *Client) FetchRaw(ctx context.Context, cred Credential, method, path string, body []byte, stream bool, limit int64) (AgentProbe, error) {
 	settings := c.settings()
 	if strings.TrimSpace(cred.Token) == "" {
 		return AgentProbe{}, ErrInvalidCredential
@@ -331,7 +348,7 @@ func (c *Client) ProbeEndpoint(ctx context.Context, cred Credential, method, pat
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
 	probe.Status = resp.StatusCode
 	probe.Body = strings.TrimSpace(string(raw))
 	return probe, nil
