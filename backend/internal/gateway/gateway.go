@@ -129,7 +129,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(out, http.StatusBadRequest, fmt.Sprintf("unknown or disabled model %q", modelID))
 		return
 	}
-	if model.Type != "chat" {
+	if model.Type != store.ModelTypeChat && model.Type != store.ModelTypeVideo {
 		writeError(out, http.StatusBadRequest, fmt.Sprintf("model %q is not a chat model", modelID))
 		return
 	}
@@ -146,13 +146,15 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Every catalogue entry reaches the same upstream agent, so the model id is
 	// not forwarded. It only steers local behaviour: the thinking variant asks
-	// the adapter to surface the reasoning stream.
+	// the adapter to surface the reasoning stream, and a video entry rewrites the
+	// turn into a plugin reference with its generation parameters attached.
 	mode := ""
 	if model.ID == "minimax-m3-thinking" {
 		mode = "think"
 	}
 
 	settings := g.settings()
+	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
 	var (
 		lastErr      error
 		accountName  string
@@ -178,7 +180,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Text:        prompt,
 			Mode:        mode,
 			Images:      images,
-			Timeout:     settings.RequestTimeout(),
+			Timeout:     timeoutFor(settings, model),
 			IdleTimeout: settings.StreamIdleTimeout(),
 		}
 
@@ -586,6 +588,233 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	_, _ = out.Write(raw)
 }
 
+// ------------------------------------------------------------ video handler
+
+// videoRequest is the body of POST /v1/videos/generations.
+//
+// The shape follows the OpenAI image endpoint rather than any MiniMax one,
+// because there is no MiniMax video endpoint to follow: the parameters below
+// are the four keys the plugin's own options block accepts, plus the prompt.
+type videoRequest struct {
+	Prompt string `json:"prompt"`
+	Model  string `json:"model"`
+	// Duration is whole seconds. It has no default worth guessing: the upstream
+	// bills by it, so an absent value falls back to the console setting and is
+	// reported back in the response.
+	Duration   int    `json:"duration"`
+	Ratio      string `json:"ratio"`
+	Resolution string `json:"resolution"`
+	// ImageURL is the first frame for image-to-video, and ImageURLs carries a
+	// multi-reference set for the models that accept one.
+	ImageURL  string   `json:"image_url"`
+	ImageURLs []string `json:"image_urls"`
+}
+
+// VideoGenerations implements POST /v1/videos/generations.
+//
+// This is a synchronous surface onto an asynchronous upstream. The fast H3
+// variant finishes in about twenty seconds and returns a playable URL in the
+// same turn, which is what this endpoint is for. The slow H3.0 model is
+// documented at 15–30 minutes, and no HTTP response can hold that: the call
+// returns whatever the agent has produced by the timeout — usually a task
+// identifier and a status — so the caller learns the task was accepted and
+// nothing was lost. Treating a slow model as if it were fast would only turn a
+// usable partial answer into a gateway timeout.
+func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
+	out := &respWriter{ResponseWriter: w}
+	started := time.Now()
+
+	key, err := g.authenticate(r)
+	if err != nil {
+		writeError(out, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err := g.limiter.acquire(key); err != nil {
+		writeError(out, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	defer g.limiter.release(key)
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	var request videoRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		writeError(out, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(request.Prompt) == "" {
+		writeError(out, http.StatusBadRequest, "prompt is required")
+		return
+	}
+
+	settings := g.settings()
+
+	modelID := request.Model
+	if modelID == "" {
+		modelID = defaultVideoModel
+	}
+	model, ok := g.store.ModelByID(modelID)
+	if !ok || !model.Enabled || model.Type != store.ModelTypeVideo {
+		writeError(out, http.StatusBadRequest, fmt.Sprintf("unknown or disabled video model %q", modelID))
+		return
+	}
+
+	options, err := (minimax.VideoOptions{
+		Model:      model.UpstreamModel,
+		Ratio:      request.Ratio,
+		Resolution: request.Resolution,
+		Duration:   request.Duration,
+	}).Normalize(minimax.VideoOptions{
+		Ratio:      settings.Video.DefaultRatio,
+		Resolution: settings.Video.DefaultResolution,
+		Duration:   settings.Video.DefaultDuration,
+	})
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Reference frames ride along as ordinary attachments; the plugin reads them
+	// from the turn rather than from the options block, which only carries the
+	// four generation parameters.
+	images := make([]minimax.UploadedImage, 0, len(request.ImageURLs)+1)
+	for _, raw := range append([]string{request.ImageURL}, request.ImageURLs...) {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		image, err := g.resolveImage(raw)
+		if err != nil {
+			writeError(out, http.StatusBadRequest, err.Error())
+			return
+		}
+		images = append(images, image)
+	}
+
+	prompt := g.outgoingText(settings, model, request.Prompt, options)
+
+	var (
+		lastErr     error
+		accountName string
+		result      *minimax.Result
+	)
+
+	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		lease, err := g.pool.Acquire(r.Context(), "")
+		if err != nil {
+			lastErr = err
+			break
+		}
+		accountName = displayName(lease.Account)
+		result, err = g.client.Completion(r.Context(), minimax.Options{
+			Credential:  CredentialOf(lease.Account),
+			Text:        prompt,
+			Images:      images,
+			Timeout:     settings.VideoTimeout(),
+			IdleTimeout: settings.StreamIdleTimeout(),
+		})
+		lease.Release(err)
+		lastErr = err
+		if err == nil || isPoolExhausted(err) {
+			break
+		}
+	}
+
+	if lastErr != nil {
+		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", lastErr.Error())
+		writeError(out, http.StatusBadGateway, lastErr.Error())
+		return
+	}
+
+	urls := g.persistMediaList(result.Media, request.Prompt, model.ID, accountName)
+	items := make([]any, 0, len(urls))
+	for index, url := range urls {
+		source := ""
+		if index < len(result.Media) {
+			source = result.Media[index].URL
+		}
+		items = append(items, map[string]any{"url": url, "source_url": source})
+	}
+
+	g.store.RecordModelUsage(model.ID, 1, 0)
+	g.store.BumpClientKeyUsage(key.ID)
+
+	response := map[string]any{
+		"created": time.Now().Unix(),
+		"model":   model.ID,
+		"data":    items,
+	}
+	// A turn that produced no media still returns 200 with an empty `data` and
+	// the agent's own words, because "submitted, here is the task" is a useful
+	// answer and an error code is not.
+	//
+	// `status` is deliberately only two-valued: it reports what this turn
+	// produced, which is the one thing the gateway actually knows. It does NOT
+	// distinguish "a task is running" from "the upstream never executed
+	// anything". That difference lives only in the agent's prose, and a live
+	// check confirmed the second case is real — the account had no connector
+	// tool available, the turn still cost points, and nothing was ever
+	// produced. Guessing between the two by matching keywords in the prose
+	// would be worse than admitting the limit, so `detail` carries the prose
+	// and the caller reads it.
+	if len(items) > 0 {
+		response["status"] = "succeeded"
+	} else {
+		response["status"] = "pending"
+		response["detail"] = result.Text
+	}
+	raw, _ := json.Marshal(response)
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
+
+	out.Header().Set("content-type", "application/json")
+	out.WriteHeader(http.StatusOK)
+	_, _ = out.Write(raw)
+}
+
+// defaultVideoModel is used when a caller names none. It is the fast variant:
+// the only video model that can answer a synchronous request, and the cheapest
+// way for a caller to discover the endpoint works.
+const defaultVideoModel = "minimax-h3-max"
+
+// outgoingText turns a prompt into the text actually sent upstream.
+//
+// For chat models that is the prompt itself. For video models it is a different
+// kind of message entirely: the plugin reference plus the generation parameters,
+// because MiniMax-H3 is not selectable as a model and the parameters have no
+// place in the request body. See internal/minimax/video.go.
+func (g *Gateway) outgoingText(
+	settings config.Settings,
+	model *store.ModelConfig,
+	prompt string,
+	options minimax.VideoOptions,
+) string {
+	if model.Type != store.ModelTypeVideo {
+		return prompt
+	}
+	if options.Model == "" {
+		options.Model = model.UpstreamModel
+	}
+	if options.Ratio == "" {
+		options.Ratio = settings.Video.DefaultRatio
+	}
+	if options.Resolution == "" {
+		options.Resolution = settings.Video.DefaultResolution
+	}
+	if options.Duration <= 0 {
+		options.Duration = settings.Video.DefaultDuration
+	}
+	return minimax.BuildVideoPrompt(prompt, settings.Video.PluginName, options, settings.Video.OptionsTag)
+}
+
+// timeoutFor picks the budget for one turn.
+//
+// A video turn and a chat turn have nothing in common: a chat turn that takes a
+// minute is broken, and a video turn that takes a minute has not started yet.
+func timeoutFor(settings config.Settings, model *store.ModelConfig) time.Duration {
+	if model.Type == store.ModelTypeVideo {
+		return settings.VideoTimeout()
+	}
+	return settings.RequestTimeout()
+}
+
 // Models implements GET /v1/models.
 func (g *Gateway) Models(w http.ResponseWriter, r *http.Request) {
 	if _, err := g.authenticate(r); err != nil {
@@ -649,10 +878,14 @@ func (g *Gateway) persistMedia(media minimax.MediaRef, prompt, model, account st
 		filename := item.ID + extension
 		target := filepath.Join(settings.Media.GeneratedDir, filename)
 
+		// Downloads go through the same proxy as the API. Generated media is
+		// served from MiniMax's CDN, and the account's egress fence applies to it
+		// too — so fetching it from the local address fails the same way an
+		// unproxied API call does, as a reset that looks like the CDN is down.
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, media.URL, nil)
 		if err == nil {
-			if resp, err := http.DefaultClient.Do(req); err == nil {
+			if resp, err := minimax.DownloadClient(settings).Do(req); err == nil {
 				if resp.StatusCode < 400 {
 					if file, err := os.Create(target); err == nil {
 						if _, err := io.Copy(file, io.LimitReader(resp.Body, 256<<20)); err == nil {

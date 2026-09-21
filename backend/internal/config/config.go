@@ -49,6 +49,42 @@ type Settings struct {
 	Audit    AuditSettings    `json:"audit"`
 	Media    MediaSettings    `json:"media"`
 	Signin   SigninSettings   `json:"signin"`
+	Video    VideoSettings    `json:"video"`
+}
+
+// VideoSettings drives the video-generation route.
+//
+// Video is not a chat mode. MiniMax-H3 has no model id in the conversation
+// API: the agent reaches it through the `video-creater` plugin, and the plugin
+// is selected by *mentioning* it in the message text — the composer's reference
+// chip serialises to `@video-creater` and that string is the whole mechanism.
+// The generation parameters then travel in a trailing
+// `<video-generation-options>` block appended to the same text, not in a
+// request field.
+//
+// Both of those belong to the upstream bundle rather than to this gateway, so
+// both are settings: a renamed plugin or a renamed tag should be a console edit,
+// not a rebuild.
+type VideoSettings struct {
+	// PluginName is the plugin reference the agent routes on. It is written
+	// into the message text as `@<pluginName>`.
+	PluginName string `json:"pluginName"`
+	// OptionsTag is the tag the generation parameters travel in.
+	OptionsTag string `json:"optionsTag"`
+	// Default* fill in whatever the caller left out.
+	//
+	// They matter more than an ordinary default would. The plugin's own skill
+	// asks the user to confirm every unspecified choice before generating, and
+	// a headless API call has nobody to answer — so an omitted parameter does
+	// not quietly fall back to an upstream default, it stalls the turn. Always
+	// sending a complete set is what keeps a request unattended.
+	DefaultRatio      string `json:"defaultRatio"`
+	DefaultResolution string `json:"defaultResolution"`
+	DefaultDuration   int    `json:"defaultDuration"`
+	// TimeoutSec bounds one video turn, separately from the chat timeout: the
+	// fast variant alone spends around twenty seconds generating, and the slow
+	// one is documented at 15–30 minutes.
+	TimeoutSec int `json:"timeoutSec"`
 }
 
 // SigninSettings drives the daily check-in sweep and the credit guard.
@@ -278,6 +314,19 @@ func DefaultSettings(dataDir string) Settings {
 			CreditPath:        "/matrix/api/v1/commerce/get_membership_info",
 			CreditDetailsPath: "/minimax-cloud/api/v1/credit/details",
 		},
+		Video: VideoSettings{
+			PluginName:        "video-creater",
+			OptionsTag:        "video-generation-options",
+			DefaultRatio:      "16:9",
+			DefaultResolution: "768P",
+			DefaultDuration:   5,
+			// Comfortably above the fast variant's ~20s and long enough that a
+			// slow H3 turn returns whatever progress the agent has reached
+			// rather than a bare timeout. It cannot cover a full H3 render:
+			// 15–30 minutes is beyond any synchronous HTTP surface, which is
+			// why the slow model is documented as submit-and-follow-up.
+			TimeoutSec: 600,
+		},
 	}
 }
 
@@ -442,6 +491,24 @@ func (s *Settings) Normalize(dataDir string) bool {
 	if s.Signin.CreditDetailsPath == "" {
 		s.Signin.CreditDetailsPath = def.Signin.CreditDetailsPath
 	}
+	if s.Video.PluginName == "" {
+		s.Video.PluginName = def.Video.PluginName
+	}
+	if s.Video.OptionsTag == "" {
+		s.Video.OptionsTag = def.Video.OptionsTag
+	}
+	if s.Video.DefaultRatio == "" {
+		s.Video.DefaultRatio = def.Video.DefaultRatio
+	}
+	if s.Video.DefaultResolution == "" {
+		s.Video.DefaultResolution = def.Video.DefaultResolution
+	}
+	if s.Video.DefaultDuration <= 0 {
+		s.Video.DefaultDuration = def.Video.DefaultDuration
+	}
+	if s.Video.TimeoutSec <= 0 {
+		s.Video.TimeoutSec = def.Video.TimeoutSec
+	}
 	// TimezoneOffsetMin is deliberately not repaired here. A stored 0 cannot be
 	// told apart from an absent field, and signinParams already maps 0 onto the
 	// +8 default the capture used, so repairing it here would only add a second
@@ -469,6 +536,15 @@ func (s Settings) RequestTimeout() time.Duration {
 
 func (s Settings) StreamIdleTimeout() time.Duration {
 	return time.Duration(s.Upstream.StreamIdleTimeoutSec) * time.Second
+}
+
+// VideoTimeout bounds one video-generation turn.
+//
+// It is a separate budget from RequestTimeout because the two have nothing in
+// common: a chat turn that takes a minute is broken, and a video turn that
+// takes a minute has not started yet.
+func (s Settings) VideoTimeout() time.Duration {
+	return time.Duration(s.Video.TimeoutSec) * time.Second
 }
 
 func (s Settings) CooldownBase() time.Duration {

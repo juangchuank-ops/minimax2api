@@ -99,6 +99,14 @@ func Open(dataDir, adminUser, adminPassword string) (*Store, error) {
 	store.settings.Store(store.state.Settings)
 	if len(store.state.Models) == 0 {
 		store.state.Models = BuiltinModels()
+	} else if merged, changed := MergeBuiltinModels(store.state.Models); changed {
+		// A catalogue that predates a built-in entry has to be written back for
+		// the same reason a repaired setting does: leaving the file describing a
+		// shorter list than the process is serving means the next release has to
+		// merge it again, and the file never becomes an accurate description of
+		// what is running.
+		store.state.Models = merged
+		store.markDirtyLocked()
 	}
 	if store.state.Admin.Username == "" {
 		if adminUser == "" {

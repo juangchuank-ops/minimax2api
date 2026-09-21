@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -696,5 +697,228 @@ func TestHarnessUsesFastCapacityWait(t *testing.T) {
 	}
 	if h.settings.RequestTimeout() > 5*time.Second {
 		t.Fatalf("request timeout = %v, tests should not hang", h.settings.RequestTimeout())
+	}
+}
+
+// --- video generation ------------------------------------------------------
+
+// captureMessages records the `content` of every message turn sent upstream.
+//
+// The video integration lives entirely in that string — the plugin reference and
+// the generation parameters have no request field of their own — so asserting on
+// the request body is the only way to test it.
+func (h *harness) captureMessages(t *testing.T) *[]string {
+	t.Helper()
+	var seen []string
+	original := h.upstream.Config.Handler
+	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/message") {
+			raw, _ := io.ReadAll(r.Body)
+			var payload struct {
+				Content string `json:"content"`
+			}
+			if json.Unmarshal(raw, &payload) == nil {
+				seen = append(seen, payload.Content)
+			}
+		}
+		original.ServeHTTP(w, r)
+	})
+	return &seen
+}
+
+// A video model is not a chat model, but it is accepted on the chat surface:
+// most clients only speak /v1/chat/completions, and refusing them there would
+// make the feature unreachable for exactly the callers who need it.
+func TestChatCompletionsRoutesAVideoModelThroughThePlugin(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("已提交")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-h3-max",
+		"messages": []any{map[string]any{"role": "user", "content": "一只猫在弹钢琴"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*seen))
+	}
+	text := (*seen)[0]
+
+	if !strings.HasPrefix(text, "@video-creater ") {
+		t.Errorf("turn does not open with the plugin reference:/n%s", text)
+	}
+	if !strings.Contains(text, "一只猫在弹钢琴") {
+		t.Errorf("prompt was dropped:/n%s", text)
+	}
+	// The upstream reads the block only at the very end of the message.
+	if !strings.HasSuffix(text, "</video-generation-options>") {
+		t.Errorf("options block is not last:/n%s", text)
+	}
+	if !strings.Contains(text, `"model":"MiniMax-H3-Max"`) {
+		t.Errorf("the selected model did not reach the options block:/n%s", text)
+	}
+}
+
+// A chat model must not be rewritten: the plugin reference would send every
+// ordinary conversation to a video plugin.
+func TestChatCompletionsLeavesChatModelsAlone(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("你好")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "你好"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(*seen) != 1 || (*seen)[0] != "你好" {
+		t.Fatalf("chat prompt was rewritten: %v", *seen)
+	}
+}
+
+func TestVideoGenerationsReturnsMedia(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	raw, _ := json.Marshal(map[string]any{
+		"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴",
+		"duration": 8, "ratio": "9:16", "resolution": "480P",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.VideoGenerations(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["status"] != "succeeded" {
+		t.Errorf("status = %v, want succeeded", payload["status"])
+	}
+	data, _ := payload["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data = %v, want one video", payload["data"])
+	}
+	first, _ := data[0].(map[string]any)
+	if first["url"] != "https://cdn/clip.mp4" {
+		t.Errorf("url = %v", first["url"])
+	}
+
+	// Every parameter the caller supplied has to survive into the options block.
+	if len(*seen) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*seen))
+	}
+	for _, want := range []string{`"duration":8`, `"ratio":"9:16"`, `"resolution":"480P"`, `"model":"MiniMax-H3-Max"`} {
+		if !strings.Contains((*seen)[0], want) {
+			t.Errorf("options block is missing %s:/n%s", want, (*seen)[0])
+		}
+	}
+}
+
+// Omitting a parameter must not stall the turn.
+//
+// The plugin's skill asks the user to confirm every unspecified choice before it
+// generates, and a headless call has nobody to answer — so a gap in the options
+// is not a harmless default, it is a request that never produces anything.
+func TestVideoGenerationsFillsInEveryUnspecifiedParameter(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	raw, _ := json.Marshal(map[string]any{"prompt": "一只猫在弹钢琴"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.VideoGenerations(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*seen))
+	}
+	text := (*seen)[0]
+	// Defaults come from the settings, so read them rather than hardcoding.
+	defaults := config.DefaultSettings(t.TempDir()).Video
+	for _, want := range []string{
+		`"duration":` + strconv.Itoa(defaults.DefaultDuration),
+		`"ratio":"` + defaults.DefaultRatio + `"`,
+		`"resolution":"` + defaults.DefaultResolution + `"`,
+		`"model":"MiniMax-H3-Max"`, // the default video model
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("options block is missing %s:/n%s", want, text)
+		}
+	}
+}
+
+// A caller that gets no video back has to be able to tell "still running" from
+// "failed" without reading prose, because the slow model legitimately returns
+// nothing within any timeout.
+func TestVideoGenerationsReportsPendingWhenNothingIsProduced(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("任务已提交，稍后生成完成")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	raw, _ := json.Marshal(map[string]any{"model": "minimax-h3", "prompt": "一只猫在弹钢琴"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.VideoGenerations(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a slow generation is not an error: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["status"] != "pending" {
+		t.Errorf("status = %v, want pending", payload["status"])
+	}
+	if detail, _ := payload["detail"].(string); !strings.Contains(detail, "任务已提交") {
+		t.Errorf("the agent's own answer was dropped: %v", payload["detail"])
+	}
+}
+
+// Naming a chat model on the video endpoint would send an ordinary conversation
+// to a plugin, so it is refused rather than silently accepted.
+func TestVideoGenerationsRejectsNonVideoModels(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	for _, model := range []string{"minimax-agent", "minimax-image", "does-not-exist"} {
+		raw, _ := json.Marshal(map[string]any{"model": model, "prompt": "一只猫"})
+		req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(raw))
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("authorization", "Bearer "+h.key)
+		rec := httptest.NewRecorder()
+		h.gateway.VideoGenerations(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("model %q: status = %d, want 400", model, rec.Code)
+		}
+	}
+}
+
+func TestVideoGenerationsRequiresAPrompt(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	raw, _ := json.Marshal(map[string]any{"model": "minimax-h3-max"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.VideoGenerations(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }

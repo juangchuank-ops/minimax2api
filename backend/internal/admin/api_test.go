@@ -289,6 +289,40 @@ func TestGetSettingsExposesEveryUpstreamAndServerField(t *testing.T) {
 			}
 		}
 	}
+
+	// Every section of the struct has to appear, including the ones that are
+	// handed to the encoder wholesale.
+	//
+	// The per-field checks above cannot see a section that was never added: a
+	// new settings group is one more line in getSettings, and forgetting that
+	// line produces a console that simply has no such panel and no error
+	// anywhere. Comparing against the struct's own json tags is what makes
+	// "added a settings group" and "wired it up" the same act.
+	for _, section := range structJSONTags(t, config.Settings{}) {
+		if _, ok := body[section]; !ok {
+			t.Errorf("settings section %q is not exposed by getSettings, so the console cannot show or edit it", section)
+		}
+	}
+}
+
+// structJSONTags returns the json tag of every field of a struct value.
+func structJSONTags(t *testing.T, value any) []string {
+	t.Helper()
+	kind := reflect.TypeOf(value)
+	if kind.Kind() != reflect.Struct {
+		t.Fatalf("structJSONTags needs a struct, got %s", kind.Kind())
+	}
+	tags := make([]string, 0, kind.NumField())
+	for i := 0; i < kind.NumField(); i++ {
+		field := kind.Field(i)
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "" || name == "-" {
+			t.Errorf("settings field %s has no json tag", field.Name)
+			continue
+		}
+		tags = append(tags, name)
+	}
+	return tags
 }
 
 // --- generated device fingerprints -----------------------------------------

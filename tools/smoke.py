@@ -215,6 +215,22 @@ def main():
                            {"model": "nope", "messages": [{"role": "user", "content": "hi"}]}, key)
     check("unknown model returns 400", status == 400, f"status={status}")
 
+    # Video is reached through a plugin rather than a model, so the catalogue
+    # entry and the route are the whole surface a caller can see. Both are
+    # checked here without spending anything: an empty body proves the route is
+    # wired (404/405 would mean it is not) and a chat model proves the endpoint
+    # is not silently accepting conversations.
+    status, payload = call(base, "/v1/models", "GET", None, key)
+    model_ids = {item.get("id") for item in (payload.get("data") or [])}
+    video_models = {"minimax-h3", "minimax-h3-max", "minimax-hailuo-2-3"}
+    check("video models are in the catalogue", video_models <= model_ids,
+          f"missing={sorted(video_models - model_ids)}")
+    status, _ = call(base, "/v1/videos/generations", "POST", {}, key)
+    check("video generation route is wired", status not in (404, 405), f"status={status}")
+    status, _ = call(base, "/v1/videos/generations", "POST",
+                     {"model": "minimax-agent", "prompt": "hi"}, key)
+    check("video endpoint refuses a chat model", status == 400, f"status={status}")
+
     if args.skip_upstream:
         print("\n8. gateway (skipped)")
         print("  [SKIP] upstream gateway calls (--skip-upstream)")

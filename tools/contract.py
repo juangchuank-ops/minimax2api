@@ -114,6 +114,13 @@ def main():
     print("\nopenai surface")
     probe(base, "models (public)", "/v1/models", "GET", None, key_value or token)
     probe(base, "health", "/health", "GET", None, None)
+    # The video route is probed with an empty body on purpose. A real request
+    # would spend the account's credits on a video nobody asked for, and the
+    # question here is only whether the path and verb are routed — which an
+    # empty body answers just as well: a missing route is 404/405, while a
+    # routed one validates the body and answers 400.
+    probe(base, "video generation (routed)", "/v1/videos/generations", "POST",
+          {}, key_value or token)
 
     print("\naccounts")
     probe(base, "account list", "/admin/api/accounts", "GET", None, token)

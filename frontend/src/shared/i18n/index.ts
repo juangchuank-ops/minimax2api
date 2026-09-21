@@ -353,6 +353,7 @@ const zhCN = {
       audit: "审计与日志",
       media: "媒体存储",
       signin: "每日签到",
+      video: "视频生成",
       about: "关于",
     },
     server: {
@@ -478,6 +479,22 @@ const zhCN = {
       upstreamLatency: "上游延迟",
       docs: "接口文档",
       upstreamURL: "上游站点",
+    },
+    video: {
+      title: "视频生成",
+      pluginName: "插件名",
+      pluginNameHelp:
+        "消息里用来点名插件的引用，写成 @插件名。H3 不是一个可选模型，而是 Agent 服务端调用的插件，只能靠这条引用触发。",
+      optionsTag: "参数标签",
+      optionsTagHelp: "承载生成参数的标签名。上游只认消息末尾的这个块，标签改名时要同步改这里。",
+      defaultRatio: "默认画幅",
+      defaultResolution: "默认分辨率",
+      defaultDuration: "默认时长",
+      defaultsHelp:
+        "调用方没传时用它兜底。这里的默认值比别处重要：上游会先问清楚没指定的项再开始生成，而接口调用没人可问，缺一项就不是走默认值，而是这轮什么都不产出。",
+      timeout: "单次超时",
+      timeoutHelp:
+        "视频单轮的超时预算，和对话超时分开。快变体本身就要生成约 20 秒；H3.0 官方标注 15-30 分钟，超过任何同步接口能等的范围，所以它只会返回「已提交」和任务信息。",
     },
     units: {
       seconds: "秒",
@@ -870,6 +887,7 @@ const en: typeof zhCN = {
       audit: "Audit & logs",
       media: "Media storage",
       signin: "Daily check-in",
+      video: "Video generation",
       about: "About",
     },
     server: {
@@ -995,6 +1013,23 @@ const en: typeof zhCN = {
       upstreamLatency: "Upstream latency",
       docs: "Documentation",
       upstreamURL: "Upstream site",
+    },
+    video: {
+      title: "Video generation",
+      pluginName: "Plugin name",
+      pluginNameHelp:
+        "The reference that selects the plugin in a message, written as @name. H3 is not a selectable model — it is a plugin the agent calls server-side — so this reference is the only way to reach it.",
+      optionsTag: "Options tag",
+      optionsTagHelp:
+        "The tag carrying the generation parameters. The upstream only reads it at the very end of a message, so a rename has to happen here and there together.",
+      defaultRatio: "Default ratio",
+      defaultResolution: "Default resolution",
+      defaultDuration: "Default duration",
+      defaultsHelp:
+        "Used when the caller leaves a value out. These defaults matter more than most: the upstream asks the user to confirm every unspecified choice before generating, and an API call has nobody to answer — so a missing value is not a fallback, it is a turn that produces nothing.",
+      timeout: "Turn timeout",
+      timeoutHelp:
+        "The budget for one video turn, separate from the chat timeout. The fast variant spends about 20 seconds generating; H3.0 is documented at 15-30 minutes, beyond anything a synchronous endpoint can wait for, so it returns a submission and a task reference instead.",
     },
     units: {
       seconds: "Seconds",

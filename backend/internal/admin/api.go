@@ -1695,6 +1695,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"audit":   settings.Audit,
 		"media":   settings.Media,
 		"signin":  settings.Signin,
+		"video":   settings.Video,
 		"about": map[string]any{
 			"version": gateway.Version, "buildTime": a.started.Format(time.RFC3339),
 			"dataDir": a.store.DataDir(), "upstreamURL": settings.Upstream.BaseURL,
@@ -1710,6 +1711,7 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		Audit         *config.AuditSettings    `json:"audit"`
 		Media         *config.MediaSettings    `json:"media"`
 		Signin        *config.SigninSettings   `json:"signin"`
+		Video         *config.VideoSettings    `json:"video"`
 		AdminPassword string                   `json:"adminPassword"`
 	}
 	if err := decode(r, &payload); err != nil {
@@ -1738,6 +1740,9 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.Signin != nil {
 			settings.Signin = *payload.Signin
+		}
+		if payload.Video != nil {
+			settings.Video = *payload.Video
 		}
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

@@ -289,7 +289,16 @@ def crosscheck_signatures(console, mock, recon_path):
     try:
         import minimax_sign
     except ImportError as error:
-        check("recon signer importable", False, str(error))
+        # Point at the directory that was wanted rather than repeating the
+        # import error. Passing the recon workspace root instead of its `code/`
+        # subdirectory is the obvious mistake, and "No module named
+        # 'minimax_sign'" does not say which one to pass.
+        check(
+            "recon signer importable",
+            False,
+            f"{error}; --recon must be the directory that contains minimax_sign.py "
+            f"(got {recon_path!r}, wanted something like {recon_path.rstrip('/')}/code)",
+        )
         return
 
     def to_int(value, fallback=0):

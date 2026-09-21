@@ -11,6 +11,7 @@
 **API 层**
 - `POST /v1/chat/completions` — 支持流式（SSE）与非流式，兼容 OpenAI 请求/响应格式
 - `POST /v1/images/generations` — 图像生成
+- `POST /v1/videos/generations` — 视频生成（MiniMax H3.0 / H3 Max / Hailuo 2.3，见「视频生成」）
 - `GET /v1/models` — 模型列表
 - `GET /health` — 健康检查 + 号池概览
 
@@ -159,16 +160,103 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## 模型映射
 
-| 模型 ID | 说明 |
-| --- | --- |
-| `minimax-agent` | 通用 Agent，自动规划并调用工具（默认） |
-| `minimax-m3` | 对话模式，响应更快 |
-| `minimax-m3-thinking` | 深度思考模式，推理内容走 `reasoning_content` |
-| `minimax-image` | 图像生成，走 `/v1/images/generations` |
+| 模型 ID | 类型 | 说明 |
+| --- | --- | --- |
+| `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
+| `minimax-m3` | chat | 对话模式，响应更快 |
+| `minimax-m3-thinking` | chat | 深度思考模式，推理内容走 `reasoning_content` |
+| `minimax-image` | image | 图像生成，走 `/v1/images/generations` |
+| `minimax-h3` | video | H3.0，质量优先；支持多模态参考；消耗账号积分 |
+| `minimax-h3-max` | video | H3 Max，约 20 秒完成；仅文生视频与首/尾帧；480P/768P；5-15 秒 |
+| `minimax-hailuo-2-3` | video | Hailuo 2.3，成本更低；可用 Token Plan；输出无声视频 |
 
-> **所有模型 ID 最终打的是同一个上游 Agent**。MiniMax Agent 的 Web API 里没有模型选择器，它返回什么取决于账号本身的权限。模型目录的作用是：给那些非要填模型名的客户端一个合法值，以及让管理台能按标签统计用量。
+> **chat 类模型 ID 最终打的是同一个上游 Agent**。MiniMax Agent 的 Web API 里没有模型选择器，它返回什么取决于账号本身的权限。模型目录的作用是：给那些非要填模型名的客户端一个合法值，以及让管理台能按标签统计用量。
+>
+> **video 类模型不是这么回事**：H3 在上游**根本不是一个可选模型**，而是一个插件。模型 ID 在这里承载的是「生成参数」而不是「路由选择」——详见下一节。
 >
 > 推理内容会被自动分离到 `reasoning_content`，不会混进正文——这是适配器按 payload 字段分流的，不依赖上游的事件编号。
+
+---
+
+## 视频生成
+
+**H3 不是模型，是插件。** 这一点决定了整个接入方式，值得先说清楚：
+
+- `GET /minimax-cloud/api/v1/config` 返回的是**权威模型清单**，里面只有对话模型（`MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed`）——**没有 H3**。
+- H3 挂在 `video-creater` 插件下（`GET /minimax-cloud/api/v1/plugins/enabled`）。在网页端，它是通过输入框里的**引用 chip** 触发的，不是通过 model 字段。
+- 网页端**没有任何视频端点**：真正提交生成的是 Agent 服务端的 Connector 工具（`connector__matrix__submit_video_generation`），客户端从不直接调用它。
+
+所以这个网关能控制的，只有「把这一轮话说成什么样」。而实测下来那就是全部的接入面：
+
+1. chip 在纯文本里序列化成 `@video-creater`，插件自己的 skill 就写着「用户显式 @video-creater 时使用」。
+   **已对真上游验证**：一条纯文本 `@video-creater` 消息确实路由到了插件，它按自己的说明答出了能力契约。
+2. 生成参数走消息末尾的 `<video-generation-options>` 块，不在请求体里。
+
+```jsonc
+// POST /v1/videos/generations
+{
+  "model": "minimax-h3-max",   // 省略时默认 minimax-h3-max（唯一能同步返回的）
+  "prompt": "一只猫在弹钢琴",
+  "duration": 8,               // 整数秒，省略时用设置里的默认值
+  "ratio": "16:9",
+  "resolution": "480P",
+  "image_url": "https://…"     // 可选，首帧图生视频
+}
+```
+
+上游实际收到的这一轮话长这样：
+
+```
+@video-creater 一只猫在弹钢琴
+
+<video-generation-options>
+{"duration":8,"model":"MiniMax-H3-Max","ratio":"16:9","resolution":"480P"}
+</video-generation-options>
+```
+
+块的格式不是猜的：它是网页端 bundle 里**写和读这一对函数**共同定义的形状，而两者互相吻合（写入端 `` `<${tag}>\n${JSON}\n</${tag}>` `` 前面空一行；读取端正则锚定在消息**末尾**）。`internal/minimax/video_test.go` 把上游那个正则原样搬过来，跑在本地写入端的输出上——改写格式会让它直接红。
+
+**响应**：
+
+```jsonc
+{ "created": 1790000000, "model": "minimax-h3-max",
+  "status": "succeeded",                      // 或 "pending"
+  "data": [{ "url": "/media/media_ab12cd34.mp4", "source_url": "https://…" }] }
+```
+
+`status` 让调用方不必解析正文就能分清「这一轮拿到成品了」和「没拿到」。但它的能力**到此为止**——它无法再区分「任务在跑」和「上游根本没执行」，那两种情况的差别只写在 `detail` 里：
+
+| 模型 | 典型耗时 | 同步接口能不能等到 |
+| --- | --- | --- |
+| `minimax-h3-max` | 约 20 秒 | 能，直接拿到可播放的 mp4 |
+| `minimax-h3` / `minimax-hailuo-2-3` | 15–30 分钟 | **不能**。超时后返回 `status: "pending"` 和 Agent 自己的原话——这一轮 HTTP 等不到结果 |
+
+> 把慢模型当成快模型处理，只会把「一个可用的中间答复」变成「一个网关超时」。所以这里不假装能同步等到。
+
+### ⚠️ 实测结论：格式已验证，但账号可能没有执行通道
+
+这个接入面被真上游验证过两次（同一账号、境外出口、`MiniMax-H3-Max` / 5s / 16:9 / 768P）：
+
+- ✅ **`@video-creater` 确实路由到插件**，options 块**四个参数一个不差被解析**——Agent 会原样复述
+  `user-specified model MiniMax-H3-Max, duration 5, ratio 16:9, resolution 768P`。
+  这段文本上游完全消化得了，**格式不需要再猜**。
+- ❌ **但两次都没产出 mp4，而原因不在网关**：Agent 自己的容器里没有可用的执行通道。它逐个查过四个位置，
+  全空——PATH 上的 `mcode-tools`、`<connected-app-tools>`、`<plugin-mcp-tools>`、`mavis`。
+  它按插件 skill 的要求拒绝改用裸 HTTP，也拒绝在拿不到成品时谎报成功，只留下自己的原话：
+
+  > The plugin skill lists `video-creater:write-h3-prompts` only, with no connected-app-tools or plugin-mcp-tools.
+
+  这说明**该账号侧没有开通这条执行通道**（套餐限制？插件只装了 skill 文档、没装 Connector）。
+  从 API 走必然撞同一堵墙，网页端也走同一条 Connector 链路。
+
+**★ 扣费与产出是解耦的**：两次共消耗 **50 积分**（1187 → 1161 → 1137），**零产出**。不要把「余额下降」当成「生成成功」的证据。
+
+**判断到底发生了什么，只能读 `detail`**——也就是 Agent 的原话，它是唯一可信的状态源。
+`status: "pending"` 加上一段「我没有这个工具 / 我无法提交」的解释，意思是上游拒了，不是网关吞了，而且**不会稍后变成功**。
+
+**参数为什么要填满**：插件自己的 skill 会**先问清楚没指定的项再开始生成**，而接口调用没人可答。所以少一个参数不是「走上游默认值」，而是这一轮什么都不产出。调用方没传的项会用设置里的默认值补齐（`video.defaultDuration` / `defaultRatio` / `defaultResolution`）。
+
+**计费**：H3 和 H3 Max 消耗**账号积分**、不占 Token Plan；Hailuo 2.3 是更低成本、可用 Token Plan 的无声选项。积分用尽会由号池跳过该账号（与签到共用同一套判断）。
 
 ---
 
@@ -194,6 +282,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - **审计**：保留天数、最大记录数、是否记录请求体、请求体长度上限
 - **媒体**：生成文件目录、公开访问前缀、总容量上限、是否自动转存
 - **签到**：开关、每日时刻、账号间隔、请求超时、是否跳过零积分账号、积分新鲜期、积分刷新间隔、时区偏移、浏览器指纹字段、三条端点路径
+- **视频生成**：插件名（`@` 后面的引用）、参数标签名、默认画幅 / 分辨率 / 时长、单轮超时
 
 ---
 
@@ -645,6 +734,27 @@ agent 侧的初始化。不调它新号发消息会 500（报 `Environment Varia
 
 **Q：想换调度策略？**
 管理台 → 系统设置 → 路由 → 调度策略。单人用推荐 `least_inflight`，多账号均匀分摊用 `round_robin`。
+
+**Q：`/v1/videos/generations` 返回 `status: "pending"` 且 `data` 是空的，是失败了吗？**
+**不能只看 `status`。** `pending` 的准确含义是「这一轮没有产出视频」，它把两种完全不同的情况合在了一起：
+
+1. 任务确实提交了，只是这一轮等不到成品——慢模型（`minimax-h3` / `minimax-hailuo-2-3`）官方标注 15–30 分钟，任何同步 HTTP 接口都等不到；
+2. 上游**根本没有执行**——比如账号侧没有可用的 Connector 通道（实测遇到过，见「视频生成」一节的实测结论）。
+
+区别只写在 `detail` 里，也就是 Agent 自己的原话，**请读它**。如果 `detail` 在解释「我没有这个工具 / 我无法提交」，那这一轮**不会**稍后变成成功——但积分可能已经扣掉了。
+
+想要一个能同步拿到 mp4 的模型，用 `minimax-h3-max`（约 20 秒）。想要慢模型的话，需要的是「提交 + 稍后查询」的异步接口，目前这个网关没有——见「视频生成」一节。
+
+**Q：视频生成请求发出去了，但 Agent 反过来问我时长/分辨率？**
+说明参数没填满。插件会**先问清楚没指定的项再开始生成**，而接口调用没人可答——所以少一个参数不是走上游默认值，而是这一轮什么都不产出。给 `duration` / `ratio` / `resolution` 都传上，或者确认系统设置 →「视频生成」里的默认值不是空的。
+
+**Q：模型页多了几个模型，是自动加的吗？**
+是。`minimax-h3` / `minimax-h3-max` / `minimax-hailuo-2-3` 是内置条目，启动时会**合并**进已有目录。
+
+这里值得说明为什么是「合并」而不是「有就用、没有才建」：全新安装会把整套内置模型写进 `app.json`，如果只在这份清单为空时才播种，那么**后续版本新增的模型只会出现在新安装上**，存量实例上毫无症状——清单看起来只是一份普通的、短一点的清单。这跟设置默认值那个坑是同一个形状，所以修法也一样：比对内置清单、补齐缺的、**写回磁盘**。已经存在的条目原样保留，你在管理台关掉的模型不会被重新打开。
+
+**Q：生成的视频/图片下载不下来？**
+转存走的是和 API **同一个代理**（`upstream.proxy`）。生成物在 MiniMax 的 CDN 上，账号的出口围栏对它同样适用——本地直连下载会失败，而且失败形态是超时或连接重置，读起来像 CDN 挂了，而不是「请求走错了出口」。回环地址同样绕过代理。
 
 **Q：生成的图片存哪了？**
 默认转存到 `data/generated/`，通过 `/media/` 对外提供。可在系统设置里改目录、公开前缀和容量上限。

@@ -20,6 +20,18 @@ const (
 	KindGuest = "guest"
 )
 
+// Model types.
+//
+// The distinction is not cosmetic: the gateway dispatches on it. A chat model
+// goes to the conversation API unchanged; a video model is rewritten into a
+// plugin reference with generation parameters attached, because MiniMax-H3 is
+// not selectable as a model at all.
+const (
+	ModelTypeChat  = "chat"
+	ModelTypeImage = "image"
+	ModelTypeVideo = "video"
+)
+
 // Account regions. MiniMax operates two deployments with separate account
 // databases, and a token issued by one is rejected by the other, so the region
 // has to travel with the account.
@@ -258,15 +270,24 @@ type Admin struct {
 }
 
 type ModelConfig struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Upstream    string `json:"upstream"`
-	Type        string `json:"type"`
-	Enabled     bool   `json:"enabled"`
-	Builtin     bool   `json:"builtin"`
-	Description string `json:"description"`
-	Requests    int64  `json:"requests"`
-	Tokens      int64  `json:"tokens"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Upstream string `json:"upstream"`
+	// UpstreamModel is the model identifier the upstream itself uses, when one
+	// exists.
+	//
+	// It is not the same thing as Upstream. That field is a *local* dispatch
+	// hint (`agent`, `chat`, `think`, `image`) and never leaves this process;
+	// this one is a value the upstream recognises — `MiniMax-H3`, for instance,
+	// which the video plugin expects to receive as a generation parameter.
+	// Empty for the chat entries, which have no model selector to fill in.
+	UpstreamModel string `json:"upstreamModel"`
+	Type          string `json:"type"`
+	Enabled       bool   `json:"enabled"`
+	Builtin       bool   `json:"builtin"`
+	Description   string `json:"description"`
+	Requests      int64  `json:"requests"`
+	Tokens        int64  `json:"tokens"`
 }
 
 type State struct {
@@ -282,27 +303,81 @@ type State struct {
 
 // BuiltinModels is the model catalogue exposed through /v1/models.
 //
-// Every entry reaches the same upstream agent: MiniMax Agent has no model
-// selector in its web API, it serves whatever the account is entitled to. The
-// catalogue exists so clients that insist on naming a model have something
-// valid to send, and so the console can report usage per label.
+// The chat entries all reach the same upstream agent: MiniMax Agent has no
+// model selector in its web API, it serves whatever the account is entitled to.
+// They exist so clients that insist on naming a model have something valid to
+// send, and so the console can report usage per label.
+//
+// The video entries are different in kind. MiniMax-H3 is not reachable as a
+// chat model at all — it is a plugin the agent calls server-side, selected by
+// mentioning the plugin in the message text. What the model entry carries is
+// therefore not a routing decision but the *generation parameter*: the value
+// that goes into the `<video-generation-options>` block.
 func BuiltinModels() []*ModelConfig {
 	return []*ModelConfig{
 		{
-			ID: "minimax-agent", Name: "MiniMax Agent", Upstream: "agent", Type: "chat",
+			ID: "minimax-agent", Name: "MiniMax Agent", Upstream: "agent", Type: ModelTypeChat,
 			Enabled: true, Builtin: true, Description: "通用 Agent，自动规划并调用工具",
 		},
 		{
-			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", Type: "chat",
+			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", Type: ModelTypeChat,
 			Enabled: true, Builtin: true, Description: "对话模式，响应更快",
 		},
 		{
-			ID: "minimax-m3-thinking", Name: "MiniMax M3 Thinking", Upstream: "think", Type: "chat",
+			ID: "minimax-m3-thinking", Name: "MiniMax M3 Thinking", Upstream: "think", Type: ModelTypeChat,
 			Enabled: true, Builtin: true, Description: "深度思考模式，附带推理内容",
 		},
 		{
-			ID: "minimax-image", Name: "MiniMax Image", Upstream: "image", Type: "image",
+			ID: "minimax-image", Name: "MiniMax Image", Upstream: "image", Type: ModelTypeImage,
 			Enabled: true, Builtin: true, Description: "图像生成",
 		},
+		{
+			ID: "minimax-h3", Name: "MiniMax H3.0", Upstream: "video", UpstreamModel: "MiniMax-H3",
+			Type: ModelTypeVideo, Enabled: true, Builtin: true,
+			Description: "视频生成，质量优先；消耗账号积分，不占用 Token Plan；支持多模态参考",
+		},
+		{
+			ID: "minimax-h3-max", Name: "MiniMax H3 Max", Upstream: "video", UpstreamModel: "MiniMax-H3-Max",
+			Type: ModelTypeVideo, Enabled: true, Builtin: true,
+			Description: "视频生成，约 20 秒完成；仅支持文生视频与首/尾帧，480P/768P，5-15 秒",
+		},
+		{
+			ID: "minimax-hailuo-2-3", Name: "MiniMax Hailuo 2.3", Upstream: "video",
+			UpstreamModel: "MiniMax-Hailuo-2.3",
+			Type:          ModelTypeVideo, Enabled: true, Builtin: true,
+			Description: "视频生成，成本更低；可用 Token Plan；输出无声视频",
+		},
 	}
+}
+
+// MergeBuiltinModels adds any built-in entry the stored catalogue is missing.
+//
+// Without this a new built-in never reaches an existing install. `Open` only
+// seeds the catalogue when it is *empty*, so on every install that already has
+// models the list is whatever that install first froze — and a release that adds
+// a model would ship it to new users only, with no symptom on anyone else's
+// machine. That is the same trap the settings defaults fall into; the difference
+// is that here the fix has to be a merge, because the stored list is also where
+// the operator's own enable/disable choices and usage counters live and must not
+// be replaced.
+//
+// Entries already present are left exactly as stored. Only the *existence* of a
+// built-in is enforced, never its state.
+func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
+	known := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model != nil && model.ID != "" {
+			known[model.ID] = struct{}{}
+		}
+	}
+	changed := false
+	for _, builtin := range BuiltinModels() {
+		if _, ok := known[builtin.ID]; ok {
+			continue
+		}
+		models = append(models, builtin)
+		known[builtin.ID] = struct{}{}
+		changed = true
+	}
+	return models, changed
 }

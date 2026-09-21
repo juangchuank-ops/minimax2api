@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CalendarCheck, ExternalLink, RefreshCw, Server, Settings2, Shield, Sparkles, Waves, ScrollText } from "lucide-react";
+import { CalendarCheck, ExternalLink, Film, RefreshCw, Server, Settings2, Shield, Sparkles, Waves, ScrollText } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -76,10 +76,17 @@ type Draft = {
   signinClaimPath: string;
   signinCreditPath: string;
   signinCreditDetailsPath: string;
+  videoPluginName: string;
+  videoOptionsTag: string;
+  videoDefaultRatio: string;
+  videoDefaultResolution: string;
+  videoDefaultDuration: number;
+  videoTimeoutSec: number;
 };
 
 function toDraft(settings: SettingsDTO): Draft {
   const signin = settings.signin;
+  const video = settings.video;
   return {
     ...settings.server,
     adminPassword: "",
@@ -107,6 +114,12 @@ function toDraft(settings: SettingsDTO): Draft {
     signinClaimPath: signin.claimPath,
     signinCreditPath: signin.creditPath,
     signinCreditDetailsPath: signin.creditDetailsPath,
+    videoPluginName: video.pluginName,
+    videoOptionsTag: video.optionsTag,
+    videoDefaultRatio: video.defaultRatio,
+    videoDefaultResolution: video.defaultResolution,
+    videoDefaultDuration: video.defaultDuration,
+    videoTimeoutSec: video.timeoutSec,
   };
 }
 
@@ -189,6 +202,14 @@ export function SettingsPage() {
           claimPath: value.signinClaimPath,
           creditPath: value.signinCreditPath,
           creditDetailsPath: value.signinCreditDetailsPath,
+        },
+        video: {
+          pluginName: value.videoPluginName,
+          optionsTag: value.videoOptionsTag,
+          defaultRatio: value.videoDefaultRatio,
+          defaultResolution: value.videoDefaultResolution,
+          defaultDuration: value.videoDefaultDuration,
+          timeoutSec: value.videoTimeoutSec,
         },
         ...(value.adminPassword ? { adminPassword: value.adminPassword } : {}),
       }),
@@ -583,6 +604,50 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.signinCreditDetailsPath}
               onChange={(event) => set("signinCreditDetailsPath", event.target.value)}
+            />
+          </Field>
+        </SettingsGroup>
+
+        <SettingsGroup icon={<Film />} title={t("settings.groups.video")}>
+          <Field label={t("settings.video.pluginName")} help={t("settings.video.pluginNameHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.videoPluginName}
+              onChange={(event) => set("videoPluginName", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.video.optionsTag")} help={t("settings.video.optionsTagHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.videoOptionsTag}
+              onChange={(event) => set("videoOptionsTag", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.video.defaultRatio")} help={t("settings.video.defaultsHelp")}>
+            <Input value={draft.videoDefaultRatio} onChange={(event) => set("videoDefaultRatio", event.target.value)} />
+          </Field>
+          <Field label={t("settings.video.defaultResolution")} help={t("settings.video.defaultsHelp")}>
+            <Input
+              value={draft.videoDefaultResolution}
+              onChange={(event) => set("videoDefaultResolution", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.video.defaultDuration")} unit={t("settings.units.seconds")}>
+            <Input
+              type="number"
+              min={1}
+              max={60}
+              value={draft.videoDefaultDuration}
+              onChange={(event) => set("videoDefaultDuration", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.video.timeout")} unit={t("settings.units.seconds")} help={t("settings.video.timeoutHelp")}>
+            <Input
+              type="number"
+              min={30}
+              max={3600}
+              value={draft.videoTimeoutSec}
+              onChange={(event) => set("videoTimeoutSec", Number(event.target.value))}
             />
           </Field>
         </SettingsGroup>

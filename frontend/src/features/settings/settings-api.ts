@@ -68,6 +68,14 @@ export type SettingsDTO = {
     creditPath: string;
     creditDetailsPath: string;
   };
+  video: {
+    pluginName: string;
+    optionsTag: string;
+    defaultRatio: string;
+    defaultResolution: string;
+    defaultDuration: number;
+    timeoutSec: number;
+  };
   about: {
     version: string;
     buildTime: string;

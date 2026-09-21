@@ -3,9 +3,14 @@ package minimax
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"strings"
 	"time"
+
+	"minimax2api/internal/config"
 )
 
 // randomUUID returns a RFC 4122 v4 UUID string.
@@ -31,4 +36,43 @@ func parseProxy(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("invalid proxy %q: missing host", raw)
 	}
 	return parsed, nil
+}
+
+// DownloadClient returns an HTTP client for fetching generated media.
+//
+// Generated images and videos are served from MiniMax's CDN, and the same
+// egress fence that applies to the API applies to it: an account is only usable
+// from an overseas IP, so a download attempted from the local one fails — and it
+// fails as a timeout or a reset, which reads as the CDN being down rather than
+// as the request having gone out the wrong door. The console's proxy is
+// therefore used here too, not just for API calls.
+//
+// Loopback is exempt for the same reason it is exempt on the API path: a proxy
+// cannot reach 127.0.0.1, and sending it there turns a local mirror into an
+// empty-bodied 502.
+func DownloadClient(settings config.Settings) *http.Client {
+	transport := &http.Transport{
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	if raw := strings.TrimSpace(settings.Upstream.Proxy); raw != "" {
+		if proxyURL, err := parseProxy(raw); err == nil {
+			transport.Proxy = func(target *http.Request) (*url.URL, error) {
+				if isLoopbackHost(target.URL.Hostname()) {
+					return nil, nil
+				}
+				return proxyURL, nil
+			}
+		}
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) > 5 {
+				return errors.New("too many redirects")
+			}
+			return nil
+		},
+	}
 }

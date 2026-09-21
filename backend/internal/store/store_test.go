@@ -349,3 +349,109 @@ func TestOpeningARepairedSettingsFileWritesTheRepairBack(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// A built-in added by a later release has to reach installs that already exist.
+//
+// `Open` seeds the catalogue only when it is empty, and a fresh install freezes
+// a copy of every built-in into the state file — so a release that adds a model
+// would ship it to new users only. There is no symptom on anyone else's machine:
+// the stored list looks like a perfectly ordinary catalogue, just a shorter one.
+// That is the same trap the settings defaults fall into, and it is worth a test
+// because the failure is invisible rather than loud.
+func TestOpeningAnOlderCatalogueAddsNewBuiltins(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed the catalogue as an earlier release left it: every built-in except
+	// the video ones, with one entry deliberately disabled and one carrying
+	// usage counters. Those two details are the point — a merge that replaced
+	// the stored list instead of extending it would silently re-enable a model
+	// the operator turned off and zero their statistics.
+	older := make([]*ModelConfig, 0, 4)
+	for _, model := range BuiltinModels() {
+		if model.Type == ModelTypeVideo {
+			continue
+		}
+		older = append(older, model)
+	}
+	if len(older) == 0 {
+		t.Fatal("the catalogue has no chat entries to seed with")
+	}
+	older[0].Enabled = false
+	older[0].Requests = 42
+	older[0].Tokens = 1234
+
+	raw, err := json.Marshal(State{
+		Version:  schemaVersion,
+		Admin:    Admin{Username: "admin", Salt: "seeded", PasswordHash: "seeded"},
+		Settings: config.DefaultSettings(dir),
+		Models:   older,
+	})
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, stateFile), raw, 0o644); err != nil {
+		t.Fatalf("seed %s: %v", stateFile, err)
+	}
+
+	st, err := Open(dir, "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// Every built-in is present...
+	for _, builtin := range BuiltinModels() {
+		got, ok := st.ModelByID(builtin.ID)
+		if !ok {
+			t.Errorf("built-in %q never reached an existing install", builtin.ID)
+			continue
+		}
+		if builtin.Type == ModelTypeVideo && got.UpstreamModel == "" {
+			t.Errorf("video model %q has no upstream model id, so a generation request would carry nothing", builtin.ID)
+		}
+	}
+
+	// ...and the stored state of the entries that were already there is intact.
+	kept, ok := st.ModelByID(older[0].ID)
+	if !ok {
+		t.Fatalf("pre-existing model %q disappeared", older[0].ID)
+	}
+	if kept.Enabled {
+		t.Errorf("model %q was re-enabled by the merge; the operator's choice was overwritten", older[0].ID)
+	}
+	if kept.Requests != 42 || kept.Tokens != 1234 {
+		t.Errorf("model %q lost its counters: requests=%d tokens=%d", older[0].ID, kept.Requests, kept.Tokens)
+	}
+
+	// The merge is written back, for the same reason a repaired setting is: a
+	// file that describes a shorter catalogue than the process is serving makes
+	// the next release do this work again.
+	var onDisk State
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if content, readErr := os.ReadFile(filepath.Join(dir, stateFile)); readErr == nil {
+			if json.Unmarshal(content, &onDisk) == nil && len(onDisk.Models) == len(BuiltinModels()) {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the merged catalogue never reached %s: %d models", stateFile, len(onDisk.Models))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Merging twice must be a no-op, or every open would append duplicates.
+func TestMergeBuiltinModelsIsIdempotent(t *testing.T) {
+	merged, changed := MergeBuiltinModels(nil)
+	if !changed {
+		t.Fatal("an empty catalogue should gain every built-in")
+	}
+	again, changedAgain := MergeBuiltinModels(merged)
+	if changedAgain {
+		t.Error("merging an already-complete catalogue reported a change")
+	}
+	if len(again) != len(merged) {
+		t.Errorf("merge duplicated entries: %d -> %d", len(merged), len(again))
+	}
+}

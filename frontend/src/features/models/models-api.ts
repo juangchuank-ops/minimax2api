@@ -4,6 +4,11 @@ export type ModelDTO = {
   id: string;
   name: string;
   upstream: string;
+  // The model identifier the upstream itself uses, when one exists. Only the
+  // video entries have one: it is the value that goes into a generation
+  // request, and it is not the same as `upstream`, which is a local dispatch
+  // hint that never leaves this process.
+  upstreamModel: string;
   type: "chat" | "image" | "video";
   enabled: boolean;
   builtin: boolean;
