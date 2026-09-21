@@ -56,20 +56,21 @@ const videoOptionsTag = "video-generation-options"
 // defaultVideoPlugin is the plugin reference the agent routes on.
 const defaultVideoPlugin = "video-creater"
 
-// VideoClientIntent is the `client_intent` that sends a turn to the video
-// service rather than to the agent.
+// VideoClientIntent is the `client_intent` a video turn carries.
 //
 // Recovered from the web bundle's own tool-kind table, where all four video
 // tools — BatchTextToVideo, BatchImageToVideo, VideosRead, VideosUnderstand —
 // map to this one string. The sibling entries in that table (`generate_image`,
 // `audio_generation`, `describe_image`) are what make it credible: it is a
-// routing vocabulary, not a single magic value.
+// routing vocabulary, not a single magic value. The same bundle declares it as
+// an optional field of the message request, so it is part of the protocol
+// rather than something inferred from a sample.
 //
-// It is not decoration. A video turn and a chat turn can carry the identical
-// `content` — same `@plugin` mention, same options block — and end differently:
-// without an intent the turn goes to the agent, which then has to find a tool
-// that can render video and reports honestly when it cannot. The two are
-// indistinguishable from outside right up until one of them produces a file.
+// What it does *not* have is proof of an effect. It was tried once early on,
+// against the entry point that has since turned out to be the wrong one, and
+// made no difference there — which isolates nothing. It is sent on every video
+// turn because that is what the web client does, not because it has been shown
+// to change the outcome.
 const VideoClientIntent = "video_generation"
 
 // Normalize fills in whatever the caller left out and rejects what cannot be
