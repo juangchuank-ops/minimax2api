@@ -226,6 +226,41 @@ func TestStreamBaseURLFollowsTheCapture(t *testing.T) {
 	}
 }
 
+// A transport failure must not carry the credential.
+//
+// net/http includes the whole URL in its error message, and every URL this
+// client builds carries the token in its query — so an error passed along
+// verbatim writes the token into whatever reads it next: a log line, an audit
+// record, or an API response. This is not hypothetical: it is exactly how a
+// failed balance check during a manual run printed a live token.
+func TestTransportErrorsDoNotCarryTheCredential(t *testing.T) {
+	settings := configWithUpstream()
+	// A closed port, so the failure is a transport error rather than a status.
+	settings.Upstream.BaseURL = "http://127.0.0.1:1"
+	settings.Upstream.StreamBaseURL = ""
+	client := New(func() config.Settings { return settings })
+
+	cred := Credential{
+		Token: "SECRET-TOKEN-VALUE", UUID: "u", DeviceID: "12345678", UserID: "42",
+	}
+	_, err := client.ProbeEndpoint(context.Background(), cred, http.MethodGet,
+		"/minimax-cloud/api/v1/config", nil, false)
+	if err == nil {
+		t.Fatal("expected a transport error against a closed port")
+	}
+	if strings.Contains(err.Error(), cred.Token) {
+		t.Fatalf("the error carries the token: %v", err)
+	}
+	// The host and path stay: without them the error says nothing about which
+	// upstream was unreachable, which is the one thing it is for.
+	if !strings.Contains(err.Error(), "127.0.0.1:1") {
+		t.Fatalf("the error lost the host: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/minimax-cloud/api/v1/config") {
+		t.Fatalf("the error lost the path: %v", err)
+	}
+}
+
 // The agent id and session id are substituted without going through net/url,
 // so the query order survives byte for byte.
 func TestBuildURLSubstitutesPathPlaceholders(t *testing.T) {

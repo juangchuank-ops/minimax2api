@@ -428,7 +428,8 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 
 func (c *Client) do(req *http.Request, settings config.Settings) (*http.Response, error) {
 	if settings.Upstream.Proxy == "" {
-		return c.http.Do(req)
+		resp, err := c.http.Do(req)
+		return resp, transportError(err)
 	}
 	proxyURL, err := parseProxy(settings.Upstream.Proxy)
 	if err != nil {
@@ -458,7 +459,33 @@ func (c *Client) do(req *http.Request, settings config.Settings) (*http.Response
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	return resp, transportError(err)
+}
+
+// transportError strips the request URL out of a transport failure.
+//
+// net/http puts the whole URL into its error message, and this client's URLs
+// carry the credential in their query — so an error passed along verbatim writes
+// the token into whatever reads it next: a log line, an audit record, or an API
+// response. The host and path survive because they are what makes a transport
+// failure diagnosable at all; the query does not, because it is a credential.
+//
+// This is not hypothetical: it is how a failed balance check during a manual
+// run printed a live token.
+func transportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil {
+		parsed.RawQuery = ""
+		return fmt.Errorf("%s %s: %w", urlErr.Op, parsed.String(), urlErr.Err)
+	}
+	return fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
 }
 
 // isLoopbackHost reports whether a host names the local machine.
