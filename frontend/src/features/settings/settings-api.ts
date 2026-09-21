@@ -9,6 +9,7 @@ export type SettingsDTO = {
   upstream: {
     baseURL: string;
     baseURLCN: string;
+    streamBaseURL: string;
     agentID: string;
     sessionPath: string;
     messagePath: string;

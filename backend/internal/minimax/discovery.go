@@ -22,10 +22,20 @@ const (
 
 // DefaultAgentRole is the agent the gateway drives.
 //
-// The account's other agents (coder, chat, mavis, verifier) are left alone;
-// pinning a specific id is still possible through the global or per-account
-// AgentID setting, which takes precedence over discovery.
-const DefaultAgentRole = "general"
+// `mavis` rather than `general`, on two pieces of evidence that agree: the
+// captured web client opens its session against a mavis agent, and the skill
+// that carries the video tooling (`mcode-tools-master`) is published under
+// `Mavis/`. `general` — what earlier builds drove — answers normally and is
+// kept as the fallback below, so an account without a mavis agent still works.
+//
+// The account's other agents (coder, chat, verifier) are left alone; pinning a
+// specific id is still possible through the global or per-account AgentID
+// setting, which takes precedence over discovery.
+const DefaultAgentRole = "mavis"
+
+// fallbackAgentRole is used when the account has no agent of the preferred
+// role. It is the role earlier builds drove, so it is known to answer.
+const fallbackAgentRole = "general"
 
 // knownAgentRoles are the agent *kinds* the upstream uses.
 //
@@ -76,19 +86,60 @@ func (p *PrepareResult) AgentID() string {
 	if p == nil {
 		return ""
 	}
-	for _, agent := range p.Agents {
-		if agent.Role == DefaultAgentRole && agent.ID != "" {
-			return agent.ID
+	for _, role := range []string{DefaultAgentRole, fallbackAgentRole} {
+		for _, agent := range p.Agents {
+			if agent.Role == role && agent.ID != "" {
+				return agent.ID
+			}
 		}
 	}
-	// The general agent is missing. Any agent beats no agent, so take the first
-	// one that has an id rather than refusing to work.
+	// Neither role is present. Any agent beats no agent, so take the first one
+	// that has an id rather than refusing to work.
 	for _, agent := range p.Agents {
 		if agent.ID != "" {
 			return agent.ID
 		}
 	}
 	return ""
+}
+
+// ResolveAgentID returns the id to store for this account and whether it
+// differs from the one already stored.
+//
+// A stored id is a *cache of an earlier discovery*, not an instruction: the role
+// the gateway drives can change between builds, and an install that keeps the
+// old id would keep driving the old agent with no symptom at all. That is why
+// the stored id is revisited rather than only filled in when empty.
+//
+// The one thing it will not do is overwrite a hand-pinned id. An id that does
+// not appear in the account's agent list did not come from a discovery, so it is
+// left alone — the same rule the rest of the config follows, where a value that
+// could not have been produced by the defaults is treated as intent.
+func (p *PrepareResult) ResolveAgentID(stored string) (string, bool) {
+	preferred := p.AgentID()
+	if preferred == "" || preferred == stored {
+		return stored, false
+	}
+	if stored == "" {
+		return preferred, true
+	}
+	if !p.knowsAgent(stored) {
+		return stored, false
+	}
+	return preferred, true
+}
+
+// knowsAgent reports whether the id appears in the account's agent list.
+func (p *PrepareResult) knowsAgent(id string) bool {
+	if p == nil {
+		return false
+	}
+	for _, agent := range p.Agents {
+		if agent.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Prepare runs the agent-side opening sequence: the three reads the web client
@@ -207,8 +258,7 @@ func (c *Client) callAgent(ctx context.Context, settings config.Settings, cred C
 	if strings.TrimSpace(cred.Token) == "" {
 		return nil, ErrInvalidCredential
 	}
-	rawURL := c.buildURL(settings, cred, path, "")
-	req, err := c.newRequest(ctx, settings, cred, method, rawURL, body)
+	req, err := c.newRequest(ctx, settings, cred, method, requestTarget{Path: path}, body)
 	if err != nil {
 		return nil, err
 	}
@@ -218,4 +268,20 @@ func (c *Client) callAgent(ctx context.Context, settings config.Settings, cred C
 	}
 	defer resp.Body.Close()
 	return decodeJSONResponse(resp, "agent")
+}
+
+// CallAgent makes one signed request against the agent API and returns the
+// decoded payload.
+//
+// Exported for diagnostics, not for the request path. It answers the question a
+// completion cannot: *what is this account actually able to do?* An agent's
+// skills listing (`/minimax-cloud/api/v1/skill`) is readable without spending
+// anything, which makes it the cheap way to tell "the gateway composed the
+// wrong request" apart from "this account has no working execution channel" —
+// two failures that look identical from the outside, right up until one of them
+// costs money to disprove.
+//
+// The path may carry its own query string.
+func (c *Client) CallAgent(ctx context.Context, cred Credential, method, path string, body []byte) (map[string]any, error) {
+	return c.callAgent(ctx, c.settings(), cred, method, path, body)
 }

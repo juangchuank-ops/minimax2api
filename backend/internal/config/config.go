@@ -188,7 +188,20 @@ type UpstreamSettings struct {
 	RequestTimeoutSec    int    `json:"requestTimeoutSec"`
 	StreamIdleTimeoutSec int    `json:"streamIdleTimeoutSec"`
 	Proxy                string `json:"proxy"`
-	UserAgent            string `json:"userAgent"`
+	// StreamBaseURL overrides the host the conversation endpoint answers on.
+	//
+	// It is separate from BaseURL because the captured web client posts
+	// messages to `agent-stream.<domain>` while every other call stays on the
+	// API host — and the two hosts are not interchangeable: the same path on
+	// the API host reaches a different entry point, which is exactly what the
+	// gateway did before this field existed.
+	//
+	// Empty means "derive it from BaseURL", which is the better default: it
+	// follows an install or an account that has been pointed somewhere else
+	// (a self-hosted relay, a test server) instead of overriding it with a
+	// hostname those deployments do not have.
+	StreamBaseURL string `json:"streamBaseURL"`
+	UserAgent     string `json:"userAgent"`
 }
 
 type RoutingSettings struct {
@@ -233,6 +246,13 @@ type MediaSettings struct {
 const (
 	legacyDefaultSessionPath = "/agent/{agent_id}/session"
 	legacyDefaultAgentID     = "general"
+	// legacyDefaultMessagePath is a different kind of entry: it was not broken,
+	// it was merely the wrong *door*. It answers, and the agent replies, but the
+	// entry point it names hands the agent no rendering tool — so every video
+	// request came back as a friendly description of a video that was never
+	// made. The captured web client uses the `/minimax-cloud` path below, on the
+	// streaming host; the two go together, which is why both are migrated.
+	legacyDefaultMessagePath = "/archon/api/v1/session/{session_id}/message"
 )
 
 // DefaultSettings returns the built-in runtime configuration.
@@ -254,7 +274,7 @@ func DefaultSettings(dataDir string) Settings {
 			// import it (the dependency runs the other way), so the agreement is
 			// pinned by a test in the minimax package instead.
 			SessionPath:          "/minimax-cloud/api/v1/agent/{agent_id}/session",
-			MessagePath:          "/archon/api/v1/session/{session_id}/message",
+			MessagePath:          "/minimax-cloud/api/v1/session/{session_id}/message",
 			UserInfoPath:         "/v1/api/user/info",
 			AgentListPath:        "/minimax-cloud/api/v1/agent",
 			ConfigPath:           "/minimax-cloud/api/v1/config",
@@ -372,6 +392,13 @@ func (s *Settings) Normalize(dataDir string) bool {
 		s.Upstream.AgentID = def.Upstream.AgentID
 	}
 	if s.Upstream.MessagePath == "" {
+		s.Upstream.MessagePath = def.Upstream.MessagePath
+	}
+	// The message path and the streaming host go together: the path was captured
+	// on that host, and pointing one at the other is a combination that was never
+	// observed. Migrating both keeps an upgraded instance on the pair the web
+	// client actually uses.
+	if s.Upstream.MessagePath == legacyDefaultMessagePath {
 		s.Upstream.MessagePath = def.Upstream.MessagePath
 	}
 	if s.Upstream.UserInfoPath == "" {

@@ -1300,12 +1300,14 @@ func (a *API) prepareAccount(ctx context.Context, id string) {
 	// happened before any check-in can pay out.
 	prepared, _ := a.client.Prepare(ctx, cred)
 
-	if strings.TrimSpace(account.AgentID) == "" {
-		if agentID := prepared.AgentID(); agentID != "" {
-			_, _ = a.store.UpdateAccounts([]string{id}, func(target *store.Account) {
-				target.AgentID = agentID
-			})
-		}
+	// Revisited rather than only filled in: the role the gateway drives can
+	// change between builds, and an account that keeps an id discovered by an
+	// older build would keep driving the older agent — silently. A hand-pinned
+	// id is left alone; see PrepareResult.ResolveAgentID.
+	if agentID, changed := prepared.ResolveAgentID(account.AgentID); changed {
+		_, _ = a.store.UpdateAccounts([]string{id}, func(target *store.Account) {
+			target.AgentID = agentID
+		})
 	}
 }
 
@@ -1690,6 +1692,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 			"requestTimeoutSec":    settings.Upstream.RequestTimeoutSec,
 			"streamIdleTimeoutSec": settings.Upstream.StreamIdleTimeoutSec,
 			"proxy":                settings.Upstream.Proxy, "userAgent": settings.Upstream.UserAgent,
+			"streamBaseURL": settings.Upstream.StreamBaseURL,
 		},
 		"routing": settings.Routing,
 		"audit":   settings.Audit,

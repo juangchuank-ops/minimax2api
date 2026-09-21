@@ -22,6 +22,7 @@ type Draft = {
   adminPassword: string;
   baseURL: string;
   baseURLCN: string;
+  streamBaseURL: string;
   agentID: string;
   sessionPath: string;
   messagePath: string;
@@ -144,6 +145,7 @@ export function SettingsPage() {
         upstream: {
           baseURL: value.baseURL,
           baseURLCN: value.baseURLCN,
+          streamBaseURL: value.streamBaseURL,
           agentID: value.agentID,
           sessionPath: value.sessionPath,
           messagePath: value.messagePath,
@@ -287,6 +289,13 @@ export function SettingsPage() {
           </Field>
           <Field label={t("settings.upstream.baseURLCN")} help={t("settings.upstream.baseURLCNHelp")}>
             <Input value={draft.baseURLCN} onChange={(event) => set("baseURLCN", event.target.value)} />
+          </Field>
+          <Field label={t("settings.upstream.streamBaseURL")} help={t("settings.upstream.streamBaseURLHelp")}>
+            <Input
+              value={draft.streamBaseURL}
+              placeholder="https://agent-stream.minimax.io"
+              onChange={(event) => set("streamBaseURL", event.target.value)}
+            />
           </Field>
           <Field label={t("settings.upstream.agentId")} help={t("settings.upstream.agentIdHelp")}>
             <Input value={draft.agentID} onChange={(event) => set("agentID", event.target.value)} />

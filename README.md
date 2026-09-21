@@ -233,23 +233,30 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 > 把慢模型当成快模型处理，只会把「一个可用的中间答复」变成「一个网关超时」。所以这里不假装能同步等到。
 
-### ⚠️ 实测结论：格式已验证，但账号可能没有执行通道
+### ⚠️ 实测结论：格式已验证，入口已按抓包修正，执行通道仍待确认
 
-这个接入面被真上游验证过两次（同一账号、境外出口、`MiniMax-H3-Max` / 5s / 16:9 / 768P）：
+这个接入面被真上游验证过三次（同一账号、境外出口、`MiniMax-H3-Max` / 5s / 16:9 / 768P）：
 
 - ✅ **`@video-creater` 确实路由到插件**，options 块**四个参数一个不差被解析**——Agent 会原样复述
   `user-specified model MiniMax-H3-Max, duration 5, ratio 16:9, resolution 768P`。
   这段文本上游完全消化得了，**格式不需要再猜**。
-- ❌ **但两次都没产出 mp4，而原因不在网关**：Agent 自己的容器里没有可用的执行通道。它逐个查过四个位置，
+- ❌ **三次都没产出 mp4**。前两次查到的原因是 Agent 自己的容器里没有可用的执行通道：它逐个查过四个位置，
   全空——PATH 上的 `mcode-tools`、`<connected-app-tools>`、`<plugin-mcp-tools>`、`mavis`。
   它按插件 skill 的要求拒绝改用裸 HTTP，也拒绝在拿不到成品时谎报成功，只留下自己的原话：
 
   > The plugin skill lists `video-creater:write-h3-prompts` only, with no connected-app-tools or plugin-mcp-tools.
 
-  这说明**该账号侧没有开通这条执行通道**（套餐限制？插件只装了 skill 文档、没装 Connector）。
-  从 API 走必然撞同一堵墙，网页端也走同一条 Connector 链路。
+- 🔁 **第三次之后，一次抓包把入口本身推翻了**。网页端发消息用的是
+  `POST agent-stream.minimax.io/minimax-cloud/api/v1/session/{id}/message`，而网关当时用的是
+  `agent.minimax.io` + `/archon/api/v1/session/{id}/message` —— **`/archon/` 这个前缀在网页端 17 个业务接口里一个都不存在**。
+  同时查到的还有：query 是 **22 个参数**而不是当时的 6 个；网页端开会话用的是 **mavis** agent，不是 `general`。
 
-**★ 扣费与产出是解耦的**：两次共消耗 **50 积分**（1187 → 1161 → 1137），**零产出**。不要把「余额下降」当成「生成成功」的证据。
+  三条都已按抓包改掉（含存量实例的迁移）。**但「换了入口就能拿到执行通道」仍然是假设**，尚未在真上游验证过。
+  另一条未排除的可能：该账号的 `video-creater` 插件只装了 skill 文档、没装 Connector，那需要到网页端插件市场确认。
+
+**★ 扣费与产出是解耦的**：三次共消耗 **542 积分**（1187 → 1161 → 1137 → 1089 → 597，最后一轮 492），**零产出**。
+第三轮贵在「让 Agent 自己想办法」——它会反复思考。**不要把「余额下降」当成「生成成功」的证据。**
+排查这类问题时，先用不花钱的 `GET`（`/config`、`/skill`、`/plugins/enabled`）确认账号能力，再决定要不要花钱发消息。
 
 **判断到底发生了什么，只能读 `detail`**——也就是 Agent 的原话，它是唯一可信的状态源。
 `status: "pending"` 加上一段「我没有这个工具 / 我无法提交」的解释，意思是上游拒了，不是网关吞了，而且**不会稍后变成功**。
@@ -347,12 +354,22 @@ MiniMax Agent 没有公开 API，这里是把它 Web 端的调用方式复刻出
 
 ```
 POST {base}/minimax-cloud/api/v1/agent/{agent_id}/session       → 建会话，拿 session_id
-POST {base}/archon/api/v1/session/{session_id}/message          → SSE 流，取 msg_content
+POST {stream}/minimax-cloud/api/v1/session/{session_id}/message → SSE 流，取 msg_content
 ```
 
-两条路径都能在「系统设置 → 上游」里改（`sessionPath` / `messagePath`，支持 `{agent_id}`、`{session_id}` 占位符）。
+注意两条路径**不在同一个域名上**。发消息走的是 `agent-stream.<domain>`（国际站是 `agent-stream.minimax.io`），其余所有接口都走 `agent.<domain>`。两者**不是同一个入口的两种写法**：同一条路径放在 API 域名上会进到另一个入口，那一侧**能收到消息、能正常回复，但没有渲染工具**——视频请求会变成一段「描述了这个视频」的友好文字，没有视频、也没有报错。这正是本项目在视频上反复踩的坑。
+
+`upstream.streamBaseURL` 留空时按规律推导：`agent.x` → `agent-stream.x`；其它地址（自建中转、测试服务器）保持原样，不会被套上一个它们没有的域名。国内站走的是同一套前端，所以同样推导——这条是**外推**而非抓包实测，但推导错了会是一个响亮的 DNS 错误，不会静默成功。
+
+三条路径都能在「系统设置 → 上游」里改（`sessionPath` / `messagePath` / `streamBaseURL`，前两者支持 `{agent_id}`、`{session_id}` 占位符）。
 
 **`{agent_id}` 是一个数字，不是角色名。** 上游把 agent 的*角色*（`general` / `coder` / `mavis` …）和它的*编号*分得很开：编号在 agent 列表的 `name` 字段里（这个字段名起得有误导性，它装的其实是数字 id，人类可读的名字在 `display_name` 里）。把 `general` 当 id 传上去，上游会回一个 **200 但不给你 `session_id`** —— 请求看起来完全成功，实际什么都没开。所以加号时后台会调 `GET /minimax-cloud/api/v1/agent` 把这个数字问回来，存在账号上；缺它的账号会被判定为**不可调度**，不会拿一个注定空转的请求去换一个假成功。
+
+驱动哪个角色由 `DefaultAgentRole` 决定，当前是 **`mavis`**（`general` 作为次选）：网页端抓包里开会话用的是 mavis agent，而带视频工具链的 `mcode-tools-master` skill 也发布在 `Mavis/` 目录下——两条证据指向同一个选择。这个选择是**可变的**，所以账号上缓存的编号会被重新审视：如果上游的 agent 列表证明它属于另一个角色，就换成新角色对应的编号；手填的编号（不在列表里的）不动。
+
+### 查询参数
+
+网页端每条业务请求都带一组固定的元数据 query，**22 个参数、顺序固定**，`unix` 在第 5 位，`client` / `region` 在最后。顺序是协议的一部分——`yy` 是对编码后 URL 取摘要，重排就等于换了一个 URL。`unix` 与 `yy` 必须来自**同一次时钟读数**：实现里两者由 `newRequest` 用同一个 `now` 一起产出，URL 组装也放在那里，这样从外部就不可能拼出「签名描述的是另一个 URL」的组合。
 
 ### 上游初始化（`/config`）
 
@@ -504,17 +521,21 @@ tools/
 > 一个坏默认值就这样活过了一次「修好默认值」的发布。
 >
 > 处理办法是**迁移**：`Normalize` 里维护一张已知坏值的清单，命中就改回默认。
-> 目前有两条，都实测不可用（一条回的是 SPA 的 HTML，一条回 200 但不开会话）：
+> 目前有三条。前两条实测不可用（一条回的是 SPA 的 HTML，一条回 200 但不开会话）；
+> 第三条是另一类——它**能用**，只是进错了门，详见「调用流程」里关于两个域名的说明：
 >
 > | 字段 | 旧值 | 修成 |
 > | --- | --- | --- |
 > | `upstream.sessionPath` | `/agent/{agent_id}/session` | `/minimax-cloud/api/v1/agent/{agent_id}/session` |
 > | `upstream.agentID` | `general`（这是角色名，不是编号） | 空（由发现流程填真实编号） |
+> | `upstream.messagePath` | `/archon/api/v1/session/{session_id}/message` | `/minimax-cloud/api/v1/session/{session_id}/message` |
 >
 > 迁移结果会**写回磁盘**，不留「文件与实际生效配置不一致」的状态。
 > 以后再加默认值修复，记得同时加进这张清单——否则修了等于没修。
 >
 > 另外 `agentID` 在**读取时**也会跳过角色名，所以即使实例还没重启过，存量的 `general` 也不会被当成编号发出去。
+>
+> `streamBaseURL` 没有默认值——它留空时**推导**，所以不需要迁移，也不会被冻住。
 
 ---
 
@@ -535,7 +556,7 @@ go vet ./...
 | `internal/minimax` | 签名公式与逐字符的 `encodeURIComponent` 对照、query 顺序与编码、按区域选主机、SSE 帧解析（推理/正文分离、媒体收集、错误识别）、JWT 令牌解析、签到两条 query 串的差异（签名含 `op_ticket=undefined`、请求不含）、真实抓包的 `x-signature` 对照、回环地址绕过代理、生成的 `device_id` 必须是纯数字、`uuid` 是 v4 UUID、会话响应是 HTML 页面时拒绝当成 `session_id`、`/config` 返回体决定 agent id、配置默认值不得与包内常量漂移 |
 | `internal/signin` | 错过的时间点补签、重复领取记为「已签」、国内站账号跳过、失效令牌退役、失败也占掉当天（避免上游故障变成请求循环）、积分接口故障不牵连账号健康、扫描不可重入、**初始化序列跑在领取之前且失败即跳过领取**、领取面板用上游回显的那一份、对账只认发放时间不认余额、宽限期内不下结论 |
 | `internal/admin` | 设置接口逐字段与 struct 的 json tag 比对（防新设置漏接线）、生成的指纹形状、区域推断、令牌解析 |
-| `internal/config` | 已知坏默认值的迁移（旧会话路径、`agentID = general`）、迁移不误伤刻意的覆盖值 |
+| `internal/config` | 已知坏默认值的迁移（旧会话路径、`agentID = general`、旧消息路径）、迁移不误伤刻意的覆盖值 |
 | `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝 |
 | `internal/gateway`（上游桩） | 用 `httptest` 顶替上游，因此不需要真实令牌就能覆盖完整链路 |
 
@@ -707,6 +728,12 @@ agent 侧的初始化。不调它新号发消息会 500（报 `Environment Varia
 
 **Q：`agentID` 填 `general` 行不行？**
 不行。`general` 是 agent 的*角色*，不是*编号*。传角色名上去上游会回 **200 但不返回 `session_id`** —— 请求看起来完全成功，实际什么都没开。加号时后台会自己去 `/minimax-cloud/api/v1/agent` 把数字编号问回来，一般不用手填。老版本的默认值正是 `general`，所以存量实例的 `app.json` 里可能还留着它：现在**读取时会跳过角色名**，加载时也会把它改回空，不用手动清。
+
+**Q：视频请求返回了一段「描述这个视频」的文字，没有视频也没有报错？**
+典型的**进错门**。发消息必须走 `agent-stream.<domain>` 上的 `/minimax-cloud/api/v1/session/{id}/message`；同一条路径放在 API 域名上是另一个入口，它能收到消息、能正常回复，但那一侧的 agent **没有渲染工具**，于是它只能把「我打算生成什么」写成文字还给你。老版本的默认值正是 API 域名 + `/archon/…` 路径，所以存量实例的 `app.json` 里可能还留着它，升级时会自动迁移。想手动核对，看「系统设置 → 上游」的**对话流地址**与**消息路径**两项。
+
+**Q：为什么 agent 用的是 `mavis` 而不是 `general`？**
+两条独立证据指向它：网页端抓包里开会话用的是 mavis agent，而带视频工具链的 `mcode-tools-master` skill 也发布在 `Mavis/` 目录下。`general` 保留为次选，所以没有 mavis 的账号照常能用。账号上缓存的编号会在每次准备时重新审视：如果上游的 agent 列表证明它属于另一个角色就换掉，手填的编号不动。
 
 **Q：升级之后，旧版本留下的一些设置好像还是老样子？**
 这是**设计使然，而且是坑**。全新安装会把整套默认设置写进 `app.json`，而 `Normalize` 只补缺失的值、不动已存在的值——所以改一个默认值只影响新安装，存量实例会带着旧值继续跑，且完全没有症状。

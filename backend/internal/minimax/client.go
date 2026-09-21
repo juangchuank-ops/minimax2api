@@ -41,7 +41,10 @@ const (
 	// "wrong path", so the mistake survives every check that only looks at the
 	// status code.
 	DefaultSessionPath = "/minimax-cloud/api/v1/agent/{agent_id}/session"
-	DefaultMessagePath = "/archon/api/v1/session/{session_id}/message"
+	// DefaultMessagePath sends one turn. It shares a prefix with the session
+	// path but answers on a different host, which is derived rather than
+	// hardcoded — see streamHostFor.
+	DefaultMessagePath = "/minimax-cloud/api/v1/session/{session_id}/message"
 )
 
 // DefaultAgentID is deliberately empty.
@@ -114,9 +117,19 @@ type Result struct {
 
 // Options describes one upstream call.
 type Options struct {
-	Credential    Credential
-	Text          string
-	Mode          string
+	Credential Credential
+	Text       string
+	Mode       string
+	// ClientIntent labels the kind of turn for the backend.
+	//
+	// It is not decoration. A plain chat turn and a video-generation turn can
+	// carry the identical `content` — same `@plugin` mention, same options
+	// block — and still end differently: without an intent the backend hands
+	// the turn to the agent, which then has to find a tool that can render
+	// video and reports honestly when it cannot; with `video_generation` the
+	// backend dispatches the turn straight to the video service. The two paths
+	// look the same from the outside right up until one of them produces a file.
+	ClientIntent  string
 	Images        []UploadedImage
 	Timeout       time.Duration
 	IdleTimeout   time.Duration
@@ -141,6 +154,19 @@ type UploadedImage struct {
 type Client struct {
 	http     *http.Client
 	settings func() config.Settings
+	// now is a test seam. `unix` and `yy` have to come from a single clock
+	// reading, and the only way to prove they do is to hand the client a clock
+	// that does not move. Nil means time.Now.
+	now func() time.Time
+}
+
+// clock returns the client's time source. A zero-value Client is usable, which
+// is why the nil case is handled here rather than at construction.
+func (c *Client) clock() time.Time {
+	if c.now == nil {
+		return time.Now()
+	}
+	return c.now()
 }
 
 // New builds a client. settingsFn is re-read on every request so runtime
@@ -209,12 +235,25 @@ func messagePath(settings config.Settings) string {
 	return DefaultMessagePath
 }
 
-// clientQuery renders the metadata query string.
+// clientQuery renders the metadata query string in the exact order the captured
+// web client sends it: 22 parameters, with `unix` fifth and `client`/`region`
+// last.
 //
-// The order is part of the contract: `yy` is an MD5 over the encoded URL, so
-// reordering the parameters changes the digest and the request is rejected.
-// url.Values.Encode() sorts keys and therefore cannot be used here.
-func clientQuery(settings config.Settings, cred Credential) string {
+// The order is part of the contract. `yy` is an MD5 over the encoded URL, so
+// reordering the parameters changes the digest and the upstream rejects the
+// request — with a message that names none of this. url.Values.Encode() sorts
+// keys and therefore cannot be used here.
+//
+// Most of these are not load-bearing for routing; `uuid`, `device_id`,
+// `user_id`, the screen size and the token are. The rest describe the same
+// browser session and were present on the captured request, and sending a
+// narrower set is what makes a request look like something other than the web
+// client. They cost nothing.
+//
+// `unix` comes from the caller's clock rather than a reading taken here, because
+// it has to be the same reading that feeds `yy`: a second time.Now() a
+// millisecond later would sign a URL that was never sent.
+func clientQuery(settings config.Settings, cred Credential, now time.Time) string {
 	width := cred.ScreenWidth
 	if width <= 0 {
 		width = settings.Upstream.ScreenWidth
@@ -224,37 +263,143 @@ func clientQuery(settings config.Settings, cred Credential) string {
 		height = settings.Upstream.ScreenHeight
 	}
 
-	pairs := make([]string, 0, 6)
+	pairs := make([]string, 0, 24)
 	add := func(key, value string) {
 		if value == "" {
 			return
 		}
 		pairs = append(pairs, key+"="+encodeURIComponent(value))
 	}
-	add("token", cred.Token)
+
+	add("device_platform", "web")
+	add("biz_id", "3")
+	add("app_id", "3001")
+	add("version_code", "22201")
+	add("unix", strconv.FormatInt(now.UnixMilli(), 10))
+	add("timezone_offset", "28800")
+	add("sys_language", "en")
+	add("lang", "en")
 	add("uuid", cred.UUID)
 	add("device_id", cred.DeviceID)
+	add("os_name", "Windows")
+	add("browser_name", "Chrome")
+	add("device_memory", "16")
+	add("cpu_core_num", "8")
+	add("browser_language", "zh-CN")
+	add("browser_platform", "Win32")
 	add("user_id", cred.UserID)
 	add("screen_width", strconv.Itoa(width))
 	add("screen_height", strconv.Itoa(height))
+	add("token", cred.Token)
+	add("client", "web")
+	add("region", "en")
 	return strings.Join(pairs, "&")
 }
 
-// buildURL assembles the exact URL that will be requested, so the same string
-// can be fed to the signature. Substitution happens here rather than through
-// net/url so the query order survives byte for byte.
-func (c *Client) buildURL(settings config.Settings, cred Credential, path, sessionID string) string {
+// buildURLWith assembles the exact URL that will be requested, so the same
+// string can be fed to the signature. Substitution happens here rather than
+// through net/url so the query order survives byte for byte.
+func (c *Client) buildURLWith(base string, settings config.Settings, cred Credential, path, sessionID string, now time.Time) string {
 	path = strings.ReplaceAll(path, "{agent_id}", c.agentID(settings, cred))
 	path = strings.ReplaceAll(path, "{session_id}", sessionID)
-	rawURL := c.baseURL(settings, cred) + path
-	if query := clientQuery(settings, cred); query != "" {
-		rawURL += "?" + query
+
+	rawURL := strings.TrimRight(base, "/") + path
+	if query := clientQuery(settings, cred, now); query != "" {
+		// A path that carries its own query needs "&", not a second "?". The
+		// difference is invisible in the URL and fatal to the signature.
+		if strings.Contains(rawURL, "?") {
+			rawURL += "&" + query
+		} else {
+			rawURL += "?" + query
+		}
 	}
 	return rawURL
 }
 
-// newRequest signs and builds a request for the given absolute URL.
-func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred Credential, method, rawURL string, body []byte) (*http.Request, error) {
+// buildURL targets the account's API host.
+func (c *Client) buildURL(settings config.Settings, cred Credential, path, sessionID string, now time.Time) string {
+	return c.buildURLWith(c.baseURL(settings, cred), settings, cred, path, sessionID, now)
+}
+
+// streamBaseURL is the host the conversation endpoint answers on.
+//
+// The captured web client posts turns to `agent-stream.<domain>` while every
+// other call stays on `agent.<domain>`. The gateway used the API host for both
+// for a long time, and the two are not interchangeable: the same path there is a
+// *different entry point*, one that reaches the agent but hands it no rendering
+// tool — so every turn came back as a plausible reply with no video and no
+// error to explain why.
+//
+// An explicit setting wins, so a capture that disagrees can be pasted into the
+// console without a rebuild.
+func streamBaseURL(settings config.Settings, fallback string) string {
+	if explicit := strings.TrimSpace(settings.Upstream.StreamBaseURL); explicit != "" {
+		return strings.TrimRight(explicit, "/")
+	}
+	return streamHostFor(fallback)
+}
+
+// streamHostFor maps an API host to its streaming counterpart.
+//
+// Only the `agent.<domain>` shape is recognised, because that is the only one
+// that has been observed — and the alternative to deriving it is hardcoding a
+// hostname, which would then be wrong for every other deployment. A self-hosted
+// relay and a test server therefore keep their own address rather than having a
+// name invented for them.
+//
+// The mainland deployment runs the same web client, so the same shape is applied
+// to it. That is an inference rather than a capture, which is why it is allowed
+// to stand: a hostname that does not exist is a DNS error, not a silent success,
+// so being wrong about it is loud. Setting StreamBaseURL overrides all of this.
+func streamHostFor(base string) string {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	host := parsed.Hostname()
+	if !strings.HasPrefix(host, "agent.") {
+		return base
+	}
+	target := "agent-stream." + strings.TrimPrefix(host, "agent.")
+	if port := parsed.Port(); port != "" {
+		target = net.JoinHostPort(target, port)
+	}
+	parsed.Host = target
+	return parsed.String()
+}
+
+// requestTarget names the endpoint a request is aimed at.
+//
+// Paths carry {agent_id} / {session_id} placeholders, which are substituted
+// without going through net/url so the query order survives byte for byte.
+type requestTarget struct {
+	// Path is the endpoint template.
+	Path string
+	// SessionID fills {session_id}.
+	SessionID string
+	// Stream routes the call to the conversation host, which is a different
+	// entry point from the API host rather than another address for the same
+	// one. See streamBaseURL.
+	Stream bool
+}
+
+// newRequest builds and signs a request.
+//
+// It takes a target rather than a finished URL because `unix`, `x-timestamp`
+// and `yy` all have to come from one clock reading, and `yy` covers the encoded
+// URL: assembling the URL anywhere else would need a second reading, and a few
+// milliseconds of drift would make the digest describe a URL that was never
+// sent. Keeping both halves here makes that impossible to get wrong from the
+// outside.
+func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred Credential, method string, target requestTarget, body []byte) (*http.Request, error) {
+	now := c.clock()
+
+	base := c.baseURL(settings, cred)
+	if target.Stream {
+		base = streamBaseURL(settings, base)
+	}
+	rawURL := c.buildURLWith(base, settings, cred, target.Path, target.SessionID, now)
+
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -264,7 +409,6 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 		return nil, err
 	}
 
-	now := time.Now()
 	bodyText := string(body)
 
 	req.Header.Set("accept", "text/event-stream, application/json, */*")
@@ -346,8 +490,6 @@ func (c *Client) CreateSession(ctx context.Context, cred Credential) (string, er
 	if agentID := c.agentID(settings, cred); strings.TrimSpace(agentID) == "" {
 		return "", fmt.Errorf("%w: agent id unknown; the account has not been prepared", ErrAgentIDUnknown)
 	}
-	rawURL := c.buildURL(settings, cred, sessionPath(settings), "")
-
 	payload, err := json.Marshal(map[string]any{
 		"agent_id":     c.agentID(settings, cred),
 		"worktreeMode": false,
@@ -356,7 +498,8 @@ func (c *Client) CreateSession(ctx context.Context, cred Credential) (string, er
 		return "", err
 	}
 
-	req, err := c.newRequest(ctx, settings, cred, http.MethodPost, rawURL, payload)
+	req, err := c.newRequest(ctx, settings, cred, http.MethodPost,
+		requestTarget{Path: sessionPath(settings)}, payload)
 	if err != nil {
 		return "", err
 	}
@@ -447,20 +590,20 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 	settings := c.settings()
 	cred := opts.Credential
 
-	path := strings.ReplaceAll(messagePath(settings), "{session_id}", sessionID)
-	path = strings.ReplaceAll(path, "{agent_id}", c.agentID(settings, cred))
-	rawURL := c.baseURL(settings, cred) + path
-	if query := clientQuery(settings, cred); query != "" {
-		rawURL += "?" + query
-	}
-
 	turnID := randomUUID()
 	payload, err := json.Marshal(buildMessageBody(settings, opts, turnID))
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := c.newRequest(ctx, settings, cred, http.MethodPost, rawURL, payload)
+	// Stream: the conversation endpoint answers on `agent-stream.<domain>`, and
+	// the same path on the API host is a different entry point. See
+	// streamBaseURL.
+	req, err := c.newRequest(ctx, settings, cred, http.MethodPost, requestTarget{
+		Path:      messagePath(settings),
+		SessionID: sessionID,
+		Stream:    true,
+	}, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -522,6 +665,11 @@ func buildMessageBody(settings config.Settings, opts Options, turnID string) map
 	}
 	if opts.Mode != "" {
 		body["mode"] = opts.Mode
+	}
+	// Only sent when the caller names one. An invented intent would be worse
+	// than no intent, and the plain chat path has always worked without it.
+	if intent := strings.TrimSpace(opts.ClientIntent); intent != "" {
+		body["client_intent"] = intent
 	}
 	return body
 }
