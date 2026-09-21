@@ -2,7 +2,9 @@ package minimax
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"minimax2api/internal/config"
@@ -270,18 +272,102 @@ func (c *Client) callAgent(ctx context.Context, settings config.Settings, cred C
 	return decodeJSONResponse(resp, "agent")
 }
 
-// CallAgent makes one signed request against the agent API and returns the
-// decoded payload.
+// AgentProbe is what one diagnostic call observed.
+//
+// The body comes back as it arrived rather than decoded, because the question
+// being asked is usually "what did the upstream actually say" — and the reply
+// that matters most is the one that does not decode at all. A page of the SPA's
+// HTML is the classic case: it is how a wrong path answers, and it looks like
+// success to anything that only checks the status.
+type AgentProbe struct {
+	// Status is the HTTP status code.
+	Status int
+	// Body is the response body, truncated to keep a console readable.
+	Body string
+	// URL is the URL that was signed and requested, with every credential value
+	// replaced by a placeholder.
+	//
+	// Seeing the *shape* is what makes a signature failure diagnosable: `yy`
+	// covers this string, so a wrong parameter order and a wrong digest produce
+	// the same rejection. The values themselves are the account's credentials
+	// and have no business in a log, so they are redacted rather than dropped —
+	// the shape is the useful part.
+	URL string
+}
+
+// ProbeEndpoint makes one signed request and reports the raw result.
 //
 // Exported for diagnostics, not for the request path. It answers the question a
-// completion cannot: *what is this account actually able to do?* An agent's
-// skills listing (`/minimax-cloud/api/v1/skill`) is readable without spending
-// anything, which makes it the cheap way to tell "the gateway composed the
-// wrong request" apart from "this account has no working execution channel" —
-// two failures that look identical from the outside, right up until one of them
-// costs money to disprove.
+// completion cannot: *what is this account actually able to do?* The skills
+// listing and the config call are readable without spending anything, which
+// makes this the cheap way to tell "the gateway composed the wrong request"
+// apart from "this account has no working execution channel" — two failures that
+// look identical from the outside, right up until one of them costs money to
+// disprove.
+//
+// `stream` routes the call to the conversation host instead of the API host.
+// They are different entry points rather than two addresses for one, so a path
+// that answers on one can 404 on the other — and that is worth being able to see
+// without sending a real turn.
+//
+// Not to be confused with Probe, which opens and discards a session to validate
+// a credential.
 //
 // The path may carry its own query string.
-func (c *Client) CallAgent(ctx context.Context, cred Credential, method, path string, body []byte) (map[string]any, error) {
-	return c.callAgent(ctx, c.settings(), cred, method, path, body)
+func (c *Client) ProbeEndpoint(ctx context.Context, cred Credential, method, path string, body []byte, stream bool) (AgentProbe, error) {
+	settings := c.settings()
+	if strings.TrimSpace(cred.Token) == "" {
+		return AgentProbe{}, ErrInvalidCredential
+	}
+	req, err := c.newRequest(ctx, settings, cred, method, requestTarget{Path: path, Stream: stream}, body)
+	if err != nil {
+		return AgentProbe{}, err
+	}
+	probe := AgentProbe{URL: redactURL(req.URL.String())}
+
+	resp, err := c.do(req, settings)
+	if err != nil {
+		return probe, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	probe.Status = resp.StatusCode
+	probe.Body = strings.TrimSpace(string(raw))
+	return probe, nil
+}
+
+// redactURL blanks the credential-bearing query values while leaving the rest of
+// the URL — including the parameter order — exactly as it was signed.
+func redactURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable url>"
+	}
+	query := parsed.Query()
+	redacted := false
+	for _, key := range []string{"token", "uuid", "device_id", "user_id"} {
+		if query.Get(key) != "" {
+			query.Set(key, "<redacted>")
+			redacted = true
+		}
+	}
+	if !redacted {
+		return raw
+	}
+	// Rebuilt rather than re-encoded: Values.Encode() sorts keys, and the order
+	// is part of what this function exists to show.
+	original := strings.SplitN(parsed.RawQuery, "&", -1)
+	for i, pair := range original {
+		key, _, found := strings.Cut(pair, "=")
+		if !found {
+			continue
+		}
+		switch key {
+		case "token", "uuid", "device_id", "user_id":
+			original[i] = key + "=<redacted>"
+		}
+	}
+	parsed.RawQuery = strings.Join(original, "&")
+	return parsed.String()
 }
