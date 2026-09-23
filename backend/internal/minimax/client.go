@@ -122,20 +122,28 @@ type Options struct {
 	Mode       string
 	// ClientIntent labels the kind of turn for the backend.
 	//
-	// It is not decoration. A plain chat turn and a video-generation turn can
-	// carry the identical `content` — same `@plugin` mention, same options
-	// block — and still end differently: without an intent the backend hands
-	// the turn to the agent, which then has to find a tool that can render
-	// video and reports honestly when it cannot; with `video_generation` the
-	// backend dispatches the turn straight to the video service. The two paths
-	// look the same from the outside right up until one of them produces a file.
-	ClientIntent  string
-	Images        []UploadedImage
-	Timeout       time.Duration
-	IdleTimeout   time.Duration
-	OnDelta       func(string)
-	OnThinking    func(string)
-	OnProgress    func(string)
+	// The field and the value are both real — the web client sends
+	// `client_intent`, and the bundle's tool-type table maps the four video
+	// tools onto `video_generation` (see internal/minimax/video.go). What has
+	// never been demonstrated is that it *changes anything*: the one live test
+	// of it produced no tool call and no file, exactly like the turns that
+	// omitted it. It is sent on video turns because the web client sends it,
+	// not because it has been shown to unlock the video service. Do not read
+	// this field as the switch that turns generation on.
+	ClientIntent string
+	Images       []UploadedImage
+	Timeout      time.Duration
+	IdleTimeout  time.Duration
+	OnDelta      func(string)
+	OnThinking   func(string)
+	// OnFrame sees every decoded frame, before anything decides what it means.
+	//
+	// Dispatch is driven by payload keys, which is what keeps the adapter
+	// working when the upstream renumbers its event enum — and it is also why a
+	// frame nobody recognises disappears without a trace. This hook is how a
+	// diagnostic gets to ask the question that keeps coming up: *what does the
+	// upstream actually send?* Nil means nothing is watching.
+	OnFrame       func(map[string]any)
 	DisableStream bool
 }
 
@@ -795,6 +803,12 @@ func (c *Client) handleFrame(block string, opts Options, result *Result) error {
 			}
 		}
 		return nil
+	}
+
+	// Seen before anything interprets it, so a frame that is about to be read as
+	// an error, or ignored as unrecognised, is still visible.
+	if opts.OnFrame != nil {
+		opts.OnFrame(frame.Data)
 	}
 
 	if message := upstreamError(frame.Data); message != "" {

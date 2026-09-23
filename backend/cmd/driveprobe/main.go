@@ -171,6 +171,29 @@ func mapDocument(ctx context.Context, client *minimax.Client, cred minimax.Crede
 	}
 
 	dumpArtefacts(doc)
+	dumpSessionMeta(doc)
+}
+
+// dumpSessionMeta prints the session object verbatim.
+//
+// It is metadata — which model, which variant, which limits, when — and it is
+// the only place the two sides of a comparison can be read off directly: the
+// same account, the same prompt, two sessions, and whatever differs between
+// them is in here. No conversation text lives in this object.
+func dumpSessionMeta(doc any) {
+	root, ok := doc.(map[string]any)
+	if !ok {
+		return
+	}
+	session, present := root["session"]
+	if !present {
+		return
+	}
+	encoded, err := json.MarshalIndent(session, "  ", "  ")
+	if err != nil {
+		return
+	}
+	fmt.Printf("\n== session ==\n  %s\n", encoded)
 }
 
 // dumpArtefacts prints the artefact arrays verbatim. They are file references,

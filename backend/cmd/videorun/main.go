@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -96,16 +97,28 @@ func main() {
 
 	text := minimax.BuildVideoPrompt(prompt, settings.Video.PluginName, options, settings.Video.OptionsTag)
 	fmt.Printf("\n== sending (model %s, %s, %s, %ds) ==\n", options.Model, options.Ratio, options.Resolution, options.Duration)
+	fmt.Printf("  client_intent: %s\n", minimax.VideoClientIntent)
 	fmt.Printf("  %s\n\n", oneLine(text, 400))
+
+	// Every decoded frame, tallied by the set of keys it carried. Dispatch is
+	// payload-driven, so an unrecognised frame vanishes silently — and "the
+	// upstream sent something we do not read" and "the upstream sent nothing"
+	// look identical from a completion. The tally is what tells them apart, and
+	// it is the only part of this run that cannot be recovered afterwards.
+	frames := newFrameTally()
 
 	started := time.Now()
 	result, err := client.Completion(ctx, minimax.Options{
 		Credential: cred,
 		Text:       text,
+		// The web client sends this for a video turn; the bundle's tool-kind
+		// table maps all four video tools to it.
+		ClientIntent: minimax.VideoClientIntent,
 		// Generous on purpose: when the agent has no tool it does not fail
 		// fast, it explores. A short timeout would cut that short and turn
 		// "the upstream explained what is missing" into "the gateway gave up".
 		Timeout: 8 * time.Minute,
+		OnFrame: frames.add,
 	})
 	elapsed := time.Since(started)
 
@@ -114,6 +127,7 @@ func main() {
 		fmt.Printf("  error: %v\n", err)
 	}
 	if result != nil {
+		fmt.Printf("  session: %s\n", result.SessionID)
 		fmt.Printf("  media  : %d\n", len(result.Media))
 		for _, m := range result.Media {
 			fmt.Printf("    %s\n", safeURL(m.URL))
@@ -126,7 +140,79 @@ func main() {
 		}
 	}
 
+	fmt.Print(frames.report())
+
+	// The second half of the answer, and the whole point of this build: a turn
+	// that produced a file leaves it in the drive, not in the stream.
+	if result != nil && result.SessionID != "" {
+		fmt.Println("\n== drive lookup (this is where a finished file would be) ==")
+		artifacts, err := client.SessionArtifacts(ctx, cred, result.SessionID)
+		if err != nil {
+			fmt.Printf("  artifacts unavailable: %v\n", err)
+		}
+		fresh := 0
+		for _, artifact := range artifacts {
+			marker := "old"
+			if artifact.CreatedAt >= started.UnixMilli() {
+				marker = "NEW"
+				fresh++
+			}
+			fmt.Printf("  [%s] %s  %s  %s  %d bytes  created_at=%d\n",
+				marker, artifact.Kind(), artifact.Category, artifact.Name, artifact.SizeBytes, artifact.CreatedAt)
+		}
+		if len(artifacts) == 0 {
+			fmt.Println("  (the session reports no artifacts at all)")
+		}
+		fmt.Printf("  -> %d produced by this turn\n", fresh)
+		if fresh > 0 {
+			media, err := client.SessionMedia(ctx, cred, result.SessionID, started.UnixMilli())
+			if err != nil {
+				fmt.Printf("  resolving links failed: %v\n", err)
+			}
+			for _, item := range media {
+				fmt.Printf("  playable: %s %s\n", item.Kind, safeURL(item.URL))
+			}
+		}
+	}
+
 	fmt.Printf("\n  credits after: %s\n", balance(ctx, client, cred))
+}
+
+// frameTally counts the shapes the upstream sent, not their contents.
+type frameTally struct {
+	shapes map[string]int
+	total  int
+}
+
+func newFrameTally() *frameTally {
+	return &frameTally{shapes: map[string]int{}}
+}
+
+func (t *frameTally) add(frame map[string]any) {
+	t.total++
+	keys := make([]string, 0, len(frame))
+	for key := range frame {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	t.shapes[strings.Join(keys, ",")]++
+}
+
+func (t *frameTally) report() string {
+	if t.total == 0 {
+		return "\n== frames ==\n  (nothing decoded)\n"
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "\n== frames (%d) ==\n", t.total)
+	shapes := make([]string, 0, len(t.shapes))
+	for shape := range t.shapes {
+		shapes = append(shapes, shape)
+	}
+	sort.Strings(shapes)
+	for _, shape := range shapes {
+		fmt.Fprintf(&out, "  %4d × {%s}\n", t.shapes[shape], shape)
+	}
+	return out.String()
 }
 
 func balance(ctx context.Context, client *minimax.Client, cred minimax.Credential) string {
