@@ -37,6 +37,66 @@ const SYNTHETIC_TOKEN =
 const USERNAME = "admin";
 const TOKEN_KEY = "minimax2api:admin-token";
 
+// Every `t("…")` key the console uses, harvested from the sources.
+//
+// A missing translation key is the quietest failure this console can have: it
+// throws nothing, blanks nothing, and i18next renders the key itself, so
+// `docs.noteModel` appears on screen looking exactly like content. The heading
+// assertions below cannot see it — the page still mounts, still has text. What
+// gives it away is that the key is a string that only ever exists in code, so
+// finding it in the rendered text proves a lookup missed.
+//
+// Keys are collected as *strings*, not as `t("…")` calls: a key held in a table
+// (`noteKey: "docs.noteModel"`) reaches the same `t()` and goes missing the
+// same way. The namespace list is what separates keys from the other dotted
+// strings a frontend is full of — MIME types, field paths, identifiers.
+const I18N_KEYS = collectI18nKeys(process.argv[6] || "frontend/src");
+
+function collectI18nKeys(dir) {
+  const namespaces = readNamespaces(path.join(dir, "shared/i18n/index.ts"));
+  if (!namespaces.size) {
+    return []; // No resources readable: nothing to look for, nothing to flag.
+  }
+
+  const keys = new Set();
+  const walk = (current) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (/\.(tsx?|jsx?)$/.test(entry.name)) {
+        const source = fs.readFileSync(full, "utf8");
+        for (const match of source.matchAll(/"([a-zA-Z][\w]*\.[\w.]+)"/g)) {
+          if (namespaces.has(match[1].split(".")[0])) keys.add(match[1]);
+        }
+      }
+    }
+  };
+  walk(dir);
+  return [...keys];
+}
+
+// readNamespaces pulls the top-level keys of the resource file, which are the
+// namespaces every translation key starts with. Read rather than hardcoded, so
+// a new namespace does not silently escape the check.
+function readNamespaces(file) {
+  let source;
+  try {
+    source = fs.readFileSync(file, "utf8");
+  } catch {
+    return new Set();
+  }
+  const names = new Set();
+  for (const match of source.matchAll(/^  ([a-zA-Z]+): \{$/gm)) names.add(match[1]);
+  return names;
+}
+
 // [route, text that must appear] - asserting the heading catches a route that
 // renders but mounts the wrong component.
 const ROUTES = [
@@ -46,7 +106,12 @@ const ROUTES = [
   ["/models", "模型"],
   ["/gallery", "生成画廊"],
   ["/request-audits", "请求审计"],
-  ["/docs/chat/completions", "接口文档"],
+  ["/docs/chat/completions", "接口文档", "messages"],
+  // The docs page is one component parameterised by the route, so a route that
+  // does not resolve still renders — it falls back to the first endpoint. The
+  // third element is the tell: text that only this endpoint's page contains.
+  // Without it a typo'd URL passes by quietly showing somebody else's table.
+  ["/docs/image/generations", "接口文档", "response_format"],
   ["/settings", "运行时设置"],
 ];
 
@@ -129,11 +194,18 @@ async function navigate(session, url) {
 const INSPECT = `(() => {
   const root = document.getElementById("root");
   const text = document.body.innerText || "";
+  const flat = text.replace(/\\s+/g, " ").trim();
   return {
     path: location.pathname,
     rootChildren: root ? root.children.length : -1,
     textLength: text.length,
-    text: text.replace(/\\s+/g, " ").trim().slice(0, 400),
+    // For the log line, which only needs enough to recognise the page.
+    text: flat.slice(0, 400),
+    // For assertions, which need the whole page. Asserting against the 400-char
+    // sample silently restricted every check to the part above the fold: the
+    // parameter table on the docs page starts well past it, so text that was
+    // plainly on screen was reported missing.
+    textAll: flat.slice(0, 200000),
     errorBoundary: /Unexpected Application Error|Something went wrong|渲染出错/i.test(text),
     headings: Array.from(document.querySelectorAll("h1, h2"))
       .map((el) => (el.innerText || "").trim())
@@ -157,17 +229,25 @@ async function checkPage(session, label, route, opts = {}) {
 
   const fresh = entries.slice(before);
   const failed = [];
-  const haystack = `${info.text} ${info.headings.join(" ")}`;
+  const haystack = `${info.textAll} ${info.headings.join(" ")}`;
   if (info.errorBoundary) failed.push("error boundary");
   if (info.rootChildren <= 0) failed.push("empty #root");
   if (info.textLength < 40) failed.push(`thin content (${info.textLength} chars)`);
   if (opts.expectText && !new RegExp(opts.expectText, "i").test(haystack)) {
     failed.push(`missing expected text /${opts.expectText}/ (saw "${info.text.slice(0, 80)}")`);
   }
+  if (opts.expectAlso && !new RegExp(opts.expectAlso, "i").test(haystack)) {
+    failed.push(`missing endpoint-specific text /${opts.expectAlso}/ — this route is rendering another page's content`);
+  }
   if (opts.expectPath && info.path !== opts.expectPath) {
     failed.push(`expected path ${opts.expectPath}, got ${info.path}`);
   }
   if (fresh.length) failed.push(`${fresh.length} console error(s)`);
+
+  const leaked = I18N_KEYS.filter((key) => haystack.includes(key));
+  if (leaked.length) {
+    failed.push(`untranslated key(s) rendered as text: ${leaked.slice(0, 4).join(", ")}`);
+  }
 
   if (failed.length) {
     problems.push(`${label}: ${failed.join(", ")}`);
@@ -394,8 +474,11 @@ async function main() {
   }
 
   console.log("\nconsole routes");
-  for (const [route, expect] of ROUTES) {
-    await checkPage(session, route.replace(/^\//, ""), route, { expectText: expect });
+  for (const [route, expect, alsoExpect] of ROUTES) {
+    await checkPage(session, route.replace(/^\//, ""), route, {
+      expectText: expect,
+      expectAlso: alsoExpect,
+    });
   }
 
   console.log("\nroot redirect");

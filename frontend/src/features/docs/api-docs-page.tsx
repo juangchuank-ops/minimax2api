@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { useParams } from "react-router-dom";
+import { Navigate, useParams } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/shared/components/page-header";
@@ -14,7 +14,10 @@ type EndpointDoc = {
   descriptionKey: string;
   request: string;
   response: string;
-  parameters: Array<{ name: string; type: string; required?: boolean; note: string }>;
+  // Every parameter note is a key, including the ones that read like prose:
+  // this page is the API reference, and an operator switching the console to
+  // English should not find half of it in Chinese.
+  parameters: Array<{ name: string; type: string; required?: boolean; noteKey: string }>;
 };
 
 const ENDPOINTS: EndpointDoc[] = [
@@ -41,11 +44,11 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":
 
 data: [DONE]`,
     parameters: [
-      { name: "model", type: "string", required: true, note: "minimax-agent（默认）或 minimax-m3-thinking" },
-      { name: "messages", type: "array", required: true, note: "OpenAI 标准消息数组，支持 text 与 image_url 多模态内容" },
-      { name: "stream", type: "boolean", note: "是否使用 SSE 流式输出，默认 false" },
-      { name: "temperature", type: "number", note: "透传字段，上游不区分，仅用于兼容客户端" },
-      { name: "max_tokens", type: "number", note: "透传字段，上游不限制输出长度" },
+      { name: "model", type: "string", required: true, noteKey: "docs.noteModel" },
+      { name: "messages", type: "array", required: true, noteKey: "docs.noteMessages" },
+      { name: "stream", type: "boolean", noteKey: "docs.noteStream" },
+      { name: "temperature", type: "number", noteKey: "docs.notePassthrough" },
+      { name: "max_tokens", type: "number", noteKey: "docs.noteMaxTokens" },
     ],
   },
   {
@@ -63,7 +66,8 @@ data: [DONE]`,
     { "id": "minimax-agent", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-m3", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-m3-thinking", "object": "model", "owned_by": "minimax" },
-    { "id": "minimax-image", "object": "model", "owned_by": "minimax" }
+    { "id": "minimax-image", "object": "model", "owned_by": "minimax" },
+    { "id": "minimax-h3-max", "object": "model", "owned_by": "minimax" }
   ]
 }`,
     parameters: [],
@@ -89,10 +93,10 @@ data: [DONE]`,
   ]
 }`,
     parameters: [
-      { name: "prompt", type: "string", required: true, note: "图像描述" },
-      { name: "n", type: "number", note: "期望数量，上游固定返回 4 张" },
-      { name: "size", type: "string", note: "透传字段，上游由模型决定" },
-      { name: "response_format", type: "string", note: "url（默认）或 b64_json" },
+      { name: "prompt", type: "string", required: true, noteKey: "docs.notePrompt" },
+      { name: "n", type: "number", noteKey: "docs.noteN" },
+      { name: "size", type: "string", noteKey: "docs.noteSize" },
+      { name: "response_format", type: "string", noteKey: "docs.noteResponseFormat" },
     ],
   },
   {
@@ -115,7 +119,17 @@ data: [DONE]`,
 export function ApiDocsPage() {
   const { t } = useTranslation();
   const params = useParams<{ category: string; endpoint: string }>();
-  const doc = ENDPOINTS.find((item) => item.category === params.category && item.endpoint === params.endpoint) ?? ENDPOINTS[0];
+  const doc = ENDPOINTS.find((item) => item.category === params.category && item.endpoint === params.endpoint);
+
+  // A route that resolves to nothing sends the caller to a real endpoint rather
+  // than quietly rendering the first one. Falling back would answer a URL like
+  // /docs/image/generations with the chat page — a wrong answer that looks like
+  // an answer, and the one failure mode nobody reports because nothing looks
+  // broken.
+  if (!doc) {
+    const first = ENDPOINTS[0];
+    return <Navigate to={`/docs/${first.category}/${first.endpoint}`} replace />;
+  }
   const base = typeof window === "undefined" ? "http://127.0.0.1:8080" : window.location.origin;
 
   return (
@@ -161,9 +175,9 @@ export function ApiDocsPage() {
                 <thead>
                   <tr className="border-b text-muted-foreground">
                     <th className="h-8 px-2 text-left font-normal">{t("docs.parameter")}</th>
-                    <th className="h-8 px-2 text-left font-normal">类型</th>
+                    <th className="h-8 px-2 text-left font-normal">{t("docs.parameterType")}</th>
                     <th className="h-8 px-2 text-left font-normal">{t("docs.required")}</th>
-                    <th className="h-8 px-2 text-left font-normal">说明</th>
+                    <th className="h-8 px-2 text-left font-normal">{t("docs.parameterNote")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -172,7 +186,7 @@ export function ApiDocsPage() {
                       <td className="px-2 py-2 font-mono">{parameter.name}</td>
                       <td className="px-2 py-2 text-muted-foreground">{parameter.type}</td>
                       <td className="px-2 py-2 text-muted-foreground">{parameter.required ? t("docs.required") : "—"}</td>
-                      <td className="px-2 py-2 text-muted-foreground">{parameter.note}</td>
+                      <td className="px-2 py-2 text-muted-foreground">{parameter.noteKey ? t(parameter.noteKey) : "—"}</td>
                     </tr>
                   ))}
                 </tbody>
