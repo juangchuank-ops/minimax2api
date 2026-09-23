@@ -66,11 +66,13 @@ const defaultVideoPlugin = "video-creater"
 // an optional field of the message request, so it is part of the protocol
 // rather than something inferred from a sample.
 //
-// What it does *not* have is proof of an effect. It was tried once early on,
-// against the entry point that has since turned out to be the wrong one, and
-// made no difference there — which isolates nothing. It is sent on every video
-// turn because that is what the web client does, not because it has been shown
-// to change the outcome.
+// What it does *not* have is proof of an effect, and that is now a tested
+// negative rather than an absence. The one early trial was run against the
+// entry point that later turned out to be the wrong one, so it isolated
+// nothing; the retest was run correctly and still produced no tool call and no
+// file, with the same 310 frames a turn without it produces. It is sent on
+// every video turn because that is what the web client does, not because it has
+// been shown to change the outcome.
 const VideoClientIntent = "video_generation"
 
 // Normalize fills in whatever the caller left out and rejects what cannot be

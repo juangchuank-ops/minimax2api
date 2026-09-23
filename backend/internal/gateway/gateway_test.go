@@ -958,10 +958,11 @@ func (h *harness) video(t *testing.T, body map[string]any) *httptest.ResponseRec
 
 // A video turn has to carry `client_intent`, and a chat turn must not.
 //
-// The two can send byte-identical `content` — same plugin mention, same options
-// block — and the intent is the only thing that decides whether the backend
-// dispatches the turn to the video service or hands it to the agent to reason
-// about. The agent path answers honestly, produces nothing, and bills the same.
+// This asserts *what is sent*, not what it achieves. The web client labels
+// video turns and we follow it; whether the label is what unlocks the video
+// service is still unproven — a live run that carried it produced no tool call
+// and no file. Do not read this test as evidence that the field does anything
+// beyond travelling.
 func TestVideoTurnsCarryTheVideoClientIntent(t *testing.T) {
 	h := newHarness(t, acceptsEverything(upstreamText("已提交")))
 	h.addAccount(t, "primary", "token-good", 10)
