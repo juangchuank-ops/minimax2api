@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -129,7 +130,19 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(out, http.StatusBadRequest, fmt.Sprintf("unknown or disabled model %q", modelID))
 		return
 	}
-	if model.Type != store.ModelTypeChat && model.Type != store.ModelTypeVideo {
+	// Every catalogue type is reachable here, and that is the point of the
+	// catalogue rather than an accident. `/v1/models` cannot say what a model
+	// *is* — the schema is id/object/created/owned_by and nothing else — so a
+	// chat client fills its model picker with every id it finds and sends the
+	// user's message to this endpoint whichever one was picked. A model that is
+	// listed here and then refused here is therefore a trap, not a boundary:
+	// the caller sees a 400 and has no way to tell it apart from a broken
+	// gateway. Video entries were already accepted (they are rewritten into a
+	// plugin reference); image entries are dispatched to the image turn below.
+	// Only a type this build does not know is rejected.
+	switch model.Type {
+	case store.ModelTypeChat, store.ModelTypeVideo, store.ModelTypeImage:
+	default:
 		writeError(out, http.StatusBadRequest, fmt.Sprintf("model %q is not a chat model", modelID))
 		return
 	}
@@ -141,6 +154,11 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if prompt == "" && len(images) == 0 {
 		writeError(out, http.StatusBadRequest, "messages must contain text or image content")
+		return
+	}
+
+	if model.Type == store.ModelTypeImage {
+		g.chatImage(out, r, key, model, request, prompt, images, body, started)
 		return
 	}
 
@@ -486,11 +504,235 @@ func parseContent(raw json.RawMessage) (string, []string) {
 
 // ------------------------------------------------------------ image handler
 
+// imageModelID is the catalogue entry image generation runs under.
+//
+// One id, not a family: image generation is a single capability upstream, so
+// there is nothing to choose between. The entry still earns its place — it is
+// what the console can switch off and what usage is counted against.
+const imageModelID = "minimax-image"
+
 type imageRequest struct {
-	Prompt         string `json:"prompt"`
+	Prompt string `json:"prompt"`
+	// N and Model are accepted and ignored.
+	//
+	// Image generation has exactly one model, and how many pictures come back
+	// is the upstream's decision rather than a parameter. Honouring either
+	// could therefore only ever mean rejecting the value the client guessed.
+	// Read `imageModelID` for what actually runs.
 	N              int    `json:"n"`
 	ResponseFormat string `json:"response_format"`
 	Model          string `json:"model"`
+}
+
+// imageModel returns the catalogue entry image generation runs under.
+func (g *Gateway) imageModel() (*store.ModelConfig, error) {
+	model, ok := g.store.ModelByID(imageModelID)
+	if !ok || !model.Enabled {
+		return nil, errors.New("image generation is disabled")
+	}
+	return model, nil
+}
+
+// runImageTurn sends one image request through the pool and reports what came
+// back. It does no authentication, no limiting and no auditing, because it is
+// called from two endpoints whose request shapes have nothing in common and
+// only agree from here down.
+func (g *Gateway) runImageTurn(
+	ctx context.Context,
+	prompt string,
+	images []minimax.UploadedImage,
+) (*minimax.Result, string, error) {
+	settings := g.settings()
+	var (
+		lastErr     error
+		accountName string
+		result      *minimax.Result
+	)
+
+	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		lease, err := g.pool.Acquire(ctx, "")
+		if err != nil {
+			lastErr = err
+			break
+		}
+		accountName = displayName(lease.Account)
+		result, err = g.client.Completion(ctx, minimax.Options{
+			Credential:  CredentialOf(lease.Account),
+			Text:        prompt,
+			Mode:        "image",
+			Images:      images,
+			Timeout:     settings.RequestTimeout(),
+			IdleTimeout: settings.StreamIdleTimeout(),
+		})
+		lease.Release(err)
+
+		lastErr = err
+		if err == nil || isPoolExhausted(err) {
+			break
+		}
+	}
+
+	if lastErr != nil {
+		return nil, accountName, lastErr
+	}
+	return result, accountName, nil
+}
+
+// chatImage answers a chat completion whose model is an image model.
+//
+// Both ends are translations. The request is a conversation, but an image turn
+// has no use for one — only the flattened prompt and any attached picture
+// survive. The response is a chat message, but the product is pictures, and an
+// OpenAI chat response has nowhere to put one: the only shape every client
+// already renders is markdown, so that is what the pictures travel in.
+//
+// A turn that produced nothing is still a 200 carrying the agent's own words.
+// That is deliberate and matches the video endpoint: the agent is the only
+// party that knows *why* nothing came back, and turning its explanation into an
+// error code would throw away the one useful thing the turn produced.
+func (g *Gateway) chatImage(
+	out *respWriter,
+	r *http.Request,
+	key *store.ClientKey,
+	model *store.ModelConfig,
+	request chatRequest,
+	prompt string,
+	images []minimax.UploadedImage,
+	body []byte,
+	started time.Time,
+) {
+	result, accountName, err := g.runImageTurn(r.Context(), prompt, images)
+	if err != nil {
+		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, request.Stream, 0, string(body), "", err.Error())
+		if out.wroteHeader {
+			writeSSEError(out, err.Error())
+			return
+		}
+		writeError(out, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	urls := g.absoluteMediaURLs(r, g.persistMediaList(result.Media, prompt, model.ID, accountName))
+	content := mediaMarkdown(result.Text, urls)
+	promptTokens := estimateTokens(prompt)
+
+	g.store.RecordModelUsage(model.ID, 1, 0)
+	g.store.BumpClientKeyUsage(key.ID)
+
+	if request.Stream {
+		// Nothing was streamed as it arrived — an image turn is one blocking
+		// call — so the whole message is emitted in one chunk by finishStream.
+		g.finishStream(out, &minimax.Result{Text: content}, model, nil, false)
+		g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, true, 0, string(body), content, "")
+		return
+	}
+
+	response := map[string]any{
+		"id":      "chatcmpl-" + randomID(12),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model.ID,
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": content},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": 0,
+			"total_tokens":      promptTokens,
+		},
+	}
+	if len(urls) > 0 {
+		response["media"] = urls
+	}
+	raw, _ := json.Marshal(response)
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, false, 0, string(body), string(raw), "")
+
+	out.Header().Set("content-type", "application/json")
+	out.WriteHeader(http.StatusOK)
+	_, _ = out.Write(raw)
+}
+
+// mediaMarkdown renders one chat message out of what an image turn produced.
+//
+// The agent's prose goes first and the pictures after it, in that order,
+// because the prose is where a refusal or a caveat lives and nobody reads a
+// caveat placed underneath four images. A turn with neither still has to say
+// something: an empty assistant message reads as a client-side bug and sends
+// the caller looking in the wrong place.
+func mediaMarkdown(prose string, urls []string) string {
+	var builder strings.Builder
+	if trimmed := strings.TrimSpace(prose); trimmed != "" {
+		builder.WriteString(trimmed)
+	}
+	for _, url := range urls {
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString("![](" + url + ")")
+	}
+	if builder.Len() == 0 {
+		return "The upstream turn produced neither an image nor an explanation."
+	}
+	return builder.String()
+}
+
+// absoluteMediaURLs makes stored media fetchable by the caller.
+//
+// Stored media is served from this gateway at a path, and a path is worthless
+// in a chat message: the client renders markdown in its own context, where
+// `/media/…` points at nothing. The configured public base URL wins when there
+// is one, because that is the address the operator has declared reachable;
+// otherwise the request's own origin is used, which is right both for a direct
+// call and for a proxy that passes the original host through.
+func (g *Gateway) absoluteMediaURLs(r *http.Request, urls []string) []string {
+	base := strings.TrimRight(strings.TrimSpace(g.settings().Media.PublicBaseURL), "/")
+	if base == "" {
+		base = requestBase(r)
+	}
+	out := make([]string, 0, len(urls))
+	for _, url := range urls {
+		if base != "" && strings.HasPrefix(url, "/") {
+			url = base + url
+		}
+		out = append(out, url)
+	}
+	return out
+}
+
+// requestBase reconstructs the origin the caller reached us on, preferring the
+// proxy's view when there is one.
+func requestBase(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := firstHeaderValue(r, "X-Forwarded-Proto"); forwarded == "http" || forwarded == "https" {
+		scheme = forwarded
+	}
+	host := firstHeaderValue(r, "X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	if host == "" {
+		return ""
+	}
+	return scheme + "://" + host
+}
+
+// firstHeaderValue reads the first entry of a possibly comma-joined header.
+func firstHeaderValue(r *http.Request, name string) string {
+	raw := r.Header.Get(name)
+	if index := strings.Index(raw, ","); index >= 0 {
+		raw = raw[:index]
+	}
+	return strings.TrimSpace(raw)
 }
 
 // ImageGenerations implements POST /v1/images/generations.
@@ -520,43 +762,17 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model, ok := g.store.ModelByID("minimax-image")
-	if !ok || !model.Enabled {
-		writeError(out, http.StatusServiceUnavailable, "image generation is disabled")
+	model, err := g.imageModel()
+	if err != nil {
+		writeError(out, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
 	settings := g.settings()
-	var (
-		lastErr     error
-		accountName string
-		result      *minimax.Result
-	)
-
-	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(r.Context(), "")
-		if err != nil {
-			lastErr = err
-			break
-		}
-		accountName = displayName(lease.Account)
-		result, err = g.client.Completion(r.Context(), minimax.Options{
-			Credential:  CredentialOf(lease.Account),
-			Text:        request.Prompt,
-			Mode:        "image",
-			Timeout:     settings.RequestTimeout(),
-			IdleTimeout: settings.StreamIdleTimeout(),
-		})
-		lease.Release(err)
-		lastErr = err
-		if err == nil || isPoolExhausted(err) {
-			break
-		}
-	}
-
-	if lastErr != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", lastErr.Error())
-		writeError(out, http.StatusBadGateway, lastErr.Error())
+	result, accountName, err := g.runImageTurn(r.Context(), request.Prompt, nil)
+	if err != nil {
+		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", err.Error())
+		writeError(out, http.StatusBadGateway, err.Error())
 		return
 	}
 

@@ -612,6 +612,213 @@ func TestImageGenerationsReturnsMedia(t *testing.T) {
 	}
 }
 
+// A client cannot learn from /v1/models that an image model is an image model —
+// the schema has nowhere to say so — so picking it in a chat window sends the
+// prompt to the chat endpoint. The answer therefore has to arrive as something
+// the client already knows how to render.
+func TestChatCompletionsAnswersAnImageModelWithMarkdown(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/cat.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-image",
+		"messages": []any{map[string]any{"role": "user", "content": "一只小猫"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["model"] != "minimax-image" {
+		t.Fatalf("model = %v", payload["model"])
+	}
+	choices, _ := payload["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices = %v", payload["choices"])
+	}
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	content, _ := message["content"].(string)
+	if !strings.Contains(content, "![](https://cdn/cat.png)") {
+		t.Fatalf("content does not render the image: %q", content)
+	}
+	if media, _ := payload["media"].([]any); len(media) != 1 || media[0] != "https://cdn/cat.png" {
+		t.Fatalf("media = %v", payload["media"])
+	}
+
+	// The turn is billed to the image entry, not to whatever the caller named.
+	entry, ok := h.store.ModelByID("minimax-image")
+	if !ok || entry.Requests != 1 {
+		t.Fatalf("usage was not recorded against the image entry: %+v", entry)
+	}
+}
+
+// An image turn is one blocking call, so there is nothing to stream as it
+// arrives — but the client asked for SSE and has to get a well-formed one.
+func TestChatCompletionsStreamsAnImageModelAsOneChunk(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/cat.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-image",
+		"stream":   true,
+		"messages": []any{map[string]any{"role": "user", "content": "一只小猫"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("content-type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q", ct)
+	}
+
+	lines := sseDataLines(t, rec)
+	if len(lines) == 0 || lines[len(lines)-1] != "[DONE]" {
+		t.Fatalf("stream does not end with [DONE]: %v", lines)
+	}
+	var streamed string
+	var sawStop bool
+	for _, line := range lines {
+		if line == "[DONE]" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			t.Fatalf("chunk is not JSON: %v", err)
+		}
+		choices, _ := payload["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		choice, _ := choices[0].(map[string]any)
+		if choice["finish_reason"] == "stop" {
+			sawStop = true
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if text, ok := delta["content"].(string); ok {
+			streamed += text
+		}
+	}
+	if !strings.Contains(streamed, "![](https://cdn/cat.png)") {
+		t.Fatalf("streamed content = %q", streamed)
+	}
+	if !sawStop {
+		t.Fatal("no chunk reported finish_reason stop")
+	}
+}
+
+// A turn that produced nothing is still an answer. The agent is the only party
+// that knows why, so its words are the payload and an error code would discard
+// them — the same rule the video endpoint follows.
+func TestChatImageKeepsTheAgentsExplanation(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("I cannot reach the image service.")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-image",
+		"messages": []any{map[string]any{"role": "user", "content": "一只小猫"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	choices, _ := payload["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if content, _ := message["content"].(string); !strings.Contains(content, "I cannot reach") {
+		t.Fatalf("the agent's explanation was dropped: %v", message["content"])
+	}
+	if _, present := payload["media"]; present {
+		t.Fatalf("media should be absent when nothing was produced: %v", payload["media"])
+	}
+}
+
+func TestMediaMarkdownPutsTheProseAboveThePictures(t *testing.T) {
+	cases := []struct {
+		name  string
+		prose string
+		urls  []string
+		want  string
+	}{
+		{"prose only", "I cannot do that.", nil, "I cannot do that."},
+		{"picture only", "", []string{"https://cdn/a.png"}, "![](https://cdn/a.png)"},
+		{
+			"both", "Here you go.", []string{"https://cdn/a.png", "https://cdn/b.png"},
+			"Here you go.\n\n![](https://cdn/a.png)\n\n![](https://cdn/b.png)",
+		},
+		{"blank prose is not content", " \n\t ", []string{"https://cdn/a.png"}, "![](https://cdn/a.png)"},
+		{"nothing at all", "", nil, "The upstream turn produced neither an image nor an explanation."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mediaMarkdown(tc.prose, tc.urls); got != tc.want {
+				t.Fatalf("mediaMarkdown = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Stored media is served from this gateway at a path, and a path means nothing
+// to a client rendering markdown in its own context.
+func TestAbsoluteMediaURLsMakesStoredFilesFetchable(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Host = "gateway.example:8080"
+
+	got := h.gateway.absoluteMediaURLs(req, []string{"/media/a.png", "https://cdn/b.png"})
+	if got[0] != "http://gateway.example:8080/media/a.png" {
+		t.Fatalf("stored media = %q", got[0])
+	}
+	if got[1] != "https://cdn/b.png" {
+		t.Fatalf("an absolute source url must be left alone: %q", got[1])
+	}
+}
+
+func TestAbsoluteMediaURLsPrefersTheProxyAndThenTheConfiguredBase(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Host = "internal:8080"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "m2api.example")
+	if got := h.gateway.absoluteMediaURLs(req, []string{"/media/a.png"}); got[0] != "https://m2api.example/media/a.png" {
+		t.Fatalf("proxied origin = %q", got[0])
+	}
+
+	// The configured base wins over both, because it is the address the
+	// operator has declared reachable.
+	h.settings.Media.PublicBaseURL = "https://cdn.example/public/"
+	if got := h.gateway.absoluteMediaURLs(req, []string{"/media/a.png"}); got[0] != "https://cdn.example/public/media/a.png" {
+		t.Fatalf("configured base = %q", got[0])
+	}
+}
+
+// The image endpoint has one model and no control over how many pictures come
+// back, so both fields are accepted and ignored: honouring either could only
+// mean rejecting the value the client guessed.
+func TestImageGenerationsIgnoresTheModelAndCountFields(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/one.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	raw, _ := json.Marshal(map[string]any{"prompt": "a blue circle", "model": "dall-e-3", "n": 9})
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.ImageGenerations(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	// One picture, because that is what the turn produced — not nine, because
+	// that is what the caller asked for.
+	if data, _ := decodeJSON(t, rec)["data"].([]any); len(data) != 1 {
+		t.Fatalf("data = %v, want the 1 image the turn produced", decodeJSON(t, rec)["data"])
+	}
+}
+
 // An inline data URI cannot be fetched by the upstream, so the request must be
 // refused with an actionable message rather than forwarded to fail opaquely.
 func TestChatCompletionsRejectsInlineImageWithoutPublicBaseURL(t *testing.T) {

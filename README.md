@@ -9,7 +9,7 @@
 ## 特性
 
 **API 层**
-- `POST /v1/chat/completions` — 支持流式（SSE）与非流式，兼容 OpenAI 请求/响应格式
+- `POST /v1/chat/completions` — 支持流式（SSE）与非流式，兼容 OpenAI 请求/响应格式；**模型目录里的每一种类型都从这个口进**（见「模型列表就是一句接口承诺」）
 - `POST /v1/images/generations` — 图像生成
 - `POST /v1/videos/generations` — 视频生成（MiniMax H3.0 / H3 Max / Hailuo 2.3，见「视频生成」）
 - `GET /v1/models` — 模型列表
@@ -156,6 +156,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+图像模型也从这个口进——图片以 Markdown 形式回在正文里，所以任何只会聊天的客户端都能用：
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-mm-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minimax-image",
+    "messages": [{"role": "user", "content": "一只在花园里散步的猫"}]
+  }'
+```
+
 ---
 
 ## 模型映射
@@ -165,7 +177,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
 | `minimax-m3` | chat | 对话模式，响应更快 |
 | `minimax-m3-thinking` | chat | 深度思考模式，推理内容走 `reasoning_content` |
-| `minimax-image` | image | 图像生成，走 `/v1/images/generations` |
+| `minimax-image` | image | 图像生成；`/v1/images/generations` 与 `/v1/chat/completions` 都可用 |
 | `minimax-h3` | video | H3.0，质量优先；支持多模态参考；消耗账号积分 |
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成；仅文生视频与首/尾帧；480P/768P；5-15 秒 |
 | `minimax-hailuo-2-3` | video | Hailuo 2.3，成本更低；可用 Token Plan；输出无声视频 |
@@ -174,7 +186,29 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 >
 > **video 类模型不是这么回事**：H3 在上游**根本不是一个可选模型**，而是一个插件。模型 ID 在这里承载的是「生成参数」而不是「路由选择」——详见下一节。
 >
+> **image 类模型**走 `/v1/images/generations`，但也**同样在 `/v1/chat/completions` 上可用**——原因见下一节。
+>
 > 推理内容会被自动分离到 `reasoning_content`，不会混进正文——这是适配器按 payload 字段分流的，不依赖上游的事件编号。
+
+### 模型列表就是一句接口承诺
+
+`GET /v1/models` 列出来的每一个 id，客户端都会**当成对话模型**填进它的模型下拉框，然后打到 `/v1/chat/completions` 上。这不是客户端的毛病，是因为 **OpenAI 的 `/v1/models` schema 只有 `id` / `object` / `created` / `owned_by`，没有任何字段能表达「这是图像模型」**。在响应里加自定义字段也没用——客户端不读。
+
+所以这个网关的原则是：**列出来的就能用**。
+
+| 类型 | `/v1/chat/completions` | `/v1/images/generations` | `/v1/videos/generations` |
+| --- | --- | --- | --- |
+| `chat` | ✅ | — | — |
+| `image` | ✅ 图片以 Markdown 回在正文里 | ✅ | — |
+| `video` | ✅ 整轮被改写成插件引用 | — | ✅ |
+
+对话接口上的图像模型做了两层翻译：请求侧只保留拍平后的提示词和附件（图像轮次用不上多轮对话），响应侧把图片以 `![](url)` 放进 `message.content`——这是 OpenAI 的对话响应里**唯一**一种所有客户端都认得的图片表达。同一个 `url` 也会出现在非流式响应的 `media` 字段里（这是本网关的扩展字段，客户端的 Markdown 渲染才是主力）。流式时整条消息一次性发出，因为图像轮次本身是一次阻塞调用，没有增量可发。
+
+图片链接会**补成绝对地址**：存下来的媒体是以 `/media/<文件>` 这种路径对外提供的，而相对路径在客户端自己的渲染上下文里指向虚空。配置了「媒体公开前缀」就用它，否则按请求的 `X-Forwarded-Proto` / `X-Forwarded-Host` 或 `Host` 还原来源。
+
+> 反过来说：**`/v1/images/generations` 不读请求里的 `model` 字段**。图像生成只有一个模型，认它只会意味着拒绝客户端猜的那个值。
+>
+> 这一轮如果什么都没产出，接口仍然返回 200，正文是 **Agent 自己的原话**。别把它当错误码——Agent 是唯一知道「为什么没有」的一方，把它的话丢掉才是最糟的处理。详见「视频生成」里同样的取舍。
 
 ---
 
@@ -596,7 +630,7 @@ go vet ./...
 | `internal/signin` | 错过的时间点补签、重复领取记为「已签」、国内站账号跳过、失效令牌退役、失败也占掉当天（避免上游故障变成请求循环）、积分接口故障不牵连账号健康、扫描不可重入、**初始化序列跑在领取之前且失败即跳过领取**、领取面板用上游回显的那一份、对账只认发放时间不认余额、宽限期内不下结论 |
 | `internal/admin` | 设置接口逐字段与 struct 的 json tag 比对（防新设置漏接线）、生成的指纹形状、区域推断、令牌解析 |
 | `internal/config` | 已知坏默认值的迁移（旧会话路径、`agentID = general`、旧消息路径）、迁移不误伤刻意的覆盖值 |
-| `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝、**视频轮次带 `client_intent` 而普通对话不带**、**只存在于网盘的成品也能被取回**、取件失败不污染这一轮的结果 |
+| `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝、**模型目录里的每一种类型都能在对话接口上用（图像模型回 Markdown 图片，流式也是合法 SSE）**、**媒体链接补成绝对地址（公开前缀 > 代理头 > Host）**、**视频轮次带 `client_intent` 而普通对话不带**、**只存在于网盘的成品也能被取回**、取件失败不污染这一轮的结果 |
 | `internal/gateway`（上游桩） | 用 `httptest` 顶替上游，因此不需要真实令牌就能覆盖完整链路 |
 
 > `pool` 里的死锁与并发用例用 `channel + timeout` 断言，而不是裸 `t.Fatal`——测试进程卡住时，超时能给出失败信息而不是整体挂起。
@@ -740,6 +774,9 @@ location / {
 ---
 
 ## 常见问题
+
+**Q：在 Cherry Studio 里选中 `minimax-image` 发一句话，报 `model "minimax-image" is not a chat model`？**
+这是**旧版本**的行为，现在不会了。`/v1/models` 列出的每个 id，客户端都会当成对话模型填进下拉框（OpenAI 的 `/v1/models` schema 里没有字段能说明「这是图像模型」），然后打到 `/v1/chat/completions` 上——旧版本在那一层把它拒了，于是「列表里有、选中就 400」，看起来像网关坏了。现在图像模型也从这个口进，图片以 Markdown 形式回在正文里。详见「模型列表就是一句接口承诺」。
 
 **Q：账号一直显示 `cooldown`，日志里是 `credential rejected`？**
 令牌过期了。重新登录站点取一份新的 `_token`，在号池管理里编辑该账号或重新导入即可。

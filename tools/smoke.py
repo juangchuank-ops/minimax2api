@@ -231,6 +231,21 @@ def main():
                      {"model": "minimax-agent", "prompt": "hi"}, key)
     check("video endpoint refuses a chat model", status == 400, f"status={status}")
 
+    # The model list is a promise, not a menu. A client cannot tell from
+    # /v1/models what a model *is* - the schema has nowhere to say so - so it
+    # sends whatever the user picked to the chat endpoint. A catalogue entry
+    # that the chat endpoint refuses is therefore a trap the caller cannot
+    # diagnose. This asserts the promise without spending anything: the call is
+    # allowed to fail for want of a credential, but never with "not a chat
+    # model".
+    for image_model in ("minimax-image",):
+        status, payload = call(base, "/v1/chat/completions", "POST",
+                               {"model": image_model,
+                                "messages": [{"role": "user", "content": "a blue circle"}]},
+                               key, timeout=180)
+        check(f"{image_model} is accepted on the chat endpoint", status != 400,
+              f"status={status} {payload}")
+
     if args.skip_upstream:
         print("\n8. gateway (skipped)")
         print("  [SKIP] upstream gateway calls (--skip-upstream)")
