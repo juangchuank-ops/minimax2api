@@ -1,4 +1,10 @@
-<p align="center"><img src="assets/logo.png" alt="MiniMax2API" width="480"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
+    <img alt="MiniMax2API" src="assets/logo-light.png" width="480">
+  </picture>
+</p>
 
 # MiniMax2API
 
@@ -715,6 +721,9 @@ tools/
   render.mjs            真实浏览器渲染 + 控制台流程检查（CDP，需本机 Chrome）
   secret_scan.py        工作树 + 全历史密钥扫描（推送前跑）
   hooks/pre-commit      提交前自动跑 secret_scan.py --tree-only
+assets/
+  logo-dark.png         深色主题的 logo（白字），README 里按 prefers-color-scheme 切换
+  logo-light.png        浅色主题的 logo（深字），同时充当不支持 <picture> 的渲染器的兜底
 ```
 
 ### 持久化设计
