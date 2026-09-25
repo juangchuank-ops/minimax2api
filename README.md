@@ -1,8 +1,24 @@
+<p align="center"><img src="assets/logo.png" alt="MiniMax2API" width="480"></p>
+
 # MiniMax2API
 
-把 [MiniMax Agent](https://agent.minimax.io/) 的 Web 端能力封装成 **OpenAI 兼容 API**，并配一套完整的**管理台 + 号池调度**。
+把 [MiniMax Agent](https://agent.minimax.io/) 的 Web 端能力封装成 **OpenAI 兼容 API**，同时提供 **Anthropic Messages 兼容端点**，并配一套完整的**管理台 + 号池调度**。
 
 前端界面参考 [grok2api](https://github.com/chenyme/grok2api) 的设计语言实现（React 19 + Vite + Tailwind 4，自建零依赖 shadcn 风格组件）。后端是纯 Go 标准库，无第三方依赖，单二进制 + 单 JSON 文件即可跑起来。
+
+---
+
+## 免责声明
+
+本项目仅用于**学习与技术研究**，对接的是第三方服务的 Web 端接口，而该服务并未提供公开 API。使用者需自行确保其使用方式符合目标服务的服务条款及所在地法律法规，因使用本项目产生的任何后果由使用者自行承担。
+
+需要明确知道的几件事：
+
+- **签名算法是从前端 bundle 里逆向出来的**，其中的静态盐值是硬编码的。上游随时可能更换算法或盐值，届时本项目会失效——这不是 bug，是这类项目的固有属性。
+- **批量使用账号可能触发上游的风控**，导致账号被限制或封禁。请只使用你自己的账号，并自行评估风险。
+- **自动签到同理**。签到是官方给单账号的日常福利，把一批账号放进来按天自动领，本质上就是自动化操作多账号，请自行判断这在你所处的场景下是否合适。
+- 请勿用于**商业转售、二次分发额度**或任何绕过付费的用途。
+- 本项目与 MiniMax 官方无任何关联，未获其授权或认可。
 
 ---
 
@@ -10,10 +26,15 @@
 
 **API 层**
 - `POST /v1/chat/completions` — 支持流式（SSE）与非流式，兼容 OpenAI 请求/响应格式；**模型目录里的每一种类型都从这个口进**（见「模型列表就是一句接口承诺」）
+- `POST /v1/messages` — **Anthropic Messages 兼容**。Claude Code、Kiro 这类只会说 Anthropic 协议的客户端可以直接接上，见「Anthropic 兼容」
 - `POST /v1/images/generations` — 图像生成
 - `POST /v1/videos/generations` — 视频生成（MiniMax H3.0 / H3 Max / Hailuo 2.3，见「视频生成」）
 - `GET /v1/models` — 模型列表
 - `GET /health` — 健康检查 + 号池概览
+
+**函数调用（模拟）**
+- 请求里的 `tools` 声明会被接受，模型的调用意图被解析成标准的 `tool_calls`（OpenAI）与 `tool_use`（Anthropic），流式与非流式都支持
+- ⚠️ **这是模拟，不是原生支持**：上游的消息体里没有任何可以承载工具声明的字段，网关只能用提示词约定来模拟。能力边界、代价和为什么不建议依赖它，见「函数调用」一节
 
 **双区域账号池（国内 + 国际）**
 
@@ -168,6 +189,23 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+讲 Anthropic 协议的客户端走 `/v1/messages`，用同一个 key：
+
+```bash
+curl http://127.0.0.1:8080/v1/messages \
+  -H "Authorization: Bearer sk-mm-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "system": "你是一个简洁的助手",
+    "messages": [{"role": "user", "content": "你好"}],
+    "stream": true
+  }'
+```
+
+`model` 填什么都不影响能不能用——认不出来的名字会回落到默认对话模型，见「Anthropic 兼容」。
+
 ---
 
 ## 模型映射
@@ -196,11 +234,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 所以这个网关的原则是：**列出来的就能用**。
 
-| 类型 | `/v1/chat/completions` | `/v1/images/generations` | `/v1/videos/generations` |
-| --- | --- | --- | --- |
-| `chat` | ✅ | — | — |
-| `image` | ✅ 图片以 Markdown 回在正文里 | ✅ | — |
-| `video` | ✅ 整轮被改写成插件引用 | — | ✅ |
+| 类型 | `/v1/chat/completions` | `/v1/images/generations` | `/v1/videos/generations` | `/v1/messages` |
+| --- | --- | --- | --- | --- |
+| `chat` | ✅ | — | — | ✅ |
+| `image` | ✅ 图片以 Markdown 回在正文里 | ✅ | — | — |
+| `video` | ✅ 整轮被改写成插件引用 | — | ✅ | — |
+
+> `/v1/messages` 只服务 `chat` 类型。Anthropic 协议里没有图像/视频生成的对应形状，硬塞一个自定义块只会让客户端看不懂。
 
 对话接口上的图像模型做了两层翻译：请求侧只保留拍平后的提示词和附件（图像轮次用不上多轮对话），响应侧把图片以 `![](url)` 放进 `message.content`——这是 OpenAI 的对话响应里**唯一**一种所有客户端都认得的图片表达。同一个 `url` 也会出现在非流式响应的 `media` 字段里（这是本网关的扩展字段，客户端的 Markdown 渲染才是主力）。流式时整条消息一次性发出，因为图像轮次本身是一次阻塞调用，没有增量可发。
 
@@ -209,6 +249,101 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 > 反过来说：**`/v1/images/generations` 不读请求里的 `model` 字段**。图像生成只有一个模型，认它只会意味着拒绝客户端猜的那个值。
 >
 > 这一轮如果什么都没产出，接口仍然返回 200，正文是 **Agent 自己的原话**。别把它当错误码——Agent 是唯一知道「为什么没有」的一方，把它的话丢掉才是最糟的处理。详见「视频生成」里同样的取舍。
+
+---
+
+## 函数调用
+
+**先说结论：上游没有这条通道，这里是模拟的。** 只想要一个能跑的 OpenAI 兼容网关的话，这一节可以跳过；打算依赖函数调用的话，请读完再决定。
+
+### 上游为什么做不到原生支持
+
+发消息的请求体是一张固定的字段表。它来自网页端 bundle 里构造这个体的那个函数：
+
+```js
+let N = {content: e};
+a?.length && (N.attachments = ...);
+i && (N.model = i);
+r && (N.turn_id = r);
+d && (N.enable_team = !0);
+t && (N.client_intent = t);
+void 0 !== o && (N.worktreeMode = o);
+m && u && (N.workspace_dir = m);
+```
+
+`content` / `attachments` / `model` / `turn_id` / `enable_team` / `client_intent` / `worktreeMode` / `workspace_dir`——**没有任何一项装得下工具定义**。同一份 bundle 在请求侧对 `tools`、`functions`、`tool_choice` 的匹配数都是 **0**。
+
+上游**会**返回 `tool_call` 帧，但那是它**自己的**工具（`RunMcpTool`、`LoadToolkit`、`DownloadFile`、`RenderMermaid`……），由 agent 服务端挂载、由 agent 自己执行。它们不是对调用方所声明之物的调用，转发出去就等于谎报「这个调用该由你来跑」。
+
+所以和视频生成一样，网关能控制的只有「把这一轮话说成什么样」。
+
+### 模拟是怎么工作的
+
+请求带 `tools` 时，声明会被拼进提示词，并要求模型在回复**末尾**用一个标记块作答：
+
+```
+<tool_calls>
+{"name": "get_weather", "arguments": {"city": "北京"}}
+</tool_calls>
+```
+
+一行一个 JSON 对象。选这个形状而不是嵌套 XML，是因为它不需要 CDATA 转义、不需要属性引号——模型能写错的地方更少，解析器能误收的地方也更少。
+
+回复里出现这个块且能解析，它就会被摘出来变成标准的 `tool_calls` / `tool_use`，`finish_reason` 变成 `tool_calls`（Anthropic 侧是 `stop_reason: "tool_use"`）。
+
+### 三条刻意的取舍
+
+这三点是对同类实现里那些坑的回避，也是这个模拟唯一比它们好的地方：
+
+1. **绝不悄悄换模型。** 带工具的请求跑在调用方指定的模型上。为了让某个格式跑通而把模型降级，是把一个看得见的失败换成一个看不见的失败。
+2. **解析不了就原样保留。** 只有**解析成功**的块才会从正文里摘掉。一个存在但读不懂的块留在原地——删掉调用方从没见过的文字，比让他看见一个畸形块更糟；把读不懂的块硬报成一次调用，更糟。
+3. **只在声明了工具时才解析。** 没带 `tools` 的请求里，`<tool_calls>` 就是普通文本，一个字符都不会动。没有声明，就没有关于这个块含义的约定。
+
+流式路径还多一层：标记可能被切成两半（`<tool_` 与 `calls>` 落在两个帧里），所以每次增量都会扣住末尾最多 `len("<tool_calls>")-1` 个字节，等下一帧判定。扣留按 **rune 边界**切，不会把多字节字符劈成两半。
+
+### 该不该用
+
+**能用的场景**：客户端自己会跑循环（拿到 `tool_calls` → 执行 → 把结果塞回对话），工具定义简单，模型听话。
+
+**别依赖的场景**：把工具调用当作可靠的控制流。它终究是一个格式约定，模型的服从度会变、上游对提示词的处理也会变。解析失败时你拿到的是正文而不是调用——这是有意的降级，但对一个把工具调用当命脉的程序来说，那就是一次静默的功能失效。
+
+---
+
+## Anthropic 兼容
+
+`POST /v1/messages`，讲 Anthropic Messages API 的形状。
+
+### 模型名
+
+Claude 客户端会发自己的模型 id（`claude-sonnet-4-20250514` 之类），而没有任何设置能让它们改。所以：
+
+- **认不出来的名字回落到默认对话模型**，而不是报错——否则这个端点存在的意义（让 Claude 客户端能接）就落空了
+- **认得出的名字照用**，所以你可以故意把模型填成 `minimax-m3-thinking` 来钉住它
+
+### 转换
+
+| Anthropic | 去向 |
+| --- | --- |
+| `system`（字符串或块数组） | 拍成 `[系统指令] …` 前缀 |
+| `content` 里的 `text` 块 | 正文 |
+| `content` 里的 `image` 块 | 转成图片附件，与 OpenAI 路径同一套（见「关于图片」） |
+| `content` 里的 `tool_use` / `tool_result` 块 | 渲染成散文。上游没有承载它们的结构化通道，但它们是下一轮回答所依赖的上下文，丢掉等于悄悄改了问题 |
+| `thinking` 块 | 不回放。那是模型自己产生过的推理，重放只是每轮多花 token |
+
+`tools` 的 `input_schema` 会被改写成内部的 OpenAI 形状，之后两个前端走同一套注入与解析。
+
+### 响应
+
+非流式回 `type: "message"` 的完整对象；流式回 Anthropic 的事件序列：
+
+```
+message_start → content_block_start → content_block_delta… → content_block_stop
+              → message_delta → message_stop
+```
+
+块的 index 是**按模型的实际产出顺序动态分配**的：先思考后回答的一轮，thinking 在 0、text 在 1；没思考的一轮，text 就在 0。提前把 index 定死，要么留下一个空的 thinking 块，要么给错 index。
+
+> 这个端点和 OpenAI 那个共用同一套号池、故障转移与审计——**只有请求和响应的形状不同，中间一模一样**。
 
 ---
 
@@ -518,10 +653,10 @@ signinParams(settings, cred, unixMs, forSignature)
 
 ```
                     ┌──────────────────────────────┐
-   OpenAI 客户端 ──▶│  gateway   /v1/*             │
+ OpenAI / Claude ─▶│  gateway   /v1/*             │
                     │  · 鉴权（客户端密钥）         │
                     │  · 限流（RPM / 并发）         │
-                    │  · SSE 转发                  │
+                    │  · SSE 转发 / 格式转换       │
                     └──────────┬───────────────────┘
                                │ Acquire / Release
                     ┌──────────▼───────────────────┐
@@ -565,7 +700,7 @@ backend/
   internal/pool/        号池调度
   internal/minimax/     上游协议客户端（签名、会话、SSE、令牌解析、签到/积分、身份与 agent 发现）
   internal/signin/      每日签到调度 + 积分轮询（不含 HTTP，客户端注入）
-  internal/gateway/     OpenAI 兼容层 + 限流
+  internal/gateway/     OpenAI 与 Anthropic 兼容层、函数调用模拟、限流
   internal/admin/       管理台 API
 frontend/
   src/app/              壳层与路由
@@ -620,7 +755,7 @@ go test ./...            # 单元测试（含并发/重入锁回归）
 go vet ./...
 ```
 
-覆盖五个核心包，其中四个完全不依赖网络：
+覆盖以下核心包，其中大多数完全不依赖网络：
 
 | 包 | 覆盖内容 |
 | --- | --- |
@@ -631,6 +766,8 @@ go vet ./...
 | `internal/admin` | 设置接口逐字段与 struct 的 json tag 比对（防新设置漏接线）、生成的指纹形状、区域推断、令牌解析 |
 | `internal/config` | 已知坏默认值的迁移（旧会话路径、`agentID = general`、旧消息路径）、迁移不误伤刻意的覆盖值 |
 | `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝、**模型目录里的每一种类型都能在对话接口上用（图像模型回 Markdown 图片，流式也是合法 SSE）**、**媒体链接补成绝对地址（公开前缀 > 代理头 > Host）**、**视频轮次带 `client_intent` 而普通对话不带**、**只存在于网盘的成品也能被取回**、取件失败不污染这一轮的结果 |
+| `internal/gateway`（Anthropic） | `/v1/messages` 的形状——消息对象、事件序列的顺序、未知模型名回落、鉴权错误的信封、`system` 与 `tool_result` 进提示词、图片块不丢、工具调用转 `tool_use` |
+| `internal/gateway`（函数调用） | 注入的提示词含声明、解析器接受多行与字符串化的 `arguments`、**读不懂的块原样保留**、**没声明工具时块一个字符都不动**、流式扣留标记的跨帧与 rune 边界 |
 | `internal/gateway`（上游桩） | 用 `httptest` 顶替上游，因此不需要真实令牌就能覆盖完整链路 |
 
 > `pool` 里的死锁与并发用例用 `channel + timeout` 断言，而不是裸 `t.Fatal`——测试进程卡住时，超时能给出失败信息而不是整体挂起。
@@ -876,19 +1013,14 @@ agent 侧的初始化。不调它新号发消息会 500（报 `Environment Varia
 **Q：签到失败会一直重试吗？**
 不会。失败的尝试**同样占掉当天**。否则上游一次故障会被每个 tick 重放一遍，变成请求风暴；想立刻重试就在号池管理里对单个账号点「立即签到」。
 
----
+**Q：带了 `tools` 请求，返回的却是普通文本，没有 `tool_calls`？**
+这是模拟层的正常降级，不是 bug。上游没有承载工具声明的字段，工具调用靠提示词约定加解析回复实现——模型没按格式作答时，解析就什么也拿不到。此时**正文原样返回**（不会丢内容），`finish_reason` 是 `stop` 而不是 `tool_calls`。想提高命中率可以简化工具描述、减少工具数量；但**别把它当可靠的控制流**，理由见「函数调用 → 该不该用」。
 
-## 免责声明
+**Q：Claude 客户端连上来，说模型不存在？**
+`/v1/messages` 不会因为模型名认不出来而报错，它会回落到默认对话模型。如果你在响应里看到 `model` 变成了 `minimax-agent`，说明客户端原来发的名字不在模型目录里。想让某个名字生效，在管理台的模型目录里建一个同名条目即可。
 
-本项目仅用于**学习与技术研究**，对接的是第三方服务的 Web 端接口，而该服务并未提供公开 API。使用者需自行确保其使用方式符合目标服务的服务条款及所在地法律法规，因使用本项目产生的任何后果由使用者自行承担。
-
-需要明确知道的几件事：
-
-- **签名算法是从前端 bundle 里逆向出来的**，其中的静态盐值是硬编码的。上游随时可能更换算法或盐值，届时本项目会失效——这不是 bug，是这类项目的固有属性。
-- **批量使用账号可能触发上游的风控**，导致账号被限制或封禁。请只使用你自己的账号，并自行评估风险。
-- **自动签到同理**。签到是官方给单账号的日常福利，把一批账号放进来按天自动领，本质上就是自动化操作多账号，请自行判断这在你所处的场景下是否合适。
-- 请勿用于**商业转售、二次分发额度**或任何绕过付费的用途。
-- 本项目与 MiniMax 官方无任何关联，未获其授权或认可。
+**Q：`/v1/messages` 和 `/v1/chat/completions` 有什么区别？**
+只有请求和响应的形状不同。号池、调度、冷却、故障转移、审计、限流全部共用同一条路径。
 
 ---
 

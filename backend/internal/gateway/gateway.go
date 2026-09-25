@@ -78,6 +78,7 @@ type chatRequest struct {
 	Messages []chatMessage `json:"messages"`
 	Stream   bool          `json:"stream"`
 	User     string        `json:"user"`
+	Tools    []toolSpec    `json:"tools"`
 }
 
 type chatMessage struct {
@@ -173,59 +174,59 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	settings := g.settings()
 	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
-	var (
-		lastErr      error
-		accountName  string
-		result       *minimax.Result
-		firstToken   int64
-		retries      int
-		streamedFlag bool
-	)
 
-	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(r.Context(), request.User)
-		if err != nil {
-			lastErr = err
-			break
-		}
-		accountName = displayName(lease.Account)
-		if attempt > 0 {
-			retries = attempt
-		}
-
-		opts := minimax.Options{
-			Credential:  CredentialOf(lease.Account),
-			Text:        prompt,
-			Mode:        mode,
-			Images:      images,
-			Timeout:     timeoutFor(settings, model),
-			IdleTimeout: settings.StreamIdleTimeout(),
-		}
-
-		if request.Stream {
-			var streamed bool
-			result, firstToken, streamed, err = g.streamCompletion(out, r, opts, model, started)
-			streamedFlag = streamed
-		} else {
-			result, err = g.client.Completion(r.Context(), opts)
-		}
-		lease.Release(err)
-
-		lastErr = err
-		if err == nil {
-			break
-		}
-		if r.Context().Err() != nil || out.wroteHeader {
-			break
-		}
-		if isPoolExhausted(err) {
-			break
-		}
+	// Tool declarations ride along in the turn text, because the upstream body
+	// has no field that could carry them. tools.go records the evidence and the
+	// cost of the emulation; nothing here should be read as native support.
+	toolsEnabled := model.Type == store.ModelTypeChat && hasToolDeclarations(request.Tools)
+	if toolsEnabled {
+		prompt = injectTools(prompt, request.Tools)
 	}
 
+	splitter := newToolSplitter(toolsEnabled)
+	var onDelta, onThinking func(string)
+
+	var chunkMu sync.Mutex
+	writeChunk := func(delta map[string]any, finish any) {
+		chunkMu.Lock()
+		defer chunkMu.Unlock()
+		ensureStreamHeaders(out)
+		writeChunkRaw(out, model, delta, finish)
+		out.Flush()
+	}
+
+	if request.Stream {
+		onDelta = func(text string) {
+			if safe := splitter.push(text); safe != "" {
+				writeChunk(map[string]any{"content": safe}, nil)
+			}
+		}
+		onThinking = func(text string) {
+			writeChunk(map[string]any{"reasoning_content": text}, nil)
+		}
+		// The role frame opens the message and goes out before the upstream is
+		// called. That also means a streaming request has committed by the time
+		// its first attempt is made: a retry would append a second answer to a
+		// message the caller has already begun reading.
+		writeChunk(map[string]any{"role": "assistant", "content": ""}, nil)
+	}
+
+	turn, lastErr := g.runTurn(r.Context(), turnRequest{
+		Prompt:     prompt,
+		Images:     images,
+		Mode:       mode,
+		Model:      model,
+		SessionKey: request.User,
+		Started:    started,
+		OnDelta:    onDelta,
+		OnThinking: onThinking,
+		Committed:  func() bool { return out.wroteHeader },
+	})
+
+	accountName := turn.AccountName
 	promptTokens := estimateTokens(prompt)
 	if lastErr != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, promptTokens, 0, request.Stream, retries, string(body), "", lastErr.Error())
+		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, promptTokens, 0, request.Stream, turn.Retries, string(body), "", lastErr.Error())
 		if out.wroteHeader {
 			writeSSEError(out, lastErr.Error())
 			return
@@ -233,9 +234,18 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(out, http.StatusBadGateway, lastErr.Error())
 		return
 	}
+	result := turn.Result
 	if result == nil {
 		writeError(out, http.StatusBadGateway, "upstream returned no result")
 		return
+	}
+
+	// A call block is removed from the prose only when it parsed. A block that
+	// is present but unreadable stays where it is: deleting text the caller
+	// never got to see would be worse than showing it.
+	text, calls := result.Text, []toolCall(nil)
+	if toolsEnabled {
+		text, calls = splitToolCalls(result.Text)
 	}
 
 	completionTokens := estimateTokens(result.Text + result.Thinking)
@@ -243,10 +253,39 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	g.store.BumpClientKeyUsage(key.ID)
 
 	if request.Stream {
+		if turn.Streamed {
+			// The splitter owns the tail: every byte already emitted came out of
+			// it, so only it knows what is still being held back.
+			tail, held := splitter.finish()
+			if tail != "" {
+				writeChunk(map[string]any{"content": tail}, nil)
+			}
+			if held != nil {
+				calls = held
+			}
+		} else {
+			if result.Thinking != "" {
+				writeChunk(map[string]any{"reasoning_content": result.Thinking}, nil)
+			}
+			if text != "" {
+				writeChunk(map[string]any{"content": text}, nil)
+			}
+		}
 		mediaURLs := g.persistMediaList(result.Media, prompt, model.ID, accountName)
-		g.finishStream(out, result, model, mediaURLs, streamedFlag)
-		g.recordAudit(r, key, model, accountName, started, http.StatusOK, firstToken, promptTokens, completionTokens, true, retries, string(body), result.Text, "")
+		g.finishStream(out, model, mediaURLs, calls)
+		g.recordAudit(r, key, model, accountName, started, http.StatusOK, turn.FirstToken, promptTokens, completionTokens, true, turn.Retries, string(body), result.Text, "")
 		return
+	}
+
+	message := map[string]any{
+		"role":              "assistant",
+		"content":           text,
+		"reasoning_content": result.Thinking,
+	}
+	finishReason := "stop"
+	if len(calls) > 0 {
+		message["tool_calls"] = toolCallsPayload(calls)
+		finishReason = "tool_calls"
 	}
 
 	response := map[string]any{
@@ -256,13 +295,9 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"model":   model.ID,
 		"choices": []any{
 			map[string]any{
-				"index": 0,
-				"message": map[string]any{
-					"role":              "assistant",
-					"content":           result.Text,
-					"reasoning_content": result.Thinking,
-				},
-				"finish_reason": "stop",
+				"index":         0,
+				"message":       message,
+				"finish_reason": finishReason,
 			},
 		},
 		"usage": map[string]any{
@@ -276,98 +311,174 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	raw, _ := json.Marshal(response)
-	g.recordAudit(r, key, model, accountName, started, http.StatusOK, firstToken, promptTokens, completionTokens, false, retries, string(body), string(raw), "")
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, turn.FirstToken, promptTokens, completionTokens, false, turn.Retries, string(body), string(raw), "")
 	out.Header().Set("content-type", "application/json")
 	out.WriteHeader(http.StatusOK)
 	_, _ = out.Write(raw)
 }
 
-// streamCompletion forwards upstream deltas as OpenAI SSE chunks.
-func (g *Gateway) streamCompletion(
-	out *respWriter,
-	r *http.Request,
-	opts minimax.Options,
-	model *store.ModelConfig,
-	started time.Time,
-) (*minimax.Result, int64, bool, error) {
-	var mu sync.Mutex
-	var firstToken int64
-	var streamed bool
-	id := "chatcmpl-" + randomID(12)
-	created := time.Now().Unix()
-
-	writeChunk := func(delta map[string]any, finish any) {
-		mu.Lock()
-		defer mu.Unlock()
-		if !out.wroteHeader {
-			out.Header().Set("content-type", "text/event-stream")
-			out.Header().Set("cache-control", "no-cache")
-			out.Header().Set("connection", "keep-alive")
-			out.Header().Set("x-accel-buffering", "no")
-			out.WriteHeader(http.StatusOK)
-		}
-		payload := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model.ID,
-			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
-		}
-		raw, _ := json.Marshal(payload)
-		_, _ = fmt.Fprintf(out, "data: %s\n\n", raw)
-		out.Flush()
-	}
-
-	writeChunk(map[string]any{"role": "assistant", "content": ""}, nil)
-
-	opts.OnDelta = func(text string) {
-		mu.Lock()
-		if firstToken == 0 {
-			firstToken = time.Since(started).Milliseconds()
-		}
-		streamed = true
-		mu.Unlock()
-		writeChunk(map[string]any{"content": text}, nil)
-	}
-	opts.OnThinking = func(text string) {
-		writeChunk(map[string]any{"reasoning_content": text}, nil)
-	}
-
-	result, err := g.client.Completion(r.Context(), opts)
-	if err != nil {
-		return result, firstToken, streamed, err
-	}
-	if firstToken == 0 {
-		firstToken = time.Since(started).Milliseconds()
-	}
-	return result, firstToken, streamed, nil
+// turnRequest is one call to the upstream: what to send, which pool to draw
+// from, and how deltas leave.
+type turnRequest struct {
+	Prompt     string
+	Images     []minimax.UploadedImage
+	Mode       string
+	Model      *store.ModelConfig
+	SessionKey string
+	Started    time.Time
+	OnDelta    func(string)
+	OnThinking func(string)
+	// Committed reports whether the response has already begun. A retry is only
+	// safe while nothing has been written: once the caller has seen a byte, a
+	// second account would append a second answer to the first.
+	Committed func() bool
 }
 
-// finishStream terminates the SSE response, emitting any content that was not
-// already streamed as deltas (media URLs, and text when the upstream produced
-// no incremental frames).
-func (g *Gateway) finishStream(out *respWriter, result *minimax.Result, model *store.ModelConfig, mediaURLs []string, streamed bool) {
-	if !out.wroteHeader {
-		out.Header().Set("content-type", "text/event-stream")
-		out.Header().Set("cache-control", "no-cache")
-		out.Header().Set("connection", "keep-alive")
-		out.Header().Set("x-accel-buffering", "no")
-		out.WriteHeader(http.StatusOK)
-	}
-	if !streamed {
-		if result.Thinking != "" {
-			writeChunkRaw(out, model, map[string]any{"reasoning_content": result.Thinking}, nil)
+// turnResult carries what the turn produced plus the bookkeeping an audit row
+// needs.
+type turnResult struct {
+	Result      *minimax.Result
+	AccountName string
+	FirstToken  int64
+	Retries     int
+	Streamed    bool
+}
+
+// runTurn leases an account, calls the upstream, and retries across accounts
+// while nothing has been committed to the client.
+//
+// Every endpoint shares this one path. It is a single function rather than two
+// so that failover, cooldown accounting and token estimation cannot drift apart
+// between the OpenAI and Anthropic front ends.
+func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, error) {
+	settings := g.settings()
+	out := &turnResult{}
+
+	var (
+		mu         sync.Mutex
+		firstToken int64
+		streamed   bool
+	)
+
+	markFirst := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstToken == 0 {
+			firstToken = time.Since(req.Started).Milliseconds()
 		}
-		if result.Text != "" {
-			writeChunkRaw(out, model, map[string]any{"content": result.Text}, nil)
+		streamed = true
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		lease, err := g.pool.Acquire(ctx, req.SessionKey)
+		if err != nil {
+			return out, err
+		}
+		out.AccountName = displayName(lease.Account)
+		if attempt > 0 {
+			out.Retries = attempt
+		}
+
+		opts := minimax.Options{
+			Credential:  CredentialOf(lease.Account),
+			Text:        req.Prompt,
+			Mode:        req.Mode,
+			Images:      req.Images,
+			Timeout:     timeoutFor(settings, req.Model),
+			IdleTimeout: settings.StreamIdleTimeout(),
+		}
+		if req.OnDelta != nil {
+			opts.OnDelta = func(text string) {
+				markFirst()
+				req.OnDelta(text)
+			}
+		}
+		if req.OnThinking != nil {
+			opts.OnThinking = func(text string) {
+				markFirst()
+				req.OnThinking(text)
+			}
+		}
+
+		result, err := g.client.Completion(ctx, opts)
+		lease.Release(err)
+
+		lastErr = err
+		if err == nil {
+			mu.Lock()
+			out.FirstToken, out.Streamed = firstToken, streamed
+			mu.Unlock()
+			if out.FirstToken == 0 {
+				out.FirstToken = time.Since(req.Started).Milliseconds()
+			}
+			out.Result = result
+			return out, nil
+		}
+		if ctx.Err() != nil || isPoolExhausted(err) {
+			break
+		}
+		if req.Committed != nil && req.Committed() {
+			break
 		}
 	}
+
+	mu.Lock()
+	out.FirstToken, out.Streamed = firstToken, streamed
+	mu.Unlock()
+	return out, lastErr
+}
+
+// ensureStreamHeaders writes the SSE preamble exactly once, so every caller
+// that emits a chunk gets the same headers no matter who writes first.
+func ensureStreamHeaders(out *respWriter) {
+	if out.wroteHeader {
+		return
+	}
+	out.Header().Set("content-type", "text/event-stream")
+	out.Header().Set("cache-control", "no-cache")
+	out.Header().Set("connection", "keep-alive")
+	out.Header().Set("x-accel-buffering", "no")
+	out.WriteHeader(http.StatusOK)
+}
+
+// finishStream terminates the SSE response with whatever is left: media URLs
+// and any tool calls the model asked for.
+//
+// Text that never streamed is written by the caller, not here — it needs the
+// same call-block handling as the streamed path, and splitting that logic in
+// two is how the two paths drift apart.
+func (g *Gateway) finishStream(out *respWriter, model *store.ModelConfig, mediaURLs []string, calls []toolCall) {
+	ensureStreamHeaders(out)
 	if len(mediaURLs) > 0 {
 		writeChunkRaw(out, model, map[string]any{"media": mediaURLs}, nil)
 	}
-	writeChunkRaw(out, model, map[string]any{}, "stop")
+	if len(calls) > 0 {
+		writeChunkRaw(out, model, map[string]any{"tool_calls": streamedToolCallDeltas(calls)}, "tool_calls")
+	} else {
+		writeChunkRaw(out, model, map[string]any{}, "stop")
+	}
 	_, _ = io.WriteString(out, "data: [DONE]\n\n")
 	out.Flush()
+}
+
+// streamedToolCallDeltas renders calls in the incremental shape OpenAI streams.
+// The arguments arrive whole rather than token by token; a client concatenates
+// deltas, so one complete delta is a valid sequence of one.
+func streamedToolCallDeltas(calls []toolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(calls))
+	for index, call := range calls {
+		out = append(out, map[string]any{
+			"index": index,
+			"id":    call.ID,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	return out
 }
 
 func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]any, finish any) {
@@ -620,9 +731,13 @@ func (g *Gateway) chatImage(
 	g.store.BumpClientKeyUsage(key.ID)
 
 	if request.Stream {
-		// Nothing was streamed as it arrived — an image turn is one blocking
-		// call — so the whole message is emitted in one chunk by finishStream.
-		g.finishStream(out, &minimax.Result{Text: content}, model, nil, false)
+		// Nothing streamed as it arrived — an image turn is one blocking call —
+		// so the whole message goes out as a single chunk before the stream is
+		// closed.
+		ensureStreamHeaders(out)
+		writeChunkRaw(out, model, map[string]any{"content": content}, nil)
+		out.Flush()
+		g.finishStream(out, model, nil, nil)
 		g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, true, 0, string(body), content, "")
 		return
 	}

@@ -43,6 +43,7 @@ func main() {
 	mux.HandleFunc("GET /health", compat.Health)
 	mux.HandleFunc("GET /v1/models", compat.Models)
 	mux.HandleFunc("POST /v1/chat/completions", compat.ChatCompletions)
+	mux.HandleFunc("POST /v1/messages", compat.AnthropicMessages)
 	mux.HandleFunc("POST /v1/images/generations", compat.ImageGenerations)
 	mux.HandleFunc("POST /v1/videos/generations", compat.VideoGenerations)
 
