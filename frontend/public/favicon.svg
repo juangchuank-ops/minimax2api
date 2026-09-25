@@ -1,4 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!--
+    Rounded-square plate plus a bold M, matching the console's monochrome
+    palette (its primary colour is oklch(0.12 0 0) in light mode).
+
+    The plate stays dark in both themes on purpose: it is the icon's own shape,
+    not a page background, and a dark plate with a white glyph reads on a light
+    tab strip and a dark one alike. Inverting it in dark mode would put a bright
+    white square in the tab bar, louder than the problem it solves.
+
+    The glyph used to be a "D", a leftover from the dola2api skeleton this
+    project was cloned from. It survived the rename because a favicon is exactly
+    the kind of hardcoded string that bypasses i18n and review.
+  -->
   <rect width="32" height="32" rx="8" fill="#0d0d0d"/>
-  <path d="M10 8h6.2c4.3 0 7.3 3.2 7.3 8s-3 8-7.3 8H10V8zm4.1 3.6v8.8h1.9c2.1 0 3.4-1.7 3.4-4.4s-1.3-4.4-3.4-4.4h-1.9z" fill="#fff"/>
+  <path d="M9.5 24V8h3.2L16 15l3.3-7h3.2v16h-3.2V11.5L16 18.5l-3.3-7V24z" fill="#fff"/>
 </svg>

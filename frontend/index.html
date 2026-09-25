@@ -3,7 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#ffffff" />
+    <!--
+      Two metas scoped by the OS preference, so the browser chrome is already
+      right before React hydrates. Once the console's own theme resolves,
+      ThemeColorSync rewrites both to the same colour - that stops an explicit
+      Light/Dark choice from being overruled by the OS. These values mirror
+      `--background` in index.css.
+    -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fdfdfd" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#070707" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>MiniMax2API</title>
   </head>
