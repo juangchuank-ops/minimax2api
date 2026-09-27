@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"minimax2api/internal/config"
 )
 
 // --- frame parsing ---------------------------------------------------------
@@ -324,5 +326,55 @@ func TestLoopbackHostsAreRecognised(t *testing.T) {
 		if isLoopbackHost(host) {
 			t.Errorf("isLoopbackHost(%q) = true, want false", host)
 		}
+	}
+}
+
+// TestModelObjectMergesTemplateCatalogueAndEffort pins the precedence inside
+// the upstream `model` object: the console template fills the shape in, the
+// catalogue entry's id overwrites the template's, and the caller's effort tier
+// rides along. Each source is optional, and when none contributes there is no
+// object at all — an empty object is rejected upstream.
+func TestModelObjectMergesTemplateCatalogueAndEffort(t *testing.T) {
+	if got := modelObject("", "", ""); got != nil {
+		t.Errorf("no sources at all = %v, want no model field", got)
+	}
+	if got := modelObject(`{"id":"MiniMax-M3"}`, "", ""); got == nil || got["id"] != "MiniMax-M3" {
+		t.Errorf("template alone = %v, want the template object", got)
+	}
+	if got := modelObject("", "MiniMax-M3", ""); got == nil || got["id"] != "MiniMax-M3" {
+		t.Errorf("catalogue alone = %v, want {id}", got)
+	}
+	got := modelObject(`{"id":"MiniMax-M2.7","note":"keep"}`, "MiniMax-M3", "")
+	if got["id"] != "MiniMax-M3" || got["note"] != "keep" {
+		t.Errorf("template + catalogue = %v, want the catalogue id with the template keys kept", got)
+	}
+	got = modelObject("", "MiniMax-M3.1-Flash-Preview", "max")
+	if got["id"] != "MiniMax-M3.1-Flash-Preview" || got["effort"] != "max" {
+		t.Errorf("catalogue + effort = %v, want id and effort in one object", got)
+	}
+	if got := modelObject(`not json`, "MiniMax-M3", ""); got == nil || got["id"] != "MiniMax-M3" {
+		t.Errorf("broken template = %v, want it ignored with the catalogue id kept", got)
+	}
+}
+
+// The body builder is where the object reaches the wire; one round trip through
+// it proves the fields land in the request and not just in the helper.
+func TestBuildMessageBodyCarriesModelObject(t *testing.T) {
+	settings := config.DefaultSettings(t.TempDir())
+	settings.Upstream.ModelPayload = ""
+	body := buildMessageBody(settings, Options{Text: "hi", UpstreamModel: "MiniMax-M2.7", Effort: "high"}, "turn")
+	object, ok := body["model"].(map[string]any)
+	if !ok {
+		t.Fatalf("model = %#v, want an object", body["model"])
+	}
+	if object["id"] != "MiniMax-M2.7" || object["effort"] != "high" {
+		t.Fatalf("model = %v, want the upstream id and the effort tier", object)
+	}
+
+	// No catalogue id and no effort: the field is absent, as every build before
+	// the model selector shipped.
+	body = buildMessageBody(settings, Options{Text: "hi"}, "turn")
+	if _, present := body["model"]; present {
+		t.Fatalf("model = %#v, want no model field", body["model"])
 	}
 }

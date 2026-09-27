@@ -536,9 +536,11 @@ const zhCN = {
     healthDescription: "返回服务状态与号池概况。",
     stream: "流式",
     noteModel:
-      "minimax-agent（默认）、minimax-m3-thinking，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
+      "minimax-agent（默认）、minimax-m3.1-flash-preview、minimax-m3、minimax-m3-thinking、minimax-m2.7、minimax-m2.7-highspeed，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
     noteMessages: "OpenAI 标准消息数组，支持 text 与 image_url 多模态内容",
     noteStream: "是否使用 SSE 流式输出，默认 false",
+    noteReasoningEffort:
+      "推理力度档位：low / medium / high / xhigh / max。对应桌面端 M3.1-Flash-Preview 的 Effort 选择器；不填或填其他值时不上传。该档位对上游的实际效果未经抓包验证",
     notePassthrough: "透传字段，上游不区分，仅用于兼容客户端",
     noteMaxTokens: "透传字段，上游不限制输出长度",
     notePrompt: "图像描述",
@@ -1091,9 +1093,11 @@ const en: typeof zhCN = {
     healthDescription: "Returns service status and pool summary.",
     stream: "Streaming",
     noteModel:
-      "minimax-agent (default), minimax-m3-thinking, or minimax-image — with an image model the pictures come back as Markdown in the message body",
+      "minimax-agent (default), minimax-m3.1-flash-preview, minimax-m3, minimax-m3-thinking, minimax-m2.7, minimax-m2.7-highspeed, or minimax-image — with an image model the pictures come back as Markdown in the message body",
     noteMessages: "Standard OpenAI message array; text and image_url multimodal content are both supported",
     noteStream: "Use SSE streaming, default false",
+    noteReasoningEffort:
+      "Reasoning-effort tier: low / medium / high / xhigh / max. Mirrors the desktop client's Effort selector on M3.1-Flash-Preview; anything else, or nothing, is omitted. The tiers' actual effect upstream is unverified",
     notePassthrough: "Passed through; the upstream does not distinguish it, and it exists for client compatibility",
     noteMaxTokens: "Passed through; the upstream does not cap output length",
     notePrompt: "What to draw",

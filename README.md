@@ -219,14 +219,19 @@ curl http://127.0.0.1:8080/v1/messages \
 | 模型 ID | 类型 | 说明 |
 | --- | --- | --- |
 | `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
+| `minimax-m3.1-flash-preview` | chat | 桌面端新增的预览版；支持 `reasoning_effort` 档位 |
 | `minimax-m3` | chat | 对话模式，响应更快 |
 | `minimax-m3-thinking` | chat | 深度思考模式，推理内容走 `reasoning_content` |
+| `minimax-m2.7` | chat | 上一代对话模型 |
+| `minimax-m2.7-highspeed` | chat | 上一代对话模型的高速版 |
 | `minimax-image` | image | 图像生成；`/v1/images/generations` 与 `/v1/chat/completions` 都可用 |
 | `minimax-h3` | video | H3.0，质量优先；支持多模态参考；消耗账号积分 |
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成；仅文生视频与首/尾帧；480P/768P；5-15 秒 |
 | `minimax-hailuo-2-3` | video | Hailuo 2.3，成本更低；可用 Token Plan；输出无声视频 |
 
-> **chat 类模型 ID 最终打的是同一个上游 Agent**。MiniMax Agent 的 Web API 里没有模型选择器，它返回什么取决于账号本身的权限。模型目录的作用是：给那些非要填模型名的客户端一个合法值，以及让管理台能按标签统计用量。
+> **chat 类模型 ID 最终打的是同一个上游 Agent**。除了 `minimax-agent` 和 `minimax-m3-thinking`，其余条目都带一个上游模型名（`MiniMax-M3.1-Flash-Preview`、`MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed`），会写进请求体的 `model` 字段——上游桌面端已经长出了模型选择器（M3.1-Flash-Preview / M3 / M2.7 / M2.7 HighSpeed），那个选择就是走这个字段传的。`model` 字段不填的条目维持旧行为：上游按账号默认的模型回答。上游配置端点（`/minimax-cloud/api/v1/config`）返回的权威清单里，`MiniMax-M3` / `MiniMax-M2.7` / `MiniMax-M2.7-highspeed` 三个名字有据可查，M3.1 是按桌面端标签和命名惯例推的——真 ID 若有出入，改「系统设置 → 上游 → model 字段模板」即可，不用重新编译。
+>
+> **`reasoning_effort`**（可选，OpenAI 兼容字段）对应桌面端 M3.1-Flash-Preview 的 Effort 选择器，取 `low` / `medium` / `high` / `xhigh` / `max`，其余值（含 `default` / `minimal`）一律忽略。有值时随 `model` 字段一起上传。桌面端确实有这个选择器，但它在请求体里叫什么字段名没有抓包证据，`effort` 是按最自然的位置放的——实际效果未经上游验证，发与不发都不影响请求成败。
 >
 > **video 类模型不是这么回事**：H3 在上游**根本不是一个可选模型**，而是一个插件。模型 ID 在这里承载的是「生成参数」而不是「路由选择」——详见下一节。
 >

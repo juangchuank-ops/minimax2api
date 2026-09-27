@@ -455,3 +455,83 @@ func TestMergeBuiltinModelsIsIdempotent(t *testing.T) {
 		t.Errorf("merge duplicated entries: %d -> %d", len(merged), len(again))
 	}
 }
+
+// An upstream model id added to an existing built-in has to reach installs that
+// already hold that entry. There is no console and no API that sets
+// UpstreamModel, so an empty value on a stored built-in is a freeze of an older
+// default — never the operator's choice — and the merge adopts the new id
+// without touching enablement, counters or anything else the operator owns.
+func TestMergeBuiltinModelsBackfillsUpstreamModel(t *testing.T) {
+	stored := BuiltinModels()
+	for _, model := range stored {
+		model.UpstreamModel = "" // as an older release froze it
+	}
+	modelByID := func(models []*ModelConfig, id string) *ModelConfig {
+		for _, model := range models {
+			if model.ID == id {
+				return model
+			}
+		}
+		return nil
+	}
+	disabled := modelByID(stored, "minimax-m3")
+	disabled.Enabled = false
+	disabled.Requests = 7
+
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("a catalogue stripped of upstream ids should report a change")
+	}
+	for _, builtin := range BuiltinModels() {
+		if builtin.UpstreamModel == "" {
+			continue
+		}
+		got := modelByID(merged, builtin.ID)
+		if got == nil {
+			t.Fatalf("built-in %q vanished", builtin.ID)
+		}
+		if got.UpstreamModel != builtin.UpstreamModel {
+			t.Errorf("model %q upstream = %q, want %q", builtin.ID, got.UpstreamModel, builtin.UpstreamModel)
+		}
+	}
+	if modelByID(merged, "minimax-m3").Enabled {
+		t.Error("the merge re-enabled a model the operator had turned off")
+	}
+	if got := modelByID(merged, "minimax-m3"); got.Requests != 7 {
+		t.Errorf("the merge reset usage counters: requests=%d", got.Requests)
+	}
+	// Entries that carry no upstream id stay that way — the agent and thinking
+	// entries have always served whatever the account defaults to.
+	if got := modelByID(merged, "minimax-agent").UpstreamModel; got != "" {
+		t.Errorf("minimax-agent grew an upstream id %q", got)
+	}
+	if got := modelByID(merged, "minimax-m3-thinking").UpstreamModel; got != "" {
+		t.Errorf("minimax-m3-thinking grew an upstream id %q", got)
+	}
+}
+
+// The catalogue must name every model the desktop client offers, so a client
+// filling its picker from /v1/models can select each of them.
+func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
+	want := map[string]string{
+		"minimax-agent":              "",
+		"minimax-m3.1-flash-preview": "MiniMax-M3.1-Flash-Preview",
+		"minimax-m3":                 "MiniMax-M3",
+		"minimax-m3-thinking":        "",
+		"minimax-m2.7":               "MiniMax-M2.7",
+		"minimax-m2.7-highspeed":     "MiniMax-M2.7-highspeed",
+	}
+	for _, model := range BuiltinModels() {
+		expected, ok := want[model.ID]
+		if !ok {
+			continue
+		}
+		if model.UpstreamModel != expected {
+			t.Errorf("model %q upstream = %q, want %q", model.ID, model.UpstreamModel, expected)
+		}
+		delete(want, model.ID)
+	}
+	for id := range want {
+		t.Errorf("the catalogue has no entry for %q", id)
+	}
+}

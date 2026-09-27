@@ -303,10 +303,18 @@ type State struct {
 
 // BuiltinModels is the model catalogue exposed through /v1/models.
 //
-// The chat entries all reach the same upstream agent: MiniMax Agent has no
-// model selector in its web API, it serves whatever the account is entitled to.
-// They exist so clients that insist on naming a model have something valid to
-// send, and so the console can report usage per label.
+// The chat entries all reach the same upstream agent; a conversation cannot be
+// routed to a different service by naming a different model. What an entry can
+// do since the upstream grew a model selector (the desktop client picks between
+// M3.1-Flash-Preview, M3, M2.7 and M2.7 HighSpeed) is *name* the model, and
+// that is what UpstreamModel carries: the id placed into the request's `model`
+// object. An entry without one — `minimax-agent`, `minimax-m3-thinking` — sends
+// no model field at all, exactly as every build before the selector did.
+//
+// The ids below are the ones the upstream's own config endpoint lists
+// (`MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`); M3.1 follows the
+// same pattern from its desktop label. The global model-field template can
+// still override or extend any of this; see buildMessageBody.
 //
 // The video entries are different in kind. MiniMax-H3 is not reachable as a
 // chat model at all — it is a plugin the agent calls server-side, selected by
@@ -320,12 +328,27 @@ func BuiltinModels() []*ModelConfig {
 			Enabled: true, Builtin: true, Description: "通用 Agent，自动规划并调用工具",
 		},
 		{
-			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", Type: ModelTypeChat,
+			ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Upstream: "chat",
+			UpstreamModel: "MiniMax-M3.1-Flash-Preview", Type: ModelTypeChat,
+			Enabled: true, Builtin: true,
+			Description: "桌面端新增的预览版，支持 effort 档位（随请求的 reasoning_effort 透传）",
+		},
+		{
+			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,
 			Enabled: true, Builtin: true, Description: "对话模式，响应更快",
 		},
 		{
 			ID: "minimax-m3-thinking", Name: "MiniMax M3 Thinking", Upstream: "think", Type: ModelTypeChat,
 			Enabled: true, Builtin: true, Description: "深度思考模式，附带推理内容",
+		},
+		{
+			ID: "minimax-m2.7", Name: "MiniMax M2.7", Upstream: "chat", UpstreamModel: "MiniMax-M2.7", Type: ModelTypeChat,
+			Enabled: true, Builtin: true, Description: "上一代对话模型",
+		},
+		{
+			ID: "minimax-m2.7-highspeed", Name: "MiniMax M2.7 HighSpeed", Upstream: "chat",
+			UpstreamModel: "MiniMax-M2.7-highspeed", Type: ModelTypeChat,
+			Enabled: true, Builtin: true, Description: "上一代对话模型的高速版",
 		},
 		{
 			ID: "minimax-image", Name: "MiniMax Image", Upstream: "image", Type: ModelTypeImage,
@@ -362,8 +385,18 @@ func BuiltinModels() []*ModelConfig {
 // be replaced.
 //
 // Entries already present are left exactly as stored. Only the *existence* of a
-// built-in is enforced, never its state.
+// built-in is enforced, never its state — with one deliberate exception: an
+// upstream model id the stored copy is missing is adopted from the built-in.
+// There is no console and no API that sets UpstreamModel, so an empty value on
+// a built-in entry can never be the operator's intent; it is always the freeze
+// of a default from before that entry carried an id. The same argument repairs
+// settings in Normalize, and it applies with more force here: the field is not
+// reachable by any other route at all.
 func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
+	builtinByID := make(map[string]*ModelConfig)
+	for _, builtin := range BuiltinModels() {
+		builtinByID[builtin.ID] = builtin
+	}
 	known := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		if model != nil && model.ID != "" {
@@ -371,6 +404,17 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 		}
 	}
 	changed := false
+	for _, model := range models {
+		if model == nil || !model.Builtin {
+			continue
+		}
+		builtin, ok := builtinByID[model.ID]
+		if !ok || builtin.UpstreamModel == "" || model.UpstreamModel != "" {
+			continue
+		}
+		model.UpstreamModel = builtin.UpstreamModel
+		changed = true
+	}
 	for _, builtin := range BuiltinModels() {
 		if _, ok := known[builtin.ID]; ok {
 			continue
