@@ -331,7 +331,7 @@ func BuiltinModels() []*ModelConfig {
 			ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Upstream: "chat",
 			UpstreamModel: "MiniMax-M3.1-Flash-Preview", Type: ModelTypeChat,
 			Enabled: true, Builtin: true,
-			Description: "桌面端新增的预览版，支持 effort 档位（随请求的 reasoning_effort 透传）",
+			Description: "桌面端新增的预览版；上游按账号默认模型回答",
 		},
 		{
 			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,

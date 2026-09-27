@@ -1283,38 +1283,3 @@ func TestVideoGenerationsSurvivesADriveThatDoesNotAnswer(t *testing.T) {
 	}
 }
 
-// effortTier is the gate between what a client may send and what the upstream
-// is offered. The accepted set is the desktop selector's tiers minus "default",
-// which is spelled by omitting the field; anything else is dropped rather than
-// remapped, because a guessed substitution is indistinguishable from the
-// caller's own choice.
-func TestEffortTier(t *testing.T) {
-	for _, tier := range []string{"low", "medium", "high", "xhigh", "max", "HIGH", "  max  "} {
-		if got := effortTier(tier); got != strings.ToLower(strings.TrimSpace(tier)) {
-			t.Errorf("effortTier(%q) = %q, want it kept", tier, got)
-		}
-	}
-	for _, tier := range []string{"", "default", "minimal", "none", "extreme", "turbo"} {
-		if got := effortTier(tier); got != "" {
-			t.Errorf("effortTier(%q) = %q, want empty", tier, got)
-		}
-	}
-}
-
-// A chat model's upstream id reaches the request path; a video model's does
-// not. Both kinds store an id in UpstreamModel, but the video one is a
-// generation parameter that travels in the prompt text — leaking it into the
-// model object would attach a field the video path never sent.
-func TestChatUpstreamModelIsTypeGated(t *testing.T) {
-	chat := &store.ModelConfig{ID: "minimax-m3", Type: store.ModelTypeChat, UpstreamModel: "MiniMax-M3"}
-	if got := chatUpstreamModel(chat); got != "MiniMax-M3" {
-		t.Errorf("chat model upstream = %q, want MiniMax-M3", got)
-	}
-	video := &store.ModelConfig{ID: "minimax-h3-max", Type: store.ModelTypeVideo, UpstreamModel: "MiniMax-H3-Max"}
-	if got := chatUpstreamModel(video); got != "" {
-		t.Errorf("video model upstream = %q, want empty", got)
-	}
-	if got := chatUpstreamModel(nil); got != "" {
-		t.Errorf("nil model upstream = %q, want empty", got)
-	}
-}

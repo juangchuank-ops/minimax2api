@@ -120,20 +120,6 @@ type Options struct {
 	Credential Credential
 	Text       string
 	Mode       string
-	// UpstreamModel is the chat model the catalogue entry names, sent as the
-	// `id` of the request's `model` object. The upstream grew a model selector
-	// (M3.1-Flash-Preview, M3, M2.7, M2.7 HighSpeed) and the desktop client
-	// carries the choice in that object; a conversation with the field omitted
-	// keeps working and serves whatever the account defaults to. Empty sends no
-	// model field at all, which is what every build before the selector did.
-	UpstreamModel string
-	// Effort is the reasoning-effort tier the caller asked for, sent inside the
-	// same `model` object as UpstreamModel. The desktop client exposes such a
-	// selector on M3.1-Flash-Preview; the field name it serialises to has never
-	// been captured, so treat this as a request rather than a contract — a
-	// turn that sends it is no more broken than one that omits it. Empty sends
-	// nothing.
-	Effort string
 	// ClientIntent labels the kind of turn for the backend.
 	//
 	// The field and the value are both real — the web client sends
@@ -681,31 +667,6 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 	return result, nil
 }
 
-// modelObject merges the sources of the upstream `model` object. The template
-// comes first so its keys survive (an operator's capture may carry fields this
-// build does not know about); the per-request id and effort then overwrite
-// theirs. A template that does not parse is ignored, as it always has been.
-// Nil means "send no model field".
-func modelObject(template, upstreamModel, effort string) map[string]any {
-	var object map[string]any
-	if trimmed := strings.TrimSpace(template); trimmed != "" {
-		_ = json.Unmarshal([]byte(trimmed), &object)
-	}
-	if upstreamModel != "" {
-		if object == nil {
-			object = map[string]any{}
-		}
-		object["id"] = upstreamModel
-	}
-	if effort != "" {
-		if object == nil {
-			object = map[string]any{}
-		}
-		object["effort"] = effort
-	}
-	return object
-}
-
 // buildMessageBody renders the request body for one turn.
 //
 // The agent expects the whole conversation in a single `content` string, which
@@ -729,13 +690,18 @@ func buildMessageBody(settings config.Settings, opts Options, turnID string) map
 		body["attachments"] = attachments
 	}
 
-	// `model` is an object upstream, not a string. It is assembled from up to
-	// three sources: the console template (the operator's capture of what the
-	// field needs), the catalogue entry's model id, and the caller's effort
-	// tier. Empty object is rejected upstream, so when nothing contributes the
-	// field is omitted entirely.
-	if object := modelObject(settings.Upstream.ModelPayload, opts.UpstreamModel, opts.Effort); object != nil {
-		body["model"] = object
+	// `model` is an object upstream, not a string. It is only attached when the
+	// console supplies a template, because an empty object is rejected — and so
+	// is a guessed one: a synthesized {"id": ...} earned a 400 "invalid model
+	// selection" (1406010011) from the live upstream. The desktop client's model
+	// selector serialises to a shape nobody has captured yet; until that capture
+	// exists, the template is the only sanctioned way to fill this field, and
+	// chat entries serve the account's default model.
+	if template := strings.TrimSpace(settings.Upstream.ModelPayload); template != "" {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(template), &parsed); err == nil {
+			body["model"] = parsed
+		}
 	}
 	if opts.Mode != "" {
 		body["mode"] = opts.Mode

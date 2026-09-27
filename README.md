@@ -229,9 +229,11 @@ curl http://127.0.0.1:8080/v1/messages \
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成；仅文生视频与首/尾帧；480P/768P；5-15 秒 |
 | `minimax-hailuo-2-3` | video | Hailuo 2.3，成本更低；可用 Token Plan；输出无声视频 |
 
-> **chat 类模型 ID 最终打的是同一个上游 Agent**。除了 `minimax-agent` 和 `minimax-m3-thinking`，其余条目都带一个上游模型名（`MiniMax-M3.1-Flash-Preview`、`MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed`），会写进请求体的 `model` 字段——上游桌面端已经长出了模型选择器（M3.1-Flash-Preview / M3 / M2.7 / M2.7 HighSpeed），那个选择就是走这个字段传的。`model` 字段不填的条目维持旧行为：上游按账号默认的模型回答。上游配置端点（`/minimax-cloud/api/v1/config`）返回的权威清单里，`MiniMax-M3` / `MiniMax-M2.7` / `MiniMax-M2.7-highspeed` 三个名字有据可查，M3.1 是按桌面端标签和命名惯例推的——真 ID 若有出入，改「系统设置 → 上游 → model 字段模板」即可，不用重新编译。
+> **chat 类模型 ID 最终打的是同一个上游 Agent**，上游按账号默认的模型回答——包括 `minimax-m3.1-flash-preview` / `minimax-m2.7` / `minimax-m2.7-highspeed` 在内，所有对话条目都只是标签，**没有任何一个会把模型选择传给上游**。
 >
-> **`reasoning_effort`**（可选，OpenAI 兼容字段）对应桌面端 M3.1-Flash-Preview 的 Effort 选择器，取 `low` / `medium` / `high` / `xhigh` / `max`，其余值（含 `default` / `minimal`）一律忽略。有值时随 `model` 字段一起上传。桌面端确实有这个选择器，但它在请求体里叫什么字段名没有抓包证据，`effort` 是按最自然的位置放的——实际效果未经上游验证，发与不发都不影响请求成败。
+> 上游桌面端确实长出了模型选择器（M3.1-Flash-Preview / M3 / M2.7 / M2.7 HighSpeed），选择必然走在消息请求体里——但具体形状没有抓包证据。2026-09-27 的实测教训：按惯例合成 `{"id": "MiniMax-M3"}` 塞进 `model` 字段，上游一律 400 `invalid model selection`（1406010011），当天所有对话模型 502。想真正切换上游模型，抓一次桌面端的发消息请求，把 `model` 字段原文填进「系统设置 → 上游 → model 字段模板」即可，网关会原样发送，不用等发版。
+>
+> **`reasoning_effort` 参数不生效**：该字段会被网关忽略（不透传）。桌面端 Effort 选择器对应的请求体字段尚未确认，确认之前不会猜。
 >
 > **video 类模型不是这么回事**：H3 在上游**根本不是一个可选模型**，而是一个插件。模型 ID 在这里承载的是「生成参数」而不是「路由选择」——详见下一节。
 >

@@ -79,11 +79,6 @@ type chatRequest struct {
 	Stream   bool          `json:"stream"`
 	User     string        `json:"user"`
 	Tools    []toolSpec    `json:"tools"`
-	// ReasoningEffort is the OpenAI-compatible effort tier. The upstream's
-	// own name for the desktop client's Effort selector has never been
-	// captured; what is forwarded is the tier itself, inside the model object.
-	// See effortTier for what is accepted.
-	ReasoningEffort string `json:"reasoning_effort"`
 }
 
 type chatMessage struct {
@@ -220,7 +215,6 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Prompt:     prompt,
 		Images:     images,
 		Mode:       mode,
-		Effort:     effortTier(request.ReasoningEffort),
 		Model:      model,
 		SessionKey: request.User,
 		Started:    started,
@@ -326,13 +320,9 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 // turnRequest is one call to the upstream: what to send, which pool to draw
 // from, and how deltas leave.
 type turnRequest struct {
-	Prompt string
-	Images []minimax.UploadedImage
-	Mode   string
-	// Effort is the caller's reasoning-effort tier, already validated to the
-	// accepted set (empty when the caller sent none). Only the OpenAI front
-	// end collects one; the Anthropic API has no such field.
-	Effort     string
+	Prompt     string
+	Images     []minimax.UploadedImage
+	Mode       string
 	Model      *store.ModelConfig
 	SessionKey string
 	Started    time.Time
@@ -391,14 +381,12 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 		}
 
 		opts := minimax.Options{
-			Credential:    CredentialOf(lease.Account),
-			Text:          req.Prompt,
-			Mode:          req.Mode,
-			UpstreamModel: chatUpstreamModel(req.Model),
-			Effort:        req.Effort,
-			Images:        req.Images,
-			Timeout:       timeoutFor(settings, req.Model),
-			IdleTimeout:   settings.StreamIdleTimeout(),
+			Credential:  CredentialOf(lease.Account),
+			Text:        req.Prompt,
+			Mode:        req.Mode,
+			Images:      req.Images,
+			Timeout:     timeoutFor(settings, req.Model),
+			IdleTimeout: settings.StreamIdleTimeout(),
 		}
 		if req.OnDelta != nil {
 			opts.OnDelta = func(text string) {
@@ -1173,34 +1161,6 @@ func timeoutFor(settings config.Settings, model *store.ModelConfig) time.Duratio
 		return settings.VideoTimeout()
 	}
 	return settings.RequestTimeout()
-}
-
-// chatUpstreamModel returns the model id a chat entry names, and nothing for
-// every other type. The distinction matters because both kinds store an id in
-// UpstreamModel: a video entry's names a generation parameter that travels in
-// the prompt text, and letting it leak into the request's model object would
-// attach a field the video path never sent and never tested.
-func chatUpstreamModel(model *store.ModelConfig) string {
-	if model == nil || model.Type != store.ModelTypeChat {
-		return ""
-	}
-	return model.UpstreamModel
-}
-
-// effortTier narrows the caller's reasoning_effort to the tiers the upstream's
-// own selector offers — default, low, medium, high, xhigh, max, of which
-// "default" is spelled by *omitting* the field. Anything else, including
-// OpenAI's "minimal" and "none", is dropped rather than remapped: the tiers
-// are not known to be interchangeable, and a guessed substitution would be
-// indistinguishable from the caller's own choice.
-func effortTier(raw string) string {
-	tier := strings.ToLower(strings.TrimSpace(raw))
-	switch tier {
-	case "low", "medium", "high", "xhigh", "max":
-		return tier
-	default:
-		return ""
-	}
 }
 
 // Models implements GET /v1/models.
