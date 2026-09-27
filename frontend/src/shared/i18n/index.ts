@@ -1131,6 +1131,14 @@ function readInitialLanguage(): string {
   return "zh-CN";
 }
 
+/**
+ * Keep `<html lang>` in step with the active language.
+ *
+ * index.html ships lang="zh-CN". That is right for the default, but wrong the
+ * moment someone switches to English: screen readers would keep applying
+ * Chinese pronunciation and the browser would keep offering to translate from
+ * Chinese. The attribute is not decorative — it is what those tools read.
+ */
 i18n.on("languageChanged", (language) => {
   try {
     window.localStorage.setItem("minimax2api:language", language);
