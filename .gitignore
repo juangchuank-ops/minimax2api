@@ -23,6 +23,7 @@ vendor/
 
 # Agent scratch space (holds machine-local paths and notes)
 .workbuddy-ai/
+.workbuddy/
 
 # Editor / OS noise
 .DS_Store

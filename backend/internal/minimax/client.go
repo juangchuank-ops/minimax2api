@@ -113,6 +113,12 @@ type Result struct {
 	MessageID  string
 	TurnID     string
 	StopReason string
+
+	// Completed and CompletedThinking hold the whole-message restatement that
+	// closes a turn (see messageFrameOf). They are a fallback for a stream that
+	// never chunked — not a second copy of the answer.
+	Completed         string
+	CompletedThinking string
 }
 
 // Options describes one upstream call.
@@ -761,7 +767,29 @@ func (c *Client) consumeStream(body io.ReadCloser, opts Options, result *Result)
 			return err
 		}
 	}
+
+	// A stream that never chunked — or one cut off before its first chunk —
+	// still described its answer in the closing whole-message frame.
+	c.adoptCompleted(opts, result)
 	return nil
+}
+
+// adoptCompleted falls back to the whole-message restatement when no chunk
+// supplied the text. A stream that did chunk ignores it entirely, which is what
+// keeps the answer from arriving twice.
+func (c *Client) adoptCompleted(opts Options, result *Result) {
+	if result.Text == "" && result.Completed != "" {
+		result.Text = result.Completed
+		if opts.OnDelta != nil {
+			opts.OnDelta(result.Completed)
+		}
+	}
+	if result.Thinking == "" && result.CompletedThinking != "" {
+		result.Thinking = result.CompletedThinking
+		if opts.OnThinking != nil {
+			opts.OnThinking(result.CompletedThinking)
+		}
+	}
 }
 
 type sseFrame struct {
@@ -798,6 +826,9 @@ func parseFrame(block string) sseFrame {
 // but the frame types are numeric and undocumented, so dispatch is driven by
 // the payload keys instead of the type code. That keeps the adapter working
 // when the bundle renumbers its event enum.
+//
+// Text is only ever taken out of a chunk, and only from the model. Both halves
+// of that are load-bearing — see messageFrameOf.
 func (c *Client) handleFrame(block string, opts Options, result *Result) error {
 	frame := parseFrame(block)
 	if frame.Data == nil {
@@ -831,19 +862,38 @@ func (c *Client) handleFrame(block string, opts Options, result *Result) error {
 		}
 	}
 
-	// Thinking first: an agent that exposes its reasoning nests it under a
-	// chunk of its own, and those deltas must not be appended to the answer.
-	if thinking := firstDeepString(frame.Data, thinkingKeys); thinking != "" {
-		result.Thinking += thinking
-		if opts.OnThinking != nil {
-			opts.OnThinking(thinking)
+	content, role, chunked, isMessage := messageFrameOf(frame.Data)
+	switch {
+	case isMessage && role == "user":
+		// The caller's own turn, restated by the upstream. Dropping it is the
+		// whole point: it carries back the exact `content` this gateway sent —
+		// the flattened conversation, persona and history included — so reading
+		// its `msg_content` as answer text is what makes a bot's own prompt
+		// come out as the reply.
+	case isMessage && chunked:
+		c.appendMessageText(content, opts, result)
+	case isMessage:
+		// The whole message, restated once the turn is over. It is not new
+		// text: the chunks already carried it. Held as a fallback for a stream
+		// that never chunked, so accepting it here would deliver every answer
+		// twice.
+		result.Completed = firstDeepString(content, contentKeys)
+		result.CompletedThinking = firstDeepString(content, thinkingKeys)
+	default:
+		// Not a message frame. Keep the tolerant generic path for any shape
+		// this build has not seen: an unrecognised payload with answer text in
+		// it is still better read than dropped.
+		if thinking := firstDeepString(frame.Data, thinkingKeys); thinking != "" {
+			result.Thinking += thinking
+			if opts.OnThinking != nil {
+				opts.OnThinking(thinking)
+			}
 		}
-	}
-
-	if text := firstDeepString(frame.Data, contentKeys); text != "" {
-		result.Text += text
-		if opts.OnDelta != nil {
-			opts.OnDelta(text)
+		if text := firstDeepString(frame.Data, contentKeys); text != "" {
+			result.Text += text
+			if opts.OnDelta != nil {
+				opts.OnDelta(text)
+			}
 		}
 	}
 
@@ -852,6 +902,58 @@ func (c *Client) handleFrame(block string, opts Options, result *Result) error {
 		result.StopReason = status
 	}
 	return nil
+}
+
+// messageFrameOf unpacks the container upstream uses to report a message.
+//
+// Two shapes carry text, and they do not mean the same thing:
+//
+//   - `agent_message_chunk` — the incremental stream, one delta per frame. It
+//     is the only source of live answer text.
+//   - `agent_message` — a whole message, restated. Two of these close a turn:
+//     the caller's own turn (role "user", carrying exactly the `content` this
+//     gateway sent) and the finished answer (role "assistant").
+//
+// A plain deep search for `msg_content` finds the key in both, which collects
+// the echoed request as if the model had said it — a bot's persona and history
+// come back out attached to the answer — and then collects the closing
+// restatement too, so the answer arrives twice. Both symptoms, one cause.
+func messageFrameOf(payload map[string]any) (content map[string]any, role string, chunked, ok bool) {
+	if chunk, found := payload["agent_message_chunk"].(map[string]any); found {
+		return chunk, stringField(chunk, "role"), true, true
+	}
+	if message, found := payload["agent_message"].(map[string]any); found {
+		return message, stringField(message, "role"), false, true
+	}
+	return nil, "", false, false
+}
+
+// stringField reads a plain string field out of a decoded object.
+func stringField(payload map[string]any, key string) string {
+	text, _ := payload[key].(string)
+	return text
+}
+
+// appendMessageText records one chunk of answer text, keeping reasoning out of
+// the visible reply. It reports whether the chunk carried anything, which keeps
+// an empty frame from being mistaken for progress.
+func (c *Client) appendMessageText(content map[string]any, opts Options, result *Result) bool {
+	found := false
+	if thinking := firstDeepString(content, thinkingKeys); thinking != "" {
+		result.Thinking += thinking
+		found = true
+		if opts.OnThinking != nil {
+			opts.OnThinking(thinking)
+		}
+	}
+	if text := firstDeepString(content, contentKeys); text != "" {
+		result.Text += text
+		found = true
+		if opts.OnDelta != nil {
+			opts.OnDelta(text)
+		}
+	}
+	return found
 }
 
 // contentKeys are the payload fields that carry visible answer text, in

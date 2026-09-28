@@ -326,3 +326,97 @@ func TestLoopbackHostsAreRecognised(t *testing.T) {
 		}
 	}
 }
+
+// A live turn reports every message twice, in two different shapes, and reading
+// them the same way is what puts a bot's own prompt back into its replies. The
+// frames below are copied from a real turn against agent-stream.minimax.io.
+func TestHandleFrameIgnoresEchoAndClosingRestatement(t *testing.T) {
+	client := &Client{}
+	result := &Result{}
+	var streamed, streamedThinking string
+	opts := Options{
+		OnDelta:    func(s string) { streamed += s },
+		OnThinking: func(s string) { streamedThinking += s },
+	}
+
+	frames := []string{
+		`data:{"type":10}`,
+		`data:{"type":"query_collapse_view","query_collapse_view":{"query_key":"turn:abc","force_expanded":false}}`,
+		// The caller's own turn, echoed. Whatever the gateway sent as `content`
+		// comes back in here — for a bot that is the persona and the history.
+		`data:{"type":2,"agent_message":{"msg_id":"446656746516712","role":"user","msg_type":1,"msg_content":"[系统指令] 你是小美\n用户：你好","source":"api"}}`,
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"msg-01a0","thinking_content":"The user just","chunk_index":0,"role":"assistant"}}`,
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"msg-01a0","msg_content":"Hey!","chunk_index":1,"role":"assistant"}}`,
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"msg-01a0","msg_content":" 你好呀","chunk_index":2,"role":"assistant"}}`,
+		`data:{"type":6,"agent_message_chunk":{"msg_id":"msg-01a0","chunk_index":3,"finish":true,"finish_reason":"stop","role":"assistant"}}`,
+		// The finished answer, restated whole.
+		`data:{"type":2,"agent_message":{"msg_id":"msg-01a0","role":"assistant","msg_type":1,"msg_content":"Hey! 你好呀","thinking_content":"The user just","finish_reason":"stop"}}`,
+	}
+	for _, frame := range frames {
+		if err := client.handleFrame(frame, opts, result); err != nil {
+			t.Fatalf("handleFrame(%s): %v", frame, err)
+		}
+	}
+
+	if result.Text != "Hey! 你好呀" {
+		t.Fatalf("text = %q, want the model's answer alone", result.Text)
+	}
+	if streamed != result.Text {
+		t.Fatalf("streamed = %q, want %q", streamed, result.Text)
+	}
+	if result.Thinking != "The user just" || streamedThinking != "The user just" {
+		t.Fatalf("thinking = %q / %q, want the reasoning exactly once", result.Thinking, streamedThinking)
+	}
+	if result.StopReason != "stop" {
+		t.Fatalf("stop reason = %q", result.StopReason)
+	}
+}
+
+func TestHandleFrameDropsEchoWithoutAdoptingItLater(t *testing.T) {
+	client := &Client{}
+	result := &Result{}
+	var streamed string
+	opts := Options{OnDelta: func(s string) { streamed += s }}
+
+	echo := `data:{"type":2,"agent_message":{"msg_id":"m1","role":"user","msg_type":1,"msg_content":"[系统指令] 人设\n用户：你好"}}`
+	if err := client.handleFrame(echo, opts, result); err != nil {
+		t.Fatalf("frame: %v", err)
+	}
+
+	client.adoptCompleted(opts, result)
+	if result.Text != "" || streamed != "" {
+		t.Fatalf("an echoed turn must never become the answer: text=%q streamed=%q", result.Text, streamed)
+	}
+}
+
+func TestWholeMessageIsAFallbackOnly(t *testing.T) {
+	client := &Client{}
+	result := &Result{}
+	opts := Options{}
+
+	whole := `data:{"type":2,"agent_message":{"msg_id":"m2","role":"assistant","msg_type":1,"msg_content":"只有整条消息","finish_reason":"stop"}}`
+	if err := client.handleFrame(whole, opts, result); err != nil {
+		t.Fatalf("frame: %v", err)
+	}
+	if result.Text != "" || result.Completed != "只有整条消息" {
+		t.Fatalf("a whole-message frame is a fallback, not a delta: text=%q completed=%q", result.Text, result.Completed)
+	}
+
+	var streamed string
+	opts.OnDelta = func(s string) { streamed += s }
+	client.adoptCompleted(opts, result)
+	if result.Text != "只有整条消息" || streamed != "只有整条消息" {
+		t.Fatalf("a stream that never chunked must still answer: text=%q streamed=%q", result.Text, streamed)
+	}
+}
+
+func TestHandleFrameStillReadsUnknownShapes(t *testing.T) {
+	client := &Client{}
+	result := &Result{}
+	if err := client.handleFrame(`data:{"some_future_chunk":{"msg_content":"新形状"}}`, Options{}, result); err != nil {
+		t.Fatalf("frame: %v", err)
+	}
+	if result.Text != "新形状" {
+		t.Fatalf("text = %q, want the tolerant path to keep reading it", result.Text)
+	}
+}
