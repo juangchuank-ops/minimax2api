@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -497,6 +498,52 @@ func TestChatCompletionsAuditsFailures(t *testing.T) {
 	}
 	if audits[0].Error == "" {
 		t.Fatal("audit should carry the upstream error")
+	}
+}
+
+// A refusal from the upstream belongs to the caller.
+//
+// It has to travel back with the upstream's own status, it must not be retried
+// on another account, and it must not cost the account that happened to carry
+// it. Before this existed, a 400 was reported as a 502 and retried MaxAttempts
+// times, so one caller sending an unsupported attachment URL put three accounts
+// into cooldown per request.
+func TestChatCompletionsPassesUpstreamRefusalThrough(t *testing.T) {
+	var calls atomic.Int64
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"key":"invalid_params","detail":"attachment requires one owned object_key"}`)
+	})
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (the upstream's own refusal)", rec.Code)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (a refusal is not retried)", got)
+	}
+
+	accounts := h.store.ListAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(accounts))
+	}
+	if account := accounts[0]; account.Status != store.StatusActive || account.FailCount != 0 {
+		t.Fatalf("account = %s/failCount %d, want active/0 (the account is not at fault)",
+			account.Status, account.FailCount)
+	}
+
+	audits := h.store.ListAudits()
+	if len(audits) == 0 {
+		t.Fatal("a refusal must still be audited")
+	}
+	if audits[0].Status != http.StatusBadRequest {
+		t.Fatalf("audit status = %d, want 400", audits[0].Status)
 	}
 }
 

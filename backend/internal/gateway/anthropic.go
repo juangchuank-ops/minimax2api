@@ -135,12 +135,13 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	promptTokens := estimateTokens(prompt)
 	if lastErr != nil {
-		g.recordAudit(r, key, model, turn.AccountName, started, http.StatusBadGateway, 0, promptTokens, 0, request.Stream, turn.Retries, string(body), "", lastErr.Error())
+		status := upstreamStatus(lastErr)
+		g.recordAudit(r, key, model, turn.AccountName, started, status, 0, promptTokens, 0, request.Stream, turn.Retries, string(body), "", lastErr.Error())
 		if out.wroteHeader {
 			stream.fail(lastErr.Error())
 			return
 		}
-		writeAnthropicError(out, http.StatusBadGateway, "api_error", lastErr.Error())
+		writeAnthropicError(out, status, anthropicErrorType(status), lastErr.Error())
 		return
 	}
 	result := turn.Result
@@ -561,4 +562,21 @@ func writeAnthropicError(w http.ResponseWriter, status int, kind, message string
 	w.Header().Set("content-type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
+}
+
+// anthropicErrorType names a failure the way the Anthropic surface does, so a
+// refused request does not arrive looking like a server fault.
+func anthropicErrorType(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	}
+	if status >= 400 && status < 500 {
+		return "invalid_request_error"
+	}
+	return "api_error"
 }

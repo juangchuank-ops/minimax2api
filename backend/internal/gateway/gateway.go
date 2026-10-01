@@ -226,12 +226,12 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	accountName := turn.AccountName
 	promptTokens := estimateTokens(prompt)
 	if lastErr != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, promptTokens, 0, request.Stream, turn.Retries, string(body), "", lastErr.Error())
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(lastErr), 0, promptTokens, 0, request.Stream, turn.Retries, string(body), "", lastErr.Error())
 		if out.wroteHeader {
 			writeSSEError(out, lastErr.Error())
 			return
 		}
-		writeError(out, http.StatusBadGateway, lastErr.Error())
+		writeError(out, upstreamStatus(lastErr), lastErr.Error())
 		return
 	}
 	result := turn.Result
@@ -415,7 +415,10 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 			out.Result = result
 			return out, nil
 		}
-		if ctx.Err() != nil || isPoolExhausted(err) {
+		// A refusal is final for this request: the same call on the next account
+		// draws the same answer, and every attempt spends an account to learn
+		// nothing. See minimax.ErrUpstreamRejected.
+		if ctx.Err() != nil || isPoolExhausted(err) || errors.Is(err, minimax.ErrUpstreamRejected) {
 			break
 		}
 		if req.Committed != nil && req.Committed() {
@@ -714,12 +717,12 @@ func (g *Gateway) chatImage(
 ) {
 	result, accountName, err := g.runImageTurn(r.Context(), prompt, images)
 	if err != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, request.Stream, 0, string(body), "", err.Error())
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(err), 0, 0, 0, request.Stream, 0, string(body), "", err.Error())
 		if out.wroteHeader {
 			writeSSEError(out, err.Error())
 			return
 		}
-		writeError(out, http.StatusBadGateway, err.Error())
+		writeError(out, upstreamStatus(err), err.Error())
 		return
 	}
 
@@ -886,8 +889,8 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	settings := g.settings()
 	result, accountName, err := g.runImageTurn(r.Context(), request.Prompt, nil)
 	if err != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", err.Error())
-		writeError(out, http.StatusBadGateway, err.Error())
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(err), 0, 0, 0, false, 0, string(body), "", err.Error())
+		writeError(out, upstreamStatus(err), err.Error())
 		return
 	}
 
@@ -1047,14 +1050,16 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 		})
 		lease.Release(err)
 		lastErr = err
-		if err == nil || isPoolExhausted(err) {
+		// Same rule as runTurn: a refusal is the request's fault, so trying it
+		// on the next account only spends one more account.
+		if err == nil || isPoolExhausted(err) || errors.Is(err, minimax.ErrUpstreamRejected) {
 			break
 		}
 	}
 
 	if lastErr != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", lastErr.Error())
-		writeError(out, http.StatusBadGateway, lastErr.Error())
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(lastErr), 0, 0, 0, false, 0, string(body), "", lastErr.Error())
+		writeError(out, upstreamStatus(lastErr), lastErr.Error())
 		return
 	}
 
@@ -1382,6 +1387,19 @@ func isPoolExhausted(err error) bool {
 	}
 	message := err.Error()
 	return strings.Contains(message, "no account available") || strings.Contains(message, "all accounts are busy")
+}
+
+// upstreamStatus maps a turn failure onto the status the caller should see.
+//
+// A request the upstream refused is the caller's problem, so the upstream's own
+// status travels back and the caller can fix what it sent. Everything else —
+// a dead account, an exhausted pool, a 5xx — is a gateway failure and stays a
+// 502, because the caller cannot do anything about it.
+func upstreamStatus(err error) int {
+	if status := minimax.UpstreamStatus(err); status != 0 {
+		return status
+	}
+	return http.StatusBadGateway
 }
 
 func clientIP(r *http.Request) string {

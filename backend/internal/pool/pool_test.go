@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -559,6 +560,58 @@ func TestReleaseOnSuccessClearsCooldown(t *testing.T) {
 	}
 	if account.LastUsedAt.IsZero() {
 		t.Fatal("lastUsedAt was not stamped")
+	}
+}
+
+// A request the upstream refused says nothing about the account that carried
+// it. Charging it here is how one caller's unsupported attachment URL walked
+// the whole pool into cooldown and then answered everyone "all accounts are
+// busy", so a refusal must leave the account exactly as it found it.
+func TestReleaseOnUpstreamRejectionLeavesAccountAlone(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "a", 0)
+
+	rejection := &minimax.UpstreamRejection{
+		Status: http.StatusBadRequest,
+		Body:   `{"key":"invalid_params","detail":"attachment requires one owned object_key"}`,
+	}
+
+	// Four rounds, because the failure mode being guarded against compounds:
+	// FailCount drives an exponential backoff, so a single charge is enough to
+	// start the climb.
+	for round := 0; round < 4; round++ {
+		lease := f.acquire(t, "")
+		lease.Release(rejection)
+
+		account := f.reload(t, "a")
+		if account.Status != store.StatusActive {
+			t.Fatalf("round %d: status = %q, want active", round, account.Status)
+		}
+		if account.FailCount != 0 {
+			t.Fatalf("round %d: failCount = %d, want 0", round, account.FailCount)
+		}
+		if !account.CooldownUntil.IsZero() {
+			t.Fatalf("round %d: cooldownUntil = %s, want zero", round, account.CooldownUntil)
+		}
+		if account.LastError != "" {
+			t.Fatalf("round %d: lastError = %q, want empty", round, account.LastError)
+		}
+	}
+}
+
+// The account is still released, so the in-flight slot has to come back even
+// though nothing was recorded against it.
+func TestReleaseOnUpstreamRejectionFreesTheSlot(t *testing.T) {
+	f := newFixture(t)
+	f.addAccountWith(t, "a", 0, "oauth_token=a", 1)
+
+	lease := f.acquire(t, "")
+	if got := f.pool.Inflight("a"); got != 1 {
+		t.Fatalf("inflight = %d, want 1", got)
+	}
+	lease.Release(&minimax.UpstreamRejection{Status: http.StatusBadRequest, Body: "bad"})
+	if got := f.pool.Inflight("a"); got != 0 {
+		t.Fatalf("inflight = %d, want 0", got)
 	}
 }
 

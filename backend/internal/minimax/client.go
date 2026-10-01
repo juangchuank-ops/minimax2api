@@ -68,6 +68,67 @@ var ErrInvalidCredential = errors.New("minimax credential rejected")
 // retired for it.
 var ErrAgentIDUnknown = errors.New("minimax agent id unknown")
 
+// ErrUpstreamRejected marks a call the upstream refused because of the request
+// itself — `400 invalid_params` and friends.
+//
+// It is a third kind of failure, and the one that used to be missing. Before it
+// existed, every non-401 4xx fell through to a bare fmt.Errorf, which is
+// indistinguishable from a transient 5xx: the gateway retried it on another
+// account and the pool charged the failure to whichever accounts it landed on.
+// A request the upstream will never accept cannot be fixed by another account,
+// so one client sending a bad attachment URL was enough to walk the whole pool
+// into cooldown and then answer everyone with "all accounts are busy".
+var ErrUpstreamRejected = errors.New("minimax rejected the request")
+
+// UpstreamRejection carries the status the upstream answered with, so callers
+// can hand the caller back the real reason instead of a blanket 502.
+type UpstreamRejection struct {
+	// Prefix names the call that was refused, so a log line still says which
+	// hop failed. Empty means the message path.
+	Prefix string
+	Status int
+	Body   string
+}
+
+func (e *UpstreamRejection) Error() string {
+	hop := e.Prefix
+	if hop == "" {
+		hop = "message"
+	}
+	return fmt.Sprintf("minimax %s HTTP %d: %s", hop, e.Status, e.Body)
+}
+
+func (e *UpstreamRejection) Is(target error) bool { return target == ErrUpstreamRejected }
+
+// UpstreamStatus reports the HTTP status behind an upstream refusal, or 0 when
+// err is not one. A caller that gets 0 should keep its own gateway status.
+func UpstreamStatus(err error) int {
+	var rej *UpstreamRejection
+	if errors.As(err, &rej) {
+		return rej.Status
+	}
+	return 0
+}
+
+// rejectsRequest reports whether a 4xx is the request's fault rather than the
+// account's.
+//
+// 401 and 403 mean the credential is dead. 429 means the account is out of
+// room right now. 408 is a timeout, which the next account may well answer.
+// Everything else in the 4xx range describes the call itself, and repeating it
+// somewhere else only spends another account to learn the same thing.
+func rejectsRequest(status int) bool {
+	if status < 400 || status > 499 {
+		return false
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	}
+	return true
+}
+
 // MediaRef is a generated image or video returned inside the SSE stream.
 type MediaRef struct {
 	Kind string `json:"kind"`
@@ -555,6 +616,9 @@ func (c *Client) CreateSession(ctx context.Context, cred Credential) (string, er
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
+		if rejectsRequest(resp.StatusCode) {
+			return "", &UpstreamRejection{Prefix: "session", Status: resp.StatusCode, Body: snippet(body)}
+		}
 		return "", fmt.Errorf("minimax session HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 
@@ -659,6 +723,9 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if rejectsRequest(resp.StatusCode) {
+			return nil, &UpstreamRejection{Status: resp.StatusCode, Body: snippet(body)}
+		}
 		return nil, fmt.Errorf("minimax message HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 

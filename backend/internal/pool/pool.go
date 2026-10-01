@@ -251,6 +251,14 @@ func (p *Pool) release(id string, err error) {
 			return
 		}
 
+		// A request the upstream refused is not evidence about this account —
+		// the next account answers the same way. Charging it here is how one
+		// caller's bad payload walks the pool into cooldown, so the account is
+		// returned to service untouched rather than blamed.
+		if errors.Is(err, minimax.ErrUpstreamRejected) {
+			return
+		}
+
 		account.FailCount++
 		account.LastError = truncate(err.Error(), 240)
 
