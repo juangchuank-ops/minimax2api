@@ -68,6 +68,14 @@ type Service struct {
 	settings func() config.Settings
 	credOf   func(*store.Account) minimax.Credential
 
+	// now is the clock reconciliation reads. It is a field rather than a bare
+	// time.Now() call so a test can pin it: reconcile compares a claim against
+	// both the grace period and "the same local day", so a test that backdates
+	// a claim by a fixed offset lands on the previous day whenever the suite
+	// runs just after midnight, and reconcile then returns early before doing
+	// anything the test wanted to observe.
+	now func() time.Time
+
 	mu      sync.Mutex
 	running bool
 	last    *Report
@@ -78,7 +86,16 @@ type Service struct {
 // the upstream client expects; it is injected so this package does not have to
 // import the gateway.
 func New(st *store.Store, client Client, settings func() config.Settings, credOf func(*store.Account) minimax.Credential) *Service {
-	return &Service{store: st, client: client, settings: settings, credOf: credOf}
+	return &Service{store: st, client: client, settings: settings, credOf: credOf, now: time.Now}
+}
+
+// clock reads the service clock, tolerating a Service built as a struct literal
+// without one.
+func (s *Service) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
 }
 
 // Start launches the background loops. They stop when ctx is cancelled.
@@ -502,10 +519,11 @@ func (s *Service) reconcile(ctx context.Context, account *store.Account) {
 	}
 	// Only today's claim is judgeable: a grant list cannot say which day a
 	// missing payout belonged to, and yesterday's is already beyond recovery.
-	if !sameLocalDay(account.SigninAt, time.Now()) {
+	now := s.clock()
+	if !sameLocalDay(account.SigninAt, now) {
 		return
 	}
-	if time.Since(account.SigninAt) < reconcileGrace {
+	if now.Sub(account.SigninAt) < reconcileGrace {
 		return
 	}
 

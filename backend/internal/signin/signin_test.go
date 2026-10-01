@@ -3,6 +3,7 @@ package signin
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,11 @@ type fixture struct {
 	store   *store.Store
 	client  *stubClient
 	account *store.Account
+	// now is the instant every time-sensitive test reasons from. It is pinned to
+	// noon of the current local day so a backdated claim is always older than
+	// the grace period and still lands on the same calendar day, whatever hour
+	// the suite happens to run at.
+	now time.Time
 }
 
 func newFixture(t *testing.T, settings *config.Settings) *fixture {
@@ -139,7 +145,17 @@ func newFixture(t *testing.T, settings *config.Settings) *fixture {
 	if err := st.AddAccount(account); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	return &fixture{service: service, store: st, client: client, account: account}
+	// Pin the reconciliation clock before anyone can read it. Noon leaves the
+	// grace period on one side and the rest of the calendar day on the other, so
+	// neither guard can swallow the behaviour under test.
+	sameDay := time.Now()
+	service.now = func() time.Time {
+		return time.Date(sameDay.Year(), sameDay.Month(), sameDay.Day(), 12, 0, 0, 0, sameDay.Location())
+	}
+	return &fixture{
+		service: service, store: st, client: client, account: account,
+		now: service.clock(),
+	}
 }
 
 func defaultSettings() *config.Settings {
@@ -562,11 +578,13 @@ func TestAFailedOpeningSequenceSkipsTheClaim(t *testing.T) {
 // --- reconciling -----------------------------------------------------------
 
 // claimAgo backdates the account's last claim so the reconciliation grace period
-// has elapsed.
+// has elapsed. It moves relative to the fixture's pinned clock, not wall time,
+// so the claim stays on the same calendar day the reconciliation compares
+// against.
 func claimAgo(t *testing.T, f *fixture, d time.Duration, status string) {
 	t.Helper()
 	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
-		target.SigninAt = time.Now().Add(-d)
+		target.SigninAt = f.now.Add(-d)
 		target.SigninStatus = status
 	})
 }
@@ -600,11 +618,17 @@ func TestReconcileReadsTheGrantTimestampNotTheBalance(t *testing.T) {
 	f := newFixture(t, defaultSettings())
 	claimAgo(t, f, 30*time.Minute, store.SigninOK)
 	f.client.grants = []minimax.CreditGrant{
-		{GrantedAt: time.Now().Add(-29 * time.Minute), Granted: 400, Remaining: 0},
+		{GrantedAt: f.now.Add(-29 * time.Minute), Granted: 400, Remaining: 0},
 	}
 
 	account, _ := f.store.AccountByID(f.account.ID)
 	f.service.reconcile(context.Background(), account)
+
+	// The assertion below also holds when reconcile bails out early, so pin the
+	// path: the grant list has to have been read for this to mean anything.
+	if !slices.Contains(f.client.calls, "grants") {
+		t.Fatalf("the grant list was never read; calls = %v", f.client.calls)
+	}
 
 	updated, _ := f.store.AccountByID(f.account.ID)
 	if updated.SigninStatus != store.SigninOK {
@@ -655,7 +679,7 @@ func TestReconcileClearsAFlagWhenTheGrantTurnsUp(t *testing.T) {
 		target.SigninError = "an earlier pass gave up too early"
 	})
 	f.client.grants = []minimax.CreditGrant{
-		{GrantedAt: time.Now().Add(-30 * time.Minute), Granted: 400, Remaining: 400},
+		{GrantedAt: f.now.Add(-30 * time.Minute), Granted: 400, Remaining: 400},
 	}
 
 	account, _ := f.store.AccountByID(f.account.ID)
@@ -679,6 +703,12 @@ func TestReconcileIgnoresAReadFailure(t *testing.T) {
 
 	account, _ := f.store.AccountByID(f.account.ID)
 	f.service.reconcile(context.Background(), account)
+
+	// "Left alone" is also what an early return produces, so prove the read was
+	// attempted before trusting it.
+	if !slices.Contains(f.client.calls, "grants") {
+		t.Fatalf("the grant list was never read; calls = %v", f.client.calls)
+	}
 
 	updated, _ := f.store.AccountByID(f.account.ID)
 	if updated.SigninStatus != store.SigninOK {
