@@ -401,6 +401,17 @@ func (a *Account) clone() *Account {
 		return nil
 	}
 	out := *a
+	// A cooldown is a deadline, not a mode.
+	//
+	// release() stamps StatusCooldown together with a CooldownUntil, and nothing
+	// flips the status back until the account is used again — so an account that
+	// cooled down once and then went idle keeps reporting "cooldown" forever.
+	// Every read goes through this snapshot (the admin list, /health), and a
+	// stale value there is how a fully recovered pool still gets read as drained.
+	if out.Status == StatusCooldown && !time.Now().Before(out.CooldownUntil) {
+		out.Status = StatusActive
+		out.CooldownUntil = time.Time{}
+	}
 	if a.Quota != nil {
 		quota := *a.Quota
 		out.Quota = &quota

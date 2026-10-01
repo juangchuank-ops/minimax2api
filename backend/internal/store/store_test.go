@@ -535,3 +535,29 @@ func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 		t.Errorf("the catalogue has no entry for %q", id)
 	}
 }
+
+// A cooldown that has run out must read as active.
+//
+// The status is persisted and only rewritten when the account is touched again,
+// so an account that cooled down once and then went idle keeps reporting
+// "cooldown" forever. Every read goes through the snapshot, so a stale value
+// there made a fully recovered pool look drained in the admin list while /health
+// — which evaluates the deadline — disagreed.
+func TestExpiredCooldownReadsAsActive(t *testing.T) {
+	expired := &Account{Status: StatusCooldown, CooldownUntil: time.Now().Add(-time.Minute)}
+	snapshot := expired.clone()
+	if snapshot.Status != StatusActive {
+		t.Fatalf("expired cooldown status = %q, want active", snapshot.Status)
+	}
+	if !snapshot.CooldownUntil.IsZero() {
+		t.Fatalf("expired cooldown deadline = %s, want zero", snapshot.CooldownUntil)
+	}
+	if expired.Status != StatusCooldown {
+		t.Fatal("clone mutated the account it was reading")
+	}
+
+	live := &Account{Status: StatusCooldown, CooldownUntil: time.Now().Add(time.Minute)}
+	if got := live.clone(); got.Status != StatusCooldown || got.CooldownUntil.IsZero() {
+		t.Fatalf("live cooldown = %s/%s, want cooldown with its deadline kept", got.Status, got.CooldownUntil)
+	}
+}
