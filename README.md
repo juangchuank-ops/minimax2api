@@ -33,6 +33,7 @@
 **API 层**
 - `POST /v1/chat/completions` — 支持流式（SSE）与非流式，兼容 OpenAI 请求/响应格式；**模型目录里的每一种类型都从这个口进**（见「模型列表就是一句接口承诺」）
 - `POST /v1/messages` — **Anthropic Messages 兼容**。Claude Code、Kiro 这类只会说 Anthropic 协议的客户端可以直接接上，见「Anthropic 兼容」
+- `POST /v1/files` — **文件上传**（OpenAI Files 兼容）：multipart 传文件，拿 `file_id`；列表 / 详情 / 下载 / 删除同套，见「关于文件」
 - `POST /v1/images/generations` — 图像生成
 - `POST /v1/videos/generations` — 视频生成（MiniMax H3.0 / H3 Max / Hailuo 2.3，见「视频生成」）
 - `GET /v1/models` — 模型列表
@@ -386,7 +387,8 @@ Claude 客户端会发自己的模型 id（`claude-sonnet-4-20250514` 之类）�
 | --- | --- |
 | `system`（字符串或块数组） | 拍成 `[系统指令] …` 前缀 |
 | `content` 里的 `text` 块 | 正文 |
-| `content` 里的 `image` 块 | 转成图片附件，与 OpenAI 路径同一套（见「关于图片」） |
+| `content` 里的 `image` 块 | 转成图片附件，与 OpenAI 路径同一套（见「关于图片与文件」） |
+| `content` 里的 `document` 块（base64） | 解码后进入文件上传通道，与 OpenAI 的 `file` 块同一套（见「关于图片与文件」） |
 | `content` 里的 `tool_use` / `tool_result` 块 | 渲染成散文。上游没有承载它们的结构化通道，但它们是下一轮回答所依赖的上下文，丢掉等于悄悄改了问题 |
 | `thinking` 块 | 不回放。那是模型自己产生过的推理，重放只是每轮多花 token |
 
@@ -654,7 +656,7 @@ GET /minimax-cloud/api/v1/channel/connections
 - **不调它，新号发消息会 500**，错误文案是 `[1400010501] Environment Variables not configured` —— 通篇没提「你没初始化」，看着像环境变量配错了。
 - **顺序反了（先签到后 `/config`）积分会静默丢失，且事后补调救不回来。** 领取接口照样回 `claim_result=1`，所以失败和成功长得一模一样。所以签到流程里这一步失败会**直接跳过领取**并写明原因 —— 丢掉一天是可见、可重跑的；顺序错了则是丢掉一天还报成功。
 
-三条路径都能在「系统设置 → 上游」里改（`configPath` / `agentListPath` / `connectionsPath`）。视频取件用的另外两条同理（`summariesPath` / `driveFilePath`，支持 `{session_id}`、`{node_id}`），详见「视频生成 → 成品不在对话流里」。
+三条路径都能在「系统设置 → 上游」里改（`configPath` / `agentListPath` / `connectionsPath`）。视频取件用的另外两条同理（`summariesPath` / `driveFilePath`，支持 `{session_id}`、`{node_id}`），详见「视频生成 → 成品不在对话流里」。文件上传的策略路径同理（`uploadPreparePath`），见「关于图片与文件」。
 
 ### 流式解析
 
@@ -666,12 +668,36 @@ data:{"type":6,"agent_message_chunk":{"msg_content":"你好"}}
 
 `type` 是数字且未公开，一旦上游重新编号，写死数字的解析器就会静默失效。所以判断依据是「payload 里出现了 `msg_content` 还是 `reasoning_content`」，未知帧会被安全跳过而不是报错。错误帧则通过 `error_msg` / `status_msg` / 非零 `status_code` 识别。
 
-### 关于图片
+### 关于图片与文件
 
-MiniMax 的附件走的是带签名的上传通道，无法从外部复刻，因此图片以 **URL 形式**转发给上游：
+**图片**以 URL 形式转发给上游（`http(s)` 地址直接透传；`data:` 内联图片写入媒体目录并改用「媒体公开前缀」重新发布——上游需要能自己下载到它；没配置公开前缀时会直接报错说明，而不是发出去静默失败）。
 
-- `http(s)` 图片地址直接透传
-- `data:` 内联图片会写入媒体目录并改用「媒体公开前缀」重新发布——上游需要能自己下载到它；没配置公开前缀时会直接报错说明，而不是发出去静默失败
+**文件**（PDF、Markdown、代码、Office 文档……非图片的一切）走的是**复刻出来的真实上传通道**。2026-10-02 用浏览器抓包确认了网页端发文件的完整三步，网关原样复刻：
+
+1. `POST /minimax-cloud/api/v1/uploads/prepare`（与其他云端点同套签名）带 `{purpose:1, file_name, mime_type, size_bytes}`，换回 `object_key` 与一份预签名的 OSS 表单
+2. 把表单字段和文件本体 POST 到对象存储（`matrix-internal*.oss-*.aliyuncs.com`），期待 `204`——签名在表单里，这一步不带账号令牌
+3. 消息体里用 `attachments:[{meta:{attachment_type, file_name, mime_type, size_bytes}, cloud:{object_key}}]` 引用；纯文件轮次的 `content` 是一个空格（抓包原文如此）
+
+抓包同时确认了一件事：**OSS 对象跟着上传者的 user id 走**（表单里有 `x-oss-meta-mxa-user-id`）。所以 A 账号上传的 object_key 在 B 账号的轮次里是无效的——这就是为什么 `/v1/files` 只把字节存在网关本地，**真正推到对象存储发生在对话轮次内、用当轮调度到的账号的凭证**。同账号 + 同内容会缓存 object_key，重试不会重复上传。
+
+调用方式两套都认（OpenAI 形状）：
+
+```bash
+# 1) 先传文件
+curl http://127.0.0.1:8080/v1/files -H "Authorization: Bearer $KEY" \
+  -F file=@notes.md -F purpose=user_data
+#    → {"id":"file-…","object":"file",…}
+
+# 2) 对话里引用
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -d '{"model":"minimax-agent","messages":[{"role":"user","content":[
+        {"type":"text","text":"总结这个文件"},
+        {"type":"file","file":{"file_id":"file-…"}}]}]}'
+```
+
+`file.file_data`（OpenAI PDF 输入的 data URL 形状）也收：`{"type":"file","file":{"filename":"x.pdf","file_data":"data:application/pdf;base64,…"}}`，字节内联在请求里，无需先传 `/v1/files`。`/v1/messages`（Anthropic 协议）的 `document` base64 块同样接入这条通道。消息里的 `file_id` 也可以配 `image_url` 混用。
+
+边界：单文件上限 100MB（与网页端一致）；`/v1/chat/completions` 的请求体上限随之内联文件放宽到 64MB——更大的文件请走 `/v1/files`；文件本体存在 `<数据目录>/uploads/`（媒体清扫不会碰它），删除用 `DELETE /v1/files/{id}`。
 
 ### 签到与积分
 
