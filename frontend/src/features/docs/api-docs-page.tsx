@@ -103,6 +103,45 @@ data: [DONE]`,
     ],
   },
   {
+    category: "files",
+    endpoint: "upload",
+    method: "POST",
+    path: "/v1/files",
+    titleKey: "docs.filesUpload",
+    descriptionKey: "docs.filesDescription",
+    request: `curl http://127.0.0.1:8080/v1/files \\
+  -H "Authorization: Bearer sk-mm-xxxx" \\
+  -F "file=@notes.md" \\
+  -F "purpose=user_data"
+
+# 引用到对话里：
+curl http://127.0.0.1:8080/v1/chat/completions \\
+  -H "Authorization: Bearer sk-mm-xxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "minimax-agent",
+    "messages": [
+      { "role": "user", "content": [
+        { "type": "text", "text": "总结这个文件" },
+        { "type": "file", "file": { "file_id": "file-xxxx" } }
+      ]}
+    ]
+  }'`,
+    response: `{
+  "id": "file-aBcDeFgH12...",
+  "object": "file",
+  "bytes": 12365,
+  "created_at": 1790990000,
+  "filename": "notes.md",
+  "purpose": "user_data",
+  "status": "processed"
+}`,
+    parameters: [
+      { name: "file", type: "file", required: true, noteKey: "docs.noteFile" },
+      { name: "purpose", type: "string", noteKey: "docs.notePurpose" },
+    ],
+  },
+  {
     category: "system",
     endpoint: "health",
     method: "GET",

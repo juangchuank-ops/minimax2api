@@ -30,6 +30,7 @@ type Draft = {
   agentListPath: string;
   configPath: string;
   connectionsPath: string;
+  uploadPreparePath: string;
   summariesPath: string;
   driveFilePath: string;
   modelPayload: string;
@@ -155,6 +156,7 @@ export function SettingsPage() {
           agentListPath: value.agentListPath,
           configPath: value.configPath,
           connectionsPath: value.connectionsPath,
+          uploadPreparePath: value.uploadPreparePath,
           summariesPath: value.summariesPath,
           driveFilePath: value.driveFilePath,
           modelPayload: value.modelPayload,
@@ -344,6 +346,13 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.connectionsPath}
               onChange={(event) => set("connectionsPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.uploadPreparePath")} help={t("settings.upstream.uploadPreparePathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.uploadPreparePath}
+              onChange={(event) => set("uploadPreparePath", event.target.value)}
             />
           </Field>
           <Field label={t("settings.upstream.summariesPath")} help={t("settings.upstream.summariesPathHelp")}>

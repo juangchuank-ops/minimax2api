@@ -388,6 +388,8 @@ const zhCN = {
       configPathHelp: "agent 侧的初始化调用。新号不先打一次就发消息会 500；而且签到必须排在它之后——顺序反了积分会静默丢失且补不回来。留空则用默认值。",
       connectionsPath: "连接列表路径",
       connectionsPathHelp: "初始化序列的第三步，与 config、agent 列表一起构成网页端打开 agent 页时的那串请求。留空则用默认值。",
+      uploadPreparePath: "附件上传策略路径",
+      uploadPreparePathHelp: "文件附件的第一步：请求一个带签名的对象存储上传策略，消息体随后用 object_key 引用它。留空则用默认值。",
       summariesPath: "会话摘要路径",
       summariesPathHelp: "列出一个会话每轮的产物文件。生成的视频不在对话流里，只在这里可见——所以这个接口是「这一轮到底产出了什么」的唯一来源。留空则用默认值。",
       driveFilePath: "网盘文件路径",
@@ -545,6 +547,11 @@ const zhCN = {
     noteN: "期望数量。实际返回几张由 Agent 决定，不保证等于这个值，也不保证一定有图片",
     noteSize: "透传字段，上游由模型决定",
     noteResponseFormat: "url（默认）或 b64_json",
+    filesUpload: "文件上传",
+    filesDescription:
+      "OpenAI Files 兼容的文件上传：multipart 传文件，返回 file_id。对话里用 file 块的 file_id 引用它（或直接内联 file_data），网关会在对话轮次内用当轮账号的凭证把文件推到上游的对象存储，再以 object_key 挂进消息。单文件上限 100MB。",
+    noteFile: "multipart 的文件字段，必填",
+    notePurpose: "用途标签，默认 user_data；对上游无语义，仅作记录",
   },
   errors: {
     generic: "操作失败，请稍后重试",
@@ -941,6 +948,8 @@ const en: typeof zhCN = {
       configPathHelp: "The agent-side initialisation call. A new account answers 500 to a message until it has run once, and a check-in must come after it — the reverse order loses the points silently and for good. Blank uses the default.",
       connectionsPath: "Connections path",
       connectionsPathHelp: "Third step of the opening sequence, alongside config and the agent list — the calls the web client makes when it opens the agent page. Blank uses the default.",
+      uploadPreparePath: "Attachment upload policy path",
+      uploadPreparePathHelp: "First step of a file attachment: request a pre-signed object-store upload policy; the message body then references it by object_key. Blank uses the default.",
       summariesPath: "Session summaries path",
       summariesPathHelp: "Lists the files each turn of a session produced. A generated video is not in the conversation stream and is only visible here, which makes this the sole source for \"what did this turn actually produce\". Blank uses the default.",
       driveFilePath: "Drive file path",
@@ -1101,6 +1110,11 @@ const en: typeof zhCN = {
       "How many are wanted. The agent decides what actually comes back, so this is not guaranteed — neither the count nor that anything comes back at all",
     noteSize: "Passed through; the model decides",
     noteResponseFormat: "url (default) or b64_json",
+    filesUpload: "File upload",
+    filesDescription:
+      "OpenAI Files-compatible upload: send a multipart form, get a file_id. Reference it from chat via a file block's file_id (or inline file_data); inside the chat turn the gateway pushes the bytes to the upstream object store with that turn's account credential and attaches them by object_key. 100MB per file.",
+    noteFile: "The multipart file field, required",
+    notePurpose: "Purpose label, default user_data; meaningless upstream, kept for the record",
   },
   errors: {
     generic: "Something went wrong, please retry",
