@@ -199,10 +199,14 @@ type Options struct {
 	// this field as the switch that turns generation on.
 	ClientIntent string
 	Images       []UploadedImage
-	Timeout      time.Duration
-	IdleTimeout  time.Duration
-	OnDelta      func(string)
-	OnThinking   func(string)
+	// Files ride along as `meta`/`cloud` attachment envelopes after being
+	// pushed to the object store with the turn's own credential. See
+	// PendingAttachment for why the upload cannot happen earlier.
+	Files       []PendingAttachment
+	Timeout     time.Duration
+	IdleTimeout time.Duration
+	OnDelta     func(string)
+	OnThinking  func(string)
 	// OnFrame sees every decoded frame, before anything decides what it means.
 	//
 	// Dispatch is driven by payload keys, which is what keeps the adapter
@@ -233,6 +237,10 @@ type Client struct {
 	// reading, and the only way to prove they do is to hand the client a clock
 	// that does not move. Nil means time.Now.
 	now func() time.Time
+	// uploads remembers object keys per (account token, file content). A
+	// retried turn on the same account must not push the same bytes upstream
+	// twice. See upload.go.
+	uploads uploadCache
 }
 
 // clock returns the client's time source. A zero-value Client is usable, which
@@ -672,7 +680,7 @@ func (c *Client) Completion(ctx context.Context, opts Options) (*Result, error) 
 	if strings.TrimSpace(opts.Credential.Token) == "" {
 		return nil, ErrInvalidCredential
 	}
-	if opts.Text == "" && len(opts.Images) == 0 {
+	if opts.Text == "" && len(opts.Images) == 0 && len(opts.Files) == 0 {
 		return nil, errors.New("empty prompt")
 	}
 
@@ -682,6 +690,16 @@ func (c *Client) Completion(ctx context.Context, opts Options) (*Result, error) 
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	// Upload before the session is opened: a file that cannot reach the object
+	// store should not spend a session (and the opening sequence behind it).
+	// Object keys cache per credential, so a retried turn on the same account
+	// does not push the same bytes twice.
+	for i := range opts.Files {
+		if err := c.UploadAttachment(ctx, opts.Credential, &opts.Files[i]); err != nil {
+			return nil, err
+		}
+	}
 
 	sessionID, err := c.CreateSession(ctx, opts.Credential)
 	if err != nil {
@@ -744,22 +762,53 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 //
 // The agent expects the whole conversation in a single `content` string, which
 // is what the gateway already produces when it flattens OpenAI messages.
+//
+// Attachments have two shapes. Images keep the flat `url` reference they have
+// always used — the upstream resolves the URL server-side and that path is
+// proven. Files use the `meta`/`cloud` envelope the web client sent when its
+// own upload was captured: `attachment_type`, name, mime and size under
+// `meta`, the object key under `cloud`. A file-only turn still carries a
+// non-empty `content` — the captured turn used a single space.
 func buildMessageBody(settings config.Settings, opts Options, turnID string) map[string]any {
+	// A turn that only carries files still needs a non-empty `content` — the
+	// captured file upload turn sent a single space, and that is what goes out.
+	text := opts.Text
+	if strings.TrimSpace(text) == "" && len(opts.Files) > 0 {
+		text = " "
+	}
 	body := map[string]any{
-		"content":      opts.Text,
+		"content":      text,
 		"turn_id":      turnID,
 		"worktreeMode": false,
 	}
 
-	if len(opts.Images) > 0 {
-		attachments := make([]any, 0, len(opts.Images))
-		for _, image := range opts.Images {
-			attachments = append(attachments, map[string]any{
-				"type": "image",
-				"url":  image.URL,
-				"name": image.Name,
-			})
+	attachments := make([]any, 0, len(opts.Images)+len(opts.Files))
+	for _, image := range opts.Images {
+		attachments = append(attachments, map[string]any{
+			"type": "image",
+			"url":  image.URL,
+			"name": image.Name,
+		})
+	}
+	for _, file := range opts.Files {
+		if file.ObjectKey == "" {
+			// Uploaded inside Completion; a file without a key here would be
+			// dropped silently by the upstream, which is worse than failing.
+			continue
 		}
+		attachments = append(attachments, map[string]any{
+			"meta": map[string]any{
+				"attachment_type": "file",
+				"file_name":       file.Name,
+				"mime_type":       file.MimeType,
+				"size_bytes":      file.Size,
+			},
+			"cloud": map[string]any{
+				"object_key": file.ObjectKey,
+			},
+		})
+	}
+	if len(attachments) > 0 {
 		body["attachments"] = attachments
 	}
 

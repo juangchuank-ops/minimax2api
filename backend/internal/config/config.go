@@ -181,6 +181,10 @@ type UpstreamSettings struct {
 	// ConnectionsPath completes the opening sequence the web client runs when
 	// it opens the agent page.
 	ConnectionsPath string `json:"connectionsPath"`
+	// UploadPreparePath issues private upload policies for message
+	// attachments. The prepare → object-store two-step is the only way a file
+	// reaches the agent, and it is signed like every other cloud call.
+	UploadPreparePath string `json:"uploadPreparePath"`
 	// SummariesPath lists a session's turns together with the files each one
 	// produced. Generated media is not announced in the conversation stream, so
 	// this is the only place a finished video is visible from.
@@ -286,6 +290,7 @@ func DefaultSettings(dataDir string) Settings {
 			AgentListPath:        "/minimax-cloud/api/v1/agent",
 			ConfigPath:           "/minimax-cloud/api/v1/config",
 			ConnectionsPath:      "/minimax-cloud/api/v1/channel/connections",
+			UploadPreparePath:    "/minimax-cloud/api/v1/uploads/prepare",
 			SummariesPath:        "/minimax-cloud/api/v1/session/{session_id}/input-summaries",
 			DriveFilePath:        "/minimax-cloud/api/v1/drive/file/{node_id}",
 			ModelPayload:         "",
@@ -474,6 +479,9 @@ func (s *Settings) Normalize(dataDir string) bool {
 	}
 	if s.Media.GeneratedDir == "" {
 		s.Media.GeneratedDir = def.Media.GeneratedDir
+	}
+	if s.Upstream.UploadPreparePath == "" {
+		s.Upstream.UploadPreparePath = def.Upstream.UploadPreparePath
 	}
 	if s.Media.MaxTotalSizeMB < 64 {
 		s.Media.MaxTotalSizeMB = def.Media.MaxTotalSizeMB
