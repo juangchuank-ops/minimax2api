@@ -81,13 +81,13 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, images, err := g.anthropicPrompt(request.System, request.Messages)
+	prompt, images, files, err := g.anthropicPrompt(request.System, request.Messages)
 	if err != nil {
 		writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if prompt == "" && len(images) == 0 {
-		writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", "messages must contain text or image content")
+	if prompt == "" && len(images) == 0 && len(files) == 0 {
+		writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", "messages must contain text, image or document content")
 		return
 	}
 
@@ -124,6 +124,7 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
 		Prompt:     prompt,
 		Images:     images,
+		Files:      files,
 		Mode:       mode,
 		Model:      model,
 		SessionKey: "",
@@ -264,16 +265,17 @@ func anthropicToolSpecs(tools []anthropicTool) []toolSpec {
 // anthropicPrompt flattens an Anthropic conversation the way buildPrompt
 // flattens an OpenAI one, so both front ends reach the upstream with the same
 // text for the same conversation.
-func (g *Gateway) anthropicPrompt(system json.RawMessage, messages []anthropicMessage) (string, []minimax.UploadedImage, error) {
+func (g *Gateway) anthropicPrompt(system json.RawMessage, messages []anthropicMessage) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
 	var builder strings.Builder
 	var images []minimax.UploadedImage
+	var files []minimax.PendingAttachment
 
 	if text := anthropicBlocksText(system); text != "" {
 		builder.WriteString("[系统指令] " + text + "\n\n")
 	}
 
 	for _, message := range messages {
-		text, urls := anthropicBlocks(message.Content)
+		text, urls, documents := anthropicBlocks(message.Content)
 		switch message.Role {
 		case "assistant":
 			builder.WriteString("助手：" + text + "\n")
@@ -287,13 +289,20 @@ func (g *Gateway) anthropicPrompt(system json.RawMessage, messages []anthropicMe
 		for _, raw := range urls {
 			image, err := g.resolveImage(raw)
 			if err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
 			images = append(images, image)
 		}
+		for _, doc := range documents {
+			file, err := g.resolveFilePart(doc)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			files = append(files, file)
+		}
 	}
 
-	return strings.TrimSpace(builder.String()), images, nil
+	return strings.TrimSpace(builder.String()), images, files, nil
 }
 
 // anthropicBlocksText reads the text out of a system value, which may be a bare
@@ -309,28 +318,28 @@ func anthropicBlocksText(raw json.RawMessage) string {
 		}
 		return ""
 	}
-	text, _ := anthropicBlocks(raw)
+	text, _, _ := anthropicBlocks(raw)
 	return text
 }
 
 // anthropicBlocks walks a content value and returns its text plus any image
-// URLs.
+// URLs and document blocks.
 //
 // Tool traffic is rendered back into prose. The upstream has no tool channel to
 // carry `tool_use` / `tool_result` blocks (see tools.go), so a conversation that
 // contains them still has to arrive as words: the call the assistant made and
 // the result the client produced are both part of the context the next answer
 // depends on. Dropping them would silently change the question.
-func anthropicBlocks(raw json.RawMessage) (string, []string) {
+func anthropicBlocks(raw json.RawMessage) (string, []string, []contentPart) {
 	if len(raw) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	if raw[0] == '"' {
 		var text string
 		if json.Unmarshal(raw, &text) == nil {
-			return strings.TrimSpace(text), nil
+			return strings.TrimSpace(text), nil, nil
 		}
-		return "", nil
+		return "", nil, nil
 	}
 
 	var blocks []struct {
@@ -339,20 +348,24 @@ func anthropicBlocks(raw json.RawMessage) (string, []string) {
 		Name  string          `json:"name"`
 		ID    string          `json:"id"`
 		Input json.RawMessage `json:"input"`
+		Title string          `json:"title"`
 		// tool_result carries its payload under `content`, which may be a
 		// string or an array of text blocks.
 		Content json.RawMessage `json:"content"`
 		Source  struct {
-			Type string `json:"type"`
-			URL  string `json:"url"`
+			Type      string `json:"type"`
+			URL       string `json:"url"`
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
 		} `json:"source"`
 	}
 	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return "", nil
+		return "", nil, nil
 	}
 
 	var parts []string
 	var images []string
+	var documents []contentPart
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
@@ -366,6 +379,30 @@ func anthropicBlocks(raw json.RawMessage) (string, []string) {
 			if block.Source.URL != "" {
 				images = append(images, block.Source.URL)
 			}
+		case "document":
+			// A base64 document rides like an OpenAI file_data part; the same
+			// resolver decodes it and the turn uploads it with the sending
+			// account's credential. URL documents are not accepted: there is
+			// no evidence the upstream dereferences remote files from an
+			// Anthropic-shaped turn, and a fetch-the-world proxy is not this
+			// gateway's job.
+			if block.Source.Type == "base64" && strings.TrimSpace(block.Source.Data) != "" {
+				name := strings.TrimSpace(block.Title)
+				if name == "" {
+					name = "document"
+				}
+				documents = append(documents, contentPart{
+					Type: "file",
+					File: struct {
+						FileID   string `json:"file_id"`
+						Filename string `json:"filename"`
+						FileData string `json:"file_data"`
+					}{
+						Filename: name,
+						FileData: "data:" + block.Source.MediaType + ";base64," + block.Source.Data,
+					},
+				})
+			}
 		case "tool_use":
 			parts = append(parts, fmt.Sprintf("[调用了工具 %s，参数 %s]", block.Name, string(block.Input)))
 		case "tool_result":
@@ -377,7 +414,7 @@ func anthropicBlocks(raw json.RawMessage) (string, []string) {
 			}
 		}
 	}
-	return strings.Join(parts, "\n"), images
+	return strings.Join(parts, "\n"), images, documents
 }
 
 // rawJSONObject keeps an arguments string as an object for the Anthropic

@@ -46,6 +46,11 @@ func main() {
 	mux.HandleFunc("POST /v1/messages", compat.AnthropicMessages)
 	mux.HandleFunc("POST /v1/images/generations", compat.ImageGenerations)
 	mux.HandleFunc("POST /v1/videos/generations", compat.VideoGenerations)
+	mux.HandleFunc("POST /v1/files", compat.FilesUpload)
+	mux.HandleFunc("GET /v1/files", compat.FilesList)
+	mux.HandleFunc("GET /v1/files/{id}", compat.FilesRetrieve)
+	mux.HandleFunc("GET /v1/files/{id}/content", compat.FilesContent)
+	mux.HandleFunc("DELETE /v1/files/{id}", compat.FilesDelete)
 
 	mediaDir := st.Settings().Media.GeneratedDir
 	mux.Handle("GET /media/", http.StripPrefix("/media/", http.FileServer(http.Dir(mediaDir))))

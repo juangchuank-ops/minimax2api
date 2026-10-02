@@ -32,6 +32,10 @@ type Gateway struct {
 	client   *minimax.Client
 	settings func() config.Settings
 	limiter  *limiter
+	// files is the local registry behind /v1/files, built on first use from
+	// the media settings. See files.go.
+	files     *fileStore
+	filesOnce sync.Once
 }
 
 func New(st *store.Store, p *pool.Pool, client *minimax.Client, settings func() config.Settings) *Gateway {
@@ -92,6 +96,11 @@ type contentPart struct {
 	ImageURL struct {
 		URL string `json:"url"`
 	} `json:"image_url"`
+	File struct {
+		FileID   string `json:"file_id"`
+		Filename string `json:"filename"`
+		FileData string `json:"file_data"`
+	} `json:"file"`
 }
 
 // ChatCompletions implements POST /v1/chat/completions.
@@ -110,7 +119,9 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer g.limiter.release(key)
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	// 64MB: inline `file_data` attachments are base64 inside the JSON body, so
+	// a ~40MB document costs ~54MB encoded. Bigger files belong in /v1/files.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
 	if err != nil {
 		writeError(out, http.StatusBadRequest, "cannot read request body")
 		return
@@ -148,13 +159,13 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, images, err := g.buildPrompt(r.Context(), request.Messages)
+	prompt, images, files, err := g.buildPrompt(r.Context(), request.Messages)
 	if err != nil {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
 	}
-	if prompt == "" && len(images) == 0 {
-		writeError(out, http.StatusBadRequest, "messages must contain text or image content")
+	if prompt == "" && len(images) == 0 && len(files) == 0 {
+		writeError(out, http.StatusBadRequest, "messages must contain text, image or file content")
 		return
 	}
 
@@ -214,6 +225,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
 		Prompt:     prompt,
 		Images:     images,
+		Files:      files,
 		Mode:       mode,
 		Model:      model,
 		SessionKey: request.User,
@@ -322,6 +334,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 type turnRequest struct {
 	Prompt     string
 	Images     []minimax.UploadedImage
+	Files      []minimax.PendingAttachment
 	Mode       string
 	Model      *store.ModelConfig
 	SessionKey string
@@ -385,6 +398,7 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 			Text:        req.Prompt,
 			Mode:        req.Mode,
 			Images:      req.Images,
+			Files:       req.Files,
 			Timeout:     timeoutFor(settings, req.Model),
 			IdleTimeout: settings.StreamIdleTimeout(),
 		}
@@ -498,15 +512,21 @@ func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]a
 
 // ------------------------------------------------------------ prompt build
 
-func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (string, []minimax.UploadedImage, error) {
+// buildPrompt flattens the conversation into the single content string the
+// agent expects, and collects the attachments it should carry: images by URL,
+// files as pending uploads (bytes are resolved from /v1/files or the request
+// body and pushed to the object store by the turn itself, with the sending
+// account's credential).
+func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
 	if len(messages) == 0 {
-		return "", nil, nil
+		return "", nil, nil, nil
 	}
 	var builder strings.Builder
 	var images []minimax.UploadedImage
+	var files []minimax.PendingAttachment
 
 	for _, message := range messages {
-		text, urls := parseContent(message.Content)
+		text, urls, fileParts := parseContent(message.Content)
 		switch message.Role {
 		case "system":
 			builder.WriteString("[系统指令] " + text + "\n\n")
@@ -523,13 +543,20 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 		for _, raw := range urls {
 			image, err := g.resolveImage(raw)
 			if err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
 			images = append(images, image)
 		}
+		for _, part := range fileParts {
+			file, err := g.resolveFilePart(part)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			files = append(files, file)
+		}
 	}
 
-	return strings.TrimSpace(builder.String()), images, nil
+	return strings.TrimSpace(builder.String()), images, files, nil
 }
 
 // resolveImage turns an OpenAI image reference into something the agent can
@@ -589,20 +616,21 @@ func imageName(raw string) string {
 	return candidate
 }
 
-func parseContent(raw json.RawMessage) (string, []string) {
+func parseContent(raw json.RawMessage) (string, []string, []contentPart) {
 	if len(raw) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	var plain string
 	if err := json.Unmarshal(raw, &plain); err == nil {
-		return plain, nil
+		return plain, nil, nil
 	}
 	var parts []contentPart
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return "", nil
+		return "", nil, nil
 	}
 	var text strings.Builder
 	var urls []string
+	var files []contentPart
 	for _, part := range parts {
 		switch part.Type {
 		case "text", "input_text":
@@ -611,9 +639,17 @@ func parseContent(raw json.RawMessage) (string, []string) {
 			if part.ImageURL.URL != "" {
 				urls = append(urls, part.ImageURL.URL)
 			}
+		case "file", "input_file":
+			// OpenAI file parts: `file.file_id` references a /v1/files upload,
+			// `file.file_data` carries an inline data URL. Kept as-is here —
+			// resolving needs the gateway (the file registry), which this
+			// package-level helper cannot see.
+			if part.File.FileID != "" || part.File.FileData != "" {
+				files = append(files, part)
+			}
 		}
 	}
-	return text.String(), urls
+	return text.String(), urls, files
 }
 
 // ------------------------------------------------------------ image handler
