@@ -219,6 +219,8 @@ export function AccountsPage() {
     disabled: 0,
     invalid: 0,
     routable: 0,
+    creditTotal: 0,
+    creditSynced: 0,
   };
   const total = accountsQuery.data?.total ?? 0;
   const selectedOnPage = items.filter((item) => selected.has(item.id));
@@ -533,7 +535,7 @@ export function AccountsPage() {
         }
       />
 
-      <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
         <AccountMetricPanel
           tone="text-quota-product-1"
           icon={<SquareTerminal />}
@@ -549,6 +551,14 @@ export function AccountsPage() {
           label={t("accounts.statusActive")}
           value={formatNumber(summary.active)}
           detail={t("accounts.routableAccountCount", { count: formatNumber(summary.routable) })}
+        />
+        <AccountMetricPanel
+          tone="text-quota-product-4"
+          icon={<Coins />}
+          loading={accountsQuery.isPending}
+          label={t("accounts.creditTotal")}
+          value={formatNumber(summary.creditTotal)}
+          detail={t("accounts.creditTotalDetail", { count: formatNumber(summary.creditSynced) })}
         />
         <AccountMetricPanel
           tone="text-quota-product-3"

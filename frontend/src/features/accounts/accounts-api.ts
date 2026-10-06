@@ -110,6 +110,18 @@ export type AccountSummary = {
   disabled: number;
   invalid: number;
   routable: number;
+  /**
+   * Sum of every account's last observed balance, across the whole pool rather
+   * than the current page — the number is about the pool, so paging must not
+   * move it.
+   */
+  creditTotal: number;
+  /**
+   * How many accounts that sum covers. Accounts whose balance has never been
+   * read carry no credit at all, so without this a total of 0 cannot be told
+   * apart from a pool that has simply never been polled.
+   */
+  creditSynced: number;
 };
 
 export type AccountListResult = {

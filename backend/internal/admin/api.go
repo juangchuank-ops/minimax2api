@@ -442,6 +442,22 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, active, cooldown, disabled, invalid, routable := a.pool.Summary()
+
+	// The credit card totals the whole pool rather than the current page or
+	// filter — "all accounts" is the point of the number, and the page slice
+	// would make it change as the operator pages through. An account whose
+	// balance has never been read carries no Credit at all, so it contributes
+	// nothing; the count of accounts actually covered travels with the sum,
+	// because a bare 0 is otherwise ambiguous between "spent" and "never read".
+	creditTotal, creditSynced := 0, 0
+	for _, account := range accounts {
+		if account.Credit == nil {
+			continue
+		}
+		creditTotal += account.Credit.Total
+		creditSynced++
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":    views[start:end],
 		"total":    total,
@@ -450,6 +466,7 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		"summary": map[string]any{
 			"total": total, "active": active, "cooldown": cooldown,
 			"disabled": disabled, "invalid": invalid, "routable": routable,
+			"creditTotal": creditTotal, "creditSynced": creditSynced,
 		},
 	})
 }
