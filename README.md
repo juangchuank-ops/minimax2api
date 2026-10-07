@@ -68,6 +68,7 @@
 - 函数调用（**模拟实现**，靠提示词约定，非上游原生能力）
 - 请求审计，保留天数与条数可配，后台定时清理
 - 图片 / 文件上传，附件与多模态参考
+- 图像与视频生成都支持**参考图**（改图 / 首尾帧），写法一致，数量上限按模型
 
 ---
 
@@ -211,6 +212,54 @@ curl http://127.0.0.1:8080/v1/videos/generations \
 ```
 
 改而不是拒，是因为拒绝一个参数意味着整轮失败；「最近」而不是「默认值」，是因为轴是有序的——要 2K 的人要的是这个模型最清晰的那档，不是最便宜的那档。但**改了不说是不行的**：`params` 是唯一能知道这一轮按什么参数计费的地方，`adjusted` 为空则说明请求原样发出去了。
+
+### 参考图（图像 / 视频）
+
+两个生成端点都收参考图，写法完全一致——参考图就是几个附件，**带上它就是「照着这张改」**，不带就是「生成」：
+
+```bash
+# 图像：改成水彩风格
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H "Authorization: Bearer sk-mm-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"把这幅画改成水彩风格","image_url":"https://example.com/painting.png"}'
+
+# 视频：首帧 + 尾帧
+curl http://127.0.0.1:8080/v1/videos/generations \
+  -H "Authorization: Bearer sk-mm-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"minimax-h3-max","prompt":"镜头缓慢推近","ratio":"16:9",
+       "resolution":"768P","duration":8,
+       "image_urls":["https://example.com/first.png","https://example.com/last.png"]}'
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `image_url` | 单张参考图 |
+| `image_urls` | 多张，与 `image_url` **叠加**而不是二选一 |
+| `image` | `image_url` 的别名（OpenAI 图像编辑接口用的就是这个字段名） |
+
+三个字段是**同一份列表的三种写法**，顺序是 `image` → `image_url` → `image_urls`。同时给不会互相覆盖——静默丢掉调用方自己看得见的一张图，不是帮忙。
+
+**取值只有两种**：公网 `http(s)` URL，或 `data:` URI。data URI 会被写进媒体目录、用「系统设置 → 媒体 → 公开访问前缀」重新发布出去，因为 Agent 是**服务端下载附件**的，读不了 `data:`；没配公开前缀时会明确报错，而不是转发上去让它含混地失败。
+
+> 裸 base64（不带 `data:` 前缀的那种）会被 **400 拒掉**并说明要什么。这是客户端按「OpenAI 图像编辑」惯例发送时最常犯的错——原样转发只会换来一个不点名的上游错误，还白花一轮。
+
+**参考图数量按模型限制**，和分辨率一样存在模型目录上：
+
+| 模型 | 参考图 |
+| --- | --- |
+| `minimax-h3-max` | 最多 **2** 张（首帧 / 尾帧），多了截断 |
+| `minimax-h3` | 不限制 |
+| `minimax-hailuo-2-3` | 未读取，不限制 |
+
+超出的部分**保留前 N 张**（首/尾帧的先后由调用方用顺序决定），并在 `adjusted` 里报出：
+
+```jsonc
+"adjusted": [ { "field": "reference_images", "requested": "3", "used": "2" } ]
+```
+
+走 `/v1/chat/completions` 时参考图是消息里的 `image_url` 内容块，**同一个上限照样生效**——只是聊天那条路没有地方报，静默截断。
 
 ---
 
@@ -407,11 +456,12 @@ node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码  
 ```bash
 # 1. 把 settings.upstream.baseURL 指到桩（隔离实例的数据目录里改）
 python tools/stub_upstream.py --port 18081
-# 2. 跑 264 组组合 + 越界 / 画幅 / 未读模型四组
-python tools/video_matrix.py --base http://127.0.0.1:18099 --password 你的密码
+# 2. 跑 264 组组合 + 越界 / 画幅 / 未读模型 / 参考图
+python tools/video_matrix.py --base http://127.0.0.1:18099 --password 你的密码 \
+  --log <桩的 --log 文件>
 ```
 
-> 桩会把收到的每个 `<video-generation-options>` 块写进 `--log` 指定的文件，所以「网关到底发了什么」是可直接核对的事实，不是推断。
+> 桩会**每轮写一条记录**（`<video-generation-options>` 块 + 这一轮实际带的参考图）到 `--log` 指定的文件。给了 `--log` 之后，参考图那几项检查是**读回桩的日志**做断言，而不是相信响应对自己的描述——「网关说它发了两张」和「上游确实收到两张」是两件事。
 
 推送前扫密钥（工作树 + 全部历史）：
 
@@ -453,6 +503,12 @@ git config core.hooksPath tools/hooks    # 装成 pre-commit 钩子
 
 **Q：视频参数到底以哪个为准——系统设置里的默认值，还是模型自己的范围？**
 模型范围优先。设置里那三个默认值是**全局唯一**的一份，而两个 H3 的分辨率档并不相同，所以默认值只负责「你没传时填什么」，填完还要过一遍该模型的范围；范围里没有就改到最近的一档。
+
+**Q：参考图传 base64 直接 400？**
+只收公网 `http(s)` URL 和 `data:` URI 两种。裸 base64 要自己补前缀（`data:image/png;base64,`）；`data:` URI 还需要配「系统设置 → 媒体 → 公开访问前缀」，因为 Agent 是**服务端下载附件**的，读不了内联数据。
+
+**Q：给了三张参考图，模型只用两张？**
+`minimax-h3-max` 只做首帧/尾帧，上限 2 张；超出的会被截断，并在响应的 `adjusted` 里写成 `reference_images: 3 → 2`。要真正的多图参考用 `minimax-h3`（不限制）。**顺序就是语义**：前两张分别当首帧和尾帧。
 
 **Q：接到角色扮演前端上，回复里把人设和历史对话一起吐出来了？**
 适配器把上游的**回显帧**当成了回答，不是模型在复述。详见「上游协议要点 → 流式解析」。

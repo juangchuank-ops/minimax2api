@@ -46,7 +46,8 @@ function ModelRanges({ model }: { model: ModelDTO }) {
   const resolutions = model.resolutions ?? [];
   const ratios = model.ratios ?? [];
   const durations = model.durations ?? [];
-  if (resolutions.length === 0 && ratios.length === 0 && durations.length === 0) {
+  const maxReferences = model.maxReferences ?? 0;
+  if (resolutions.length === 0 && ratios.length === 0 && durations.length === 0 && maxReferences === 0) {
     return null;
   }
   const fields: Array<{ label: string; value: string }> = [];
@@ -58,6 +59,15 @@ function ModelRanges({ model }: { model: ModelDTO }) {
   }
   if (durations.length > 0) {
     fields.push({ label: t("models.durations"), value: formatDurations(durations, t("models.seconds")) });
+  }
+  // Only shown when there is a cap. "Uncapped" and "not read yet" are the same
+  // state to the gateway — it refuses nothing in either — so the console does
+  // not claim to tell them apart.
+  if (maxReferences > 0) {
+    fields.push({
+      label: t("models.references"),
+      value: t("models.referenceLimit", { count: maxReferences }),
+    });
   }
   return (
     <p className="mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px] text-muted-foreground/80">

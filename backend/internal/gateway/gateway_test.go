@@ -1210,6 +1210,37 @@ func (h *harness) video(t *testing.T, body map[string]any) *httptest.ResponseRec
 	return rec
 }
 
+func (h *harness) image(t *testing.T, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.ImageGenerations(rec, req)
+	return rec
+}
+
+// referenceURLs pulls the reference pictures out of a captured turn body.
+//
+// Files and images share the `attachments` array but not its shape, so the
+// filter is on `type` rather than on position — a turn that carries both must
+// not have its document counted as a picture.
+func referenceURLs(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	items, _ := body["attachments"].([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["type"] != "image" {
+			continue
+		}
+		url, _ := entry["url"].(string)
+		out = append(out, url)
+	}
+	return out
+}
+
 // A video turn has to carry `client_intent`, and a chat turn must not.
 //
 // This asserts *what is sent*, not what it achieves. The web client labels
@@ -1329,7 +1360,6 @@ func TestVideoGenerationsSurvivesADriveThatDoesNotAnswer(t *testing.T) {
 		t.Errorf("the agent's own answer was dropped: %v", payload["detail"])
 	}
 }
-
 
 // ------------------------------------------------------------------ ranges
 
@@ -1583,5 +1613,244 @@ func TestChatCompletionsRepairsAVideoTurnToo(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("options block is missing %s:/n%s", want, text)
 		}
+	}
+}
+
+// --------------------------------------------------------------- references
+
+// A reference picture turns an image turn into an edit, and it travels as an
+// attachment.
+//
+// Until now this endpoint dropped them on the floor: the handler passed a
+// literal nil to the turn, so a caller could send a reference and get back a
+// picture that ignored it, with nothing anywhere saying so.
+func TestImageGenerationsCarriesReferenceImages(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/out.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	rec := h.image(t, map[string]any{
+		"prompt":    "把这张图改成水彩风格",
+		"image_url": "https://example.test/cat.png",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(*bodies) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*bodies))
+	}
+	got := referenceURLs(t, (*bodies)[0])
+	if len(got) != 1 || got[0] != "https://example.test/cat.png" {
+		t.Fatalf("references = %v, want the one that was sent", got)
+	}
+	if _, adjusted := decodeJSON(t, rec)["adjusted"]; adjusted {
+		t.Error("an accepted reference set was reported as adjusted")
+	}
+}
+
+// The three spellings are additive, in a fixed order.
+//
+// `image` is the field OpenAI's image-edit surface uses and `image_url` is what
+// this gateway's video endpoint has always taken; a client will send whichever
+// it already has wired up. Dropping one because it arrived under the other name
+// would lose a picture the caller can see in their own request.
+func TestImageGenerationsAcceptsEveryReferenceSpelling(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/out.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	rec := h.image(t, map[string]any{
+		"prompt":     "把这四张合成一张",
+		"image":      "https://example.test/a.png",
+		"image_url":  "https://example.test/b.png",
+		"image_urls": []any{"https://example.test/c.png", "https://example.test/d.png"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	want := []string{
+		"https://example.test/a.png",
+		"https://example.test/b.png",
+		"https://example.test/c.png",
+		"https://example.test/d.png",
+	}
+	got := referenceURLs(t, (*bodies)[0])
+	if len(got) != len(want) {
+		t.Fatalf("references = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("references = %v, want %v (order matters: it is how a caller says which frame is first)", got, want)
+		}
+	}
+}
+
+// H3-Max animates a first and a last frame, so a third picture has nowhere to
+// go — and a picture the plugin cannot place does not degrade the turn, it
+// stops it while it asks which one was meant.
+func TestVideoGenerationsCapsReferencesAtWhatTheModelAccepts(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	rec := h.video(t, map[string]any{
+		"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴",
+		"image_urls": []any{
+			"https://example.test/first.png",
+			"https://example.test/last.png",
+			"https://example.test/spare.png",
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	payload := decodeJSON(t, rec)
+	adjusted, _ := payload["adjusted"].([]any)
+	if len(adjusted) != 1 {
+		t.Fatalf("adjusted = %v, want one entry for the trimmed set", payload["adjusted"])
+	}
+	entry, _ := adjusted[0].(map[string]any)
+	if entry["field"] != "reference_images" || entry["requested"] != "3" || entry["used"] != "2" {
+		t.Errorf("adjustment = %v", entry)
+	}
+
+	got := referenceURLs(t, (*bodies)[0])
+	if len(got) != 2 {
+		t.Fatalf("references sent = %v, want two", got)
+	}
+	// The first two, not an arbitrary two: on a first/last pair the order is
+	// how the caller says which is which.
+	if got[0] != "https://example.test/first.png" || got[1] != "https://example.test/last.png" {
+		t.Errorf("references sent = %v, want the first two in order", got)
+	}
+}
+
+// H3.0 takes a reference set rather than a frame pair, so nothing is trimmed.
+// The cap is per model for the same reason the resolutions are.
+func TestVideoGenerationsKeepsEveryReferenceH3Accepts(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	rec := h.video(t, map[string]any{
+		"model": "minimax-h3", "prompt": "一只猫在弹钢琴",
+		"image_urls": []any{
+			"https://example.test/1.png",
+			"https://example.test/2.png",
+			"https://example.test/3.png",
+			"https://example.test/4.png",
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, adjusted := decodeJSON(t, rec)["adjusted"]; adjusted {
+		t.Error("H3.0 reported a trim it does not have")
+	}
+	if got := referenceURLs(t, (*bodies)[0]); len(got) != 4 {
+		t.Errorf("references sent = %v, want all four", got)
+	}
+}
+
+// The chat surface carries references as message content rather than as request
+// fields, and the cap has to apply there too — otherwise the same picture set
+// is trimmed on one endpoint and not on the other.
+func TestChatCompletionsCapsReferencesOnAVideoModel(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("已提交")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	content := []any{map[string]any{"type": "text", "text": "一只猫在弹钢琴"}}
+	for _, url := range []string{
+		"https://example.test/1.png",
+		"https://example.test/2.png",
+		"https://example.test/3.png",
+	} {
+		content = append(content, map[string]any{
+			"type": "image_url", "image_url": map[string]any{"url": url},
+		})
+	}
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-h3-max",
+		"messages": []any{map[string]any{"role": "user", "content": content}},
+	}, h.key)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := referenceURLs(t, (*bodies)[0]); len(got) != 2 {
+		t.Errorf("references sent = %v, want two", got)
+	}
+}
+
+// A reference the agent cannot fetch is refused, and the refusal says what
+// would work.
+//
+// A bare base64 payload is the mistake a client makes when it assumes these
+// endpoints follow the image-edit convention. Forwarding it produces an
+// upstream failure that names nothing and spends a turn; and because the value
+// is a whole picture, it must not be echoed into a message that lands in the
+// audit log.
+func TestGenerationRefusesAReferenceItCannotFetch(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/out.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	// One transparent pixel, as a client would send it.
+	const bare = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+	cases := []struct {
+		name string
+		call func(*testing.T, map[string]any) *httptest.ResponseRecorder
+	}{
+		{"images", h.image},
+		{"videos", h.video},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := tc.call(t, map[string]any{"prompt": "一只猫", "image_url": bare})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			message := rec.Body.String()
+			if !strings.Contains(message, "http(s) URL") {
+				t.Errorf("the refusal does not say what would work: %s", message)
+			}
+			if strings.Contains(message, bare) {
+				t.Errorf("the rejected payload was echoed back into a logged message: %s", message)
+			}
+		})
+	}
+
+	if len(*bodies) != 0 {
+		t.Errorf("a refused request still spent %d upstream turn(s)", len(*bodies))
+	}
+}
+
+// A data URI is accepted, because it is one of the two forms the agent can be
+// handed: it is written into the media directory and republished under the
+// public base URL. Without that base URL the request is refused rather than
+// forwarded to fail opaquely — the agent downloads attachments server-side and
+// cannot dereference a data: URI.
+func TestGenerationAcceptsAnInlineReferenceOnlyWithAPublicBaseURL(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/out.png")))
+	h.addAccount(t, "primary", "token-good", 10)
+	h.captureMessageBodies(t)
+
+	const inline = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+	rec := h.image(t, map[string]any{"prompt": "改成水彩", "image_url": inline})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "public base URL") {
+		t.Errorf("the refusal does not name the setting to fill in: %s", rec.Body.String())
+	}
+
+	h.settings.Media.PublicBaseURL = "https://gateway.test/media"
+	h.settings.Media.GeneratedDir = t.TempDir()
+	rec = h.image(t, map[string]any{"prompt": "改成水彩", "image_url": inline})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }

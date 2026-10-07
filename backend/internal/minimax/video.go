@@ -137,7 +137,7 @@ type VideoLimits struct {
 	Durations   []int
 }
 
-// VideoAdjustment records one parameter the gateway had to change.
+// Adjustment records one parameter the gateway had to change.
 //
 // It exists because the alternative to changing the value is failing the
 // request, and the alternative to both is changing it silently — which would
@@ -145,10 +145,29 @@ type VideoLimits struct {
 // resolution, different price) with nothing to say so. A caller that reads the
 // response learns what was actually generated; one that does not is no worse
 // off than before.
-type VideoAdjustment struct {
+//
+// The shape is deliberately generic — field, what was asked for, what was used
+// — because the generation parameters are not the only thing a request can get
+// wrong. A reference set trimmed to what the model accepts is the same kind of
+// fact and travels in the same list.
+type Adjustment struct {
 	Field     string `json:"field"`
 	Requested string `json:"requested"`
 	Used      string `json:"used"`
+}
+
+// ReferenceAdjustment reports a reference set trimmed to a model's cap.
+//
+// It lives here rather than in the gateway so that both generation endpoints
+// describe a trim the same way, and so the field name appears once: `adjusted`
+// is one list, and a caller filtering it by field should not have to know which
+// endpoint produced it.
+func ReferenceAdjustment(requested, used int) Adjustment {
+	return Adjustment{
+		Field:     "reference_images",
+		Requested: strconv.Itoa(requested),
+		Used:      strconv.Itoa(used),
+	}
 }
 
 // Conform repairs whatever the chosen model does not accept.
@@ -164,22 +183,22 @@ type VideoAdjustment struct {
 // measured on the axis' own scale — pixels for a resolution, the width/height
 // ratio for an aspect, seconds for a duration — and an unreadable value falls
 // back to the console default before falling back to the first entry.
-func (o VideoOptions) Conform(limits VideoLimits, fallback VideoOptions) (VideoOptions, []VideoAdjustment) {
+func (o VideoOptions) Conform(limits VideoLimits, fallback VideoOptions) (VideoOptions, []Adjustment) {
 	out := o
-	adjustments := make([]VideoAdjustment, 0, 3)
+	adjustments := make([]Adjustment, 0, 3)
 
 	if value, changed := conformValue(limits.Ratios, out.Ratio, fallback.Ratio, ratioRank); changed {
-		adjustments = append(adjustments, VideoAdjustment{Field: "ratio", Requested: out.Ratio, Used: value})
+		adjustments = append(adjustments, Adjustment{Field: "ratio", Requested: out.Ratio, Used: value})
 		out.Ratio = value
 	}
 	if value, changed := conformValue(limits.Resolutions, out.Resolution, fallback.Resolution, resolutionRank); changed {
-		adjustments = append(adjustments, VideoAdjustment{
+		adjustments = append(adjustments, Adjustment{
 			Field: "resolution", Requested: out.Resolution, Used: value,
 		})
 		out.Resolution = value
 	}
 	if value, changed := conformDuration(limits.Durations, out.Duration); changed {
-		adjustments = append(adjustments, VideoAdjustment{
+		adjustments = append(adjustments, Adjustment{
 			Field: "duration", Requested: strconv.Itoa(out.Duration), Used: strconv.Itoa(value),
 		})
 		out.Duration = value

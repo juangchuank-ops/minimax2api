@@ -22,6 +22,11 @@ export type ModelDTO = {
   ratios?: string[];
   resolutions?: string[];
   durations?: number[];
+  // How many reference pictures the model accepts. Absent or zero means the
+  // gateway enforces nothing — either because the model takes any number or
+  // because its limit has not been read, and the console does not pretend to
+  // tell those apart.
+  maxReferences?: number;
   enabled: boolean;
   builtin: boolean;
   description: string;

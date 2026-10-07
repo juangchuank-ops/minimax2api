@@ -164,6 +164,13 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The same cap the video endpoint enforces, applied where the pictures
+	// arrive as message content rather than as request fields. A chat turn has
+	// nowhere to report a trim — its answer is the agent's own prose — so this
+	// one happens silently; VideoGenerations reports the identical trim.
+	if keep, _ := referenceLimit(model, len(images)); keep < len(images) {
+		images = images[:keep]
+	}
 	if prompt == "" && len(images) == 0 && len(files) == 0 {
 		writeError(out, http.StatusBadRequest, "messages must contain text, image or file content")
 		return
@@ -568,7 +575,21 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 // public base URL is configured the request is rejected with an actionable
 // message rather than being forwarded to fail opaquely upstream.
 func (g *Gateway) resolveImage(raw string) (minimax.UploadedImage, error) {
+	raw = strings.TrimSpace(raw)
 	if !strings.HasPrefix(raw, "data:") {
+		// Anything that is not a data URI has to be a URL the agent can fetch
+		// itself. Without this the fallthrough is a *value* that looks fine
+		// here and fails upstream naming nothing — and the value it happens to
+		// is a bare base64 payload, which is what a client sends when it
+		// assumes these endpoints follow the image-edit convention.
+		//
+		// The value is quoted to 60 characters because a base64 payload is
+		// megabytes long and this string reaches the audit log.
+		if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+			return minimax.UploadedImage{}, fmt.Errorf(
+				"reference image must be an http(s) URL or a data: URI — the agent downloads references server-side, so a bare base64 payload or a local path cannot work (got %.60q)",
+				raw)
+		}
 		return minimax.UploadedImage{URL: raw, Name: imageName(raw)}, nil
 	}
 
@@ -598,6 +619,77 @@ func (g *Gateway) resolveImage(raw string) (minimax.UploadedImage, error) {
 		URL:  strings.TrimRight(settings.Media.PublicBaseURL, "/") + "/" + name,
 		Name: name,
 	}, nil
+}
+
+// referenceRequest is the reference-picture fields a generation request may
+// carry, in every spelling the gateway accepts.
+//
+// Three names for one idea, because nothing standard covers it: `image_url` is
+// what this gateway's video endpoint has always taken, `image_urls` is its
+// plural, and `image` is the field OpenAI's own image-edit surface uses — which
+// is what a client that already has one of these wired up will send.
+//
+// They are additive rather than mutually exclusive. A request that fills in two
+// of them is asking for the union, and silently dropping one of a caller's
+// pictures because it arrived under the other name is the kind of help nobody
+// wants.
+type referenceRequest struct {
+	Image     string   `json:"image"`
+	ImageURL  string   `json:"image_url"`
+	ImageURLs []string `json:"image_urls"`
+}
+
+// collect flattens the spellings into one ordered list.
+func (r referenceRequest) collect() []string {
+	out := make([]string, 0, len(r.ImageURLs)+2)
+	for _, raw := range append([]string{r.Image, r.ImageURL}, r.ImageURLs...) {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// resolveReferences turns the reference fields into turn attachments.
+//
+// It is the only path from a request field to a reference picture, so that the
+// two generation endpoints cannot drift apart on what they accept or on how
+// many they keep.
+func (g *Gateway) resolveReferences(model *store.ModelConfig, request referenceRequest) ([]minimax.UploadedImage, []minimax.Adjustment, error) {
+	raw := request.collect()
+	keep, adjustments := referenceLimit(model, len(raw))
+	raw = raw[:keep]
+	images := make([]minimax.UploadedImage, 0, len(raw))
+	for _, reference := range raw {
+		image, err := g.resolveImage(reference)
+		if err != nil {
+			return nil, nil, err
+		}
+		images = append(images, image)
+	}
+	return images, adjustments, nil
+}
+
+// referenceLimit reports how many references to keep, and whether that is fewer
+// than were sent.
+//
+// It returns a count rather than a trimmed slice because the two callers hold
+// different things — one has the request fields, the other has already resolved
+// attachments — and the count is the part that has to agree. It is also the
+// part that gets reported: "asked for 5, used 2" is the fact, and it is gone
+// once the list is trimmed.
+//
+// A picture beyond the cap does not degrade the turn, it stops it: the plugin
+// answers an attachment it has nowhere to put by asking the caller which one
+// they meant, and an API call has nobody to answer. Keeping the first N is the
+// right half to keep for the one model that has a cap — H3-Max animates a first
+// and a last frame, and the caller decides which is which by the order they
+// send them.
+func referenceLimit(model *store.ModelConfig, count int) (int, []minimax.Adjustment) {
+	if cap := model.MaxReferences; cap > 0 && count > cap {
+		return cap, []minimax.Adjustment{minimax.ReferenceAdjustment(count, cap)}
+	}
+	return count, nil
 }
 
 // imageName derives a filename from a URL, falling back to a stable default.
@@ -672,6 +764,11 @@ type imageRequest struct {
 	N              int    `json:"n"`
 	ResponseFormat string `json:"response_format"`
 	Model          string `json:"model"`
+	// The reference pictures, in every spelling the gateway accepts. This is
+	// what makes an image turn an edit: the pictures ride along as attachments
+	// and the agent reads them, so "生成" and "参考这张改" are the same request
+	// with and without them.
+	referenceRequest
 }
 
 // imageModel returns the catalogue entry image generation runs under.
@@ -922,8 +1019,14 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	images, adjustments, err := g.resolveReferences(model, request.referenceRequest)
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	settings := g.settings()
-	result, accountName, err := g.runImageTurn(r.Context(), request.Prompt, nil)
+	result, accountName, err := g.runImageTurn(r.Context(), request.Prompt, images)
 	if err != nil {
 		g.recordAudit(r, key, model, accountName, started, upstreamStatus(err), 0, 0, 0, false, 0, string(body), "", err.Error())
 		writeError(out, upstreamStatus(err), err.Error())
@@ -950,6 +1053,12 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	g.store.RecordModelUsage(model.ID, 1, 0)
 	g.store.BumpClientKeyUsage(key.ID)
 	response := map[string]any{"created": time.Now().Unix(), "data": items}
+	// Same contract as the video endpoint: the key is absent when nothing was
+	// changed, and present only when the gateway did something the caller did
+	// not ask for.
+	if len(adjustments) > 0 {
+		response["adjusted"] = adjustments
+	}
 	raw, _ := json.Marshal(response)
 	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
 
@@ -974,10 +1083,10 @@ type videoRequest struct {
 	Duration   int    `json:"duration"`
 	Ratio      string `json:"ratio"`
 	Resolution string `json:"resolution"`
-	// ImageURL is the first frame for image-to-video, and ImageURLs carries a
-	// multi-reference set for the models that accept one.
-	ImageURL  string   `json:"image_url"`
-	ImageURLs []string `json:"image_urls"`
+	// Reference frames: a first/last pair on H3-Max, a multi-reference set on
+	// H3.0. Embedded rather than spelled out again, so the two generation
+	// endpoints cannot disagree about what they accept.
+	referenceRequest
 }
 
 // VideoGenerations implements POST /v1/videos/generations.
@@ -1051,18 +1160,16 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	// Reference frames ride along as ordinary attachments; the plugin reads them
 	// from the turn rather than from the options block, which only carries the
 	// four generation parameters.
-	images := make([]minimax.UploadedImage, 0, len(request.ImageURLs)+1)
-	for _, raw := range append([]string{request.ImageURL}, request.ImageURLs...) {
-		if strings.TrimSpace(raw) == "" {
-			continue
-		}
-		image, err := g.resolveImage(raw)
-		if err != nil {
-			writeError(out, http.StatusBadRequest, err.Error())
-			return
-		}
-		images = append(images, image)
+	images, referenceAdjustments, err := g.resolveReferences(model, request.referenceRequest)
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
 	}
+	// One list, not two: a caller filtering `adjusted` by field should not have
+	// to know which part of the request produced the entry. References go first
+	// because they are what the caller notices — a trimmed set changes the
+	// picture, a repaired resolution changes its size.
+	adjustments = append(referenceAdjustments, adjustments...)
 
 	prompt := g.outgoingText(settings, model, request.Prompt, options)
 

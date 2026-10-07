@@ -10,12 +10,18 @@ a body.
 It never talks to the real upstream. Point it at an instance whose
 `upstream.baseURL` is `tools/stub_upstream.py` and no credit is spent.
 
+Pass `--log` with the stub's own log file and the reference-picture checks read
+back what upstream actually received, rather than trusting the response to
+describe itself.
+
 Usage:
-    python tools/video_matrix.py --base http://127.0.0.1:18099 --password admin12345
+    python tools/video_matrix.py --base http://127.0.0.1:18099 --password admin12345 \
+        --log /tmp/turns.jsonl
 """
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -63,6 +69,14 @@ def check(label, ok, detail=""):
         FAILURES.append(f"{label} {detail}")
 
 
+def read_turns(log_path):
+    """Every turn the stub saw, as {options, references}."""
+    if not log_path or not os.path.exists(log_path):
+        return []
+    with open(log_path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
 def login(base, password):
     status, payload = call(base, "/admin/api/auth/login", "POST",
                            {"username": "admin", "password": password})
@@ -75,6 +89,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:18099")
     parser.add_argument("--password", default="admin12345")
+    parser.add_argument("--log", default="", help="the stub's --log file, to check what upstream received")
     args = parser.parse_args()
     base = args.base.rstrip("/")
 
@@ -182,6 +197,76 @@ def main():
           status == 200 and params.get("ratio") == "5:4" and params.get("resolution") == "1080P"
           and params.get("duration") == 25 and "adjusted" not in payload,
           f"status={status} params={params} adjusted={payload.get('adjusted')}")
+
+    print("\n6. reference pictures")
+    before = len(read_turns(args.log))
+
+    status, payload = call(base, "/v1/images/generations", "POST",
+                           {"prompt": "改成水彩", "image_url": "https://example.test/a.png"}, key)
+    check("image: one image_url is accepted and nothing is reported as adjusted",
+          status == 200 and "adjusted" not in payload, f"status={status} {payload}")
+
+    status, payload = call(base, "/v1/images/generations", "POST", {
+        "prompt": "把这四张合成一张",
+        "image": "https://example.test/1.png",
+        "image_url": "https://example.test/2.png",
+        "image_urls": ["https://example.test/3.png", "https://example.test/4.png"],
+    }, key)
+    check("image: every spelling is additive", status == 200, f"status={status} {payload}")
+
+    status, payload = call(base, "/v1/videos/generations", "POST", {
+        "model": "minimax-h3-max", "prompt": "镜头缓慢推近",
+        "ratio": "16:9", "resolution": "768P", "duration": 8,
+        "image_urls": ["https://example.test/first.png", "https://example.test/last.png",
+                       "https://example.test/spare.png"],
+    }, key)
+    adjusted = payload.get("adjusted") or []
+    check("video: h3-max trims a third reference and says so",
+          status == 200 and {"field": "reference_images", "requested": "3", "used": "2"} in adjusted,
+          f"status={status} adjusted={adjusted}")
+
+    status, payload = call(base, "/v1/videos/generations", "POST", {
+        "model": "minimax-h3", "prompt": "镜头缓慢推近",
+        "ratio": "16:9", "resolution": "768P", "duration": 8,
+        "image_urls": ["https://example.test/1.png", "https://example.test/2.png",
+                       "https://example.test/3.png"],
+    }, key)
+    check("video: h3 keeps every reference it was given",
+          status == 200 and "adjusted" not in payload, f"status={status} {payload}")
+
+    # One transparent pixel, as a client sends it when it assumes the
+    # image-edit convention.
+    bare = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
+            "AAAABJRU5ErkJggg==")
+    for path, label in (("/v1/images/generations", "image"), ("/v1/videos/generations", "video")):
+        body = {"prompt": "一只猫", "image_url": bare}
+        if label == "video":
+            body.update({"model": "minimax-h3-max", "ratio": "16:9", "resolution": "768P", "duration": 8})
+        status, payload = call(base, path, "POST", body, key)
+        message = json.dumps(payload, ensure_ascii=False)
+        check(f"{label}: a bare base64 reference is refused with something actionable",
+              status == 400 and "http(s) URL" in message and bare not in message,
+              f"status={status} {message[:160]}")
+
+    status, payload = call(base, "/v1/images/generations", "POST",
+                           {"prompt": "改成水彩", "image_url": "data:image/png;base64," + bare}, key)
+    check("image: an inline reference names the setting it needs",
+          status == 400 and "public base URL" in json.dumps(payload),
+          f"status={status} {json.dumps(payload, ensure_ascii=False)[:160]}")
+
+    # The response says what the gateway decided; the stub says what it did.
+    want = [
+        ["https://example.test/a.png"],
+        ["https://example.test/1.png", "https://example.test/2.png",
+         "https://example.test/3.png", "https://example.test/4.png"],
+        ["https://example.test/first.png", "https://example.test/last.png"],
+        ["https://example.test/1.png", "https://example.test/2.png", "https://example.test/3.png"],
+    ]
+    turns = read_turns(args.log)[before:]
+    got = [turn["references"] for turn in turns]
+    check(f"upstream received exactly the {sum(len(item) for item in want)} references across four turns",
+          got == want, json.dumps(got, ensure_ascii=False))
+    check("no refused request reached upstream", len(turns) == len(want), f"{len(turns)} turns")
 
     print()
     if FAILURES:

@@ -297,10 +297,17 @@ type ModelConfig struct {
 	Ratios      []string `json:"ratios,omitempty"`
 	Resolutions []string `json:"resolutions,omitempty"`
 	Durations   []int    `json:"durations,omitempty"`
-	Type        string   `json:"type"`
-	Enabled     bool     `json:"enabled"`
-	Builtin     bool     `json:"builtin"`
-	Description string   `json:"description"`
+	// MaxReferences caps how many reference pictures a request may attach.
+	//
+	// Zero means unconstrained, which covers two different situations on
+	// purpose: a model that takes any number, and a model whose limit has not
+	// been read. Both are "the gateway will not refuse anything here", and that
+	// is the only thing this field decides.
+	MaxReferences int    `json:"maxReferences,omitempty"`
+	Type          string `json:"type"`
+	Enabled       bool   `json:"enabled"`
+	Builtin       bool   `json:"builtin"`
+	Description   string `json:"description"`
 	Requests      int64  `json:"requests"`
 	Tokens        int64  `json:"tokens"`
 }
@@ -379,6 +386,11 @@ func BuiltinModels() []*ModelConfig {
 			ID: "minimax-h3-max", Name: "MiniMax H3 Max", Upstream: "video", UpstreamModel: "MiniMax-H3-Max",
 			Type: ModelTypeVideo, Enabled: true, Builtin: true,
 			Ratios: videoRatios(), Resolutions: []string{"480P", "768P"}, Durations: videoDurations(),
+			// Two, because this variant animates a first and a last frame
+			// rather than taking a reference set. A third picture has nowhere
+			// to go, and the plugin's answer to a parameter it cannot use is to
+			// ask the caller which one they meant — nobody can answer.
+			MaxReferences: 2,
 			// The resolutions and durations used to be spelled out here. They
 			// are structured fields now, and a fact stated twice is a fact that
 			// will disagree with itself eventually — the console renders the
@@ -427,8 +439,9 @@ func videoDurations() []int {
 // Entries already present are left exactly as stored. Only the *existence* of a
 // built-in is enforced, never its state — with one deliberate exception: fields
 // the stored copy is missing are adopted from the built-in. Those are the
-// upstream model id and the three generation ranges, and the argument is the
-// same for all four: the console's model editor writes `enabled`, `name` and
+// upstream model id, the three generation ranges and the reference cap, and the
+// argument is the same for all of them: the console's model editor writes
+// `enabled`, `name` and
 // `description` and nothing else, so an empty value on a built-in entry can
 // never be the operator's intent — it is always the freeze of a default from
 // before that entry carried the field. The same argument repairs settings in
@@ -473,6 +486,14 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 		}
 		if len(model.Durations) == 0 && len(builtin.Durations) > 0 {
 			model.Durations = builtin.Durations
+			changed = true
+		}
+		// Zero is a legitimate value here — "unconstrained" — so this cannot
+		// distinguish an operator's deliberate zero from a stale one. It does
+		// not have to: the console cannot write the field at all, and the
+		// adoption only ever installs a cap the built-in already declares.
+		if model.MaxReferences == 0 && builtin.MaxReferences > 0 {
+			model.MaxReferences = builtin.MaxReferences
 			changed = true
 		}
 	}

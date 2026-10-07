@@ -316,6 +316,8 @@ const zhCN = {
     ratios: "画幅",
     durations: "时长",
     seconds: "秒",
+    references: "参考图",
+    referenceLimit: "最多 {{count}} 张",
   },
   audits: {
     title: "请求审计",
@@ -540,7 +542,11 @@ const zhCN = {
     chatDescription:
       "OpenAI 兼容的对话接口，支持流式输出、视觉输入与推理内容。图像模型也从这里进：客户端只拿得到模型 id，看不出它是不是图像模型，所以生成的图片会以 Markdown 图片形式回在正文里。",
     imageGenerations: "图像生成",
-    imageDescription: "图像生成。上游是 Agent 轮次里的一次工具调用，返回几张由 Agent 决定，不是固定值。",
+    imageDescription:
+      "图像生成。上游是 Agent 轮次里的一次工具调用，返回几张由 Agent 决定，不是固定值。带上参考图就是改图——同一轮次，多了几张附件。",
+    videoGenerations: "视频生成",
+    videoDescription:
+      "视频生成。慢模型（h3 / hailuo-2-3）等不到成品，会返回 status: pending 与 Agent 的原话；能同步拿到 mp4 的是 h3-max。",
     health: "健康检查",
     healthDescription: "返回服务状态与号池概况。",
     stream: "流式",
@@ -554,6 +560,14 @@ const zhCN = {
     noteN: "期望数量。实际返回几张由 Agent 决定，不保证等于这个值，也不保证一定有图片",
     noteSize: "透传字段，上游由模型决定",
     noteResponseFormat: "url（默认）或 b64_json",
+    noteImageURL: "参考图的公网 URL 或 data URI。带上它这一轮就从「生成」变成「照着这张改」",
+    noteImageURLs: "参考图数组，与 image_url 叠加使用",
+    noteImageAlias: "image_url 的别名，OpenAI 图像编辑接口用的就是这个名字，两者可以同时给",
+    noteVideoModel: "minimax-h3-max（默认，能同步返回）、minimax-h3、minimax-hailuo-2-3",
+    noteRatio: "画幅，如 16:9 / 9:16 / 1:1",
+    noteResolution: "分辨率。h3-max 是 480P/768P，h3 是 768P/2K；超出范围会改到最近的一档",
+    noteDuration: "时长（整秒），两个 h3 都是 5-15 秒",
+    noteVideoReferences: "参考帧的公网 URL 或 data URI。h3-max 只收首/尾两帧，多给的会被截断并在 adjusted 里说明",
     filesUpload: "文件上传",
     filesDescription:
       "OpenAI Files 兼容的文件上传：multipart 传文件，返回 file_id。对话里用 file 块的 file_id 引用它（或直接内联 file_data），网关会在对话轮次内用当轮账号的凭证把文件推到上游的对象存储，再以 object_key 挂进消息。单文件上限 100MB。",
@@ -883,6 +897,8 @@ const en: typeof zhCN = {
     ratios: "Ratios",
     durations: "Durations",
     seconds: "s",
+    references: "References",
+    referenceLimit: "up to {{count}}",
   },
   audits: {
     title: "Request audits",
@@ -1109,7 +1125,10 @@ const en: typeof zhCN = {
       "OpenAI-compatible chat endpoint with streaming, vision input and reasoning content. Image models are reached here too: a client only sees the model id and cannot tell that it is an image model, so the generated pictures come back as Markdown in the message body.",
     imageGenerations: "Image generations",
     imageDescription:
-      "Image generation. Upstream this is a tool call inside an agent turn, so how many pictures come back is the agent's decision rather than a fixed number.",
+      "Image generation. Upstream this is a tool call inside an agent turn, so how many pictures come back is the agent's decision rather than a fixed number. Add a reference picture and it becomes an edit — the same turn, with attachments.",
+    videoGenerations: "Video generations",
+    videoDescription:
+      "Video generation. The slow models (h3 / hailuo-2-3) outlive any HTTP response and come back with status: pending plus the agent's own words; h3-max is the one that returns an mp4 in the same turn.",
     health: "Health check",
     healthDescription: "Returns service status and pool summary.",
     stream: "Streaming",
@@ -1124,6 +1143,14 @@ const en: typeof zhCN = {
       "How many are wanted. The agent decides what actually comes back, so this is not guaranteed — neither the count nor that anything comes back at all",
     noteSize: "Passed through; the model decides",
     noteResponseFormat: "url (default) or b64_json",
+    noteImageURL: "A public URL or data URI for a reference picture. With one, the turn stops being \"generate\" and becomes \"rework this\"",
+    noteImageURLs: "An array of references; additive with image_url",
+    noteImageAlias: "An alias of image_url — the name OpenAI's image-edit endpoint uses. Both may be sent",
+    noteVideoModel: "minimax-h3-max (default, the one that answers synchronously), minimax-h3, minimax-hailuo-2-3",
+    noteRatio: "Aspect ratio, e.g. 16:9 / 9:16 / 1:1",
+    noteResolution: "Resolution. h3-max offers 480P/768P and h3 offers 768P/2K; a value outside the range moves to the nearest one",
+    noteDuration: "Length in whole seconds; 5-15 on both h3 variants",
+    noteVideoReferences: "Public URLs or data URIs for reference frames. h3-max takes a first and a last frame only — extras are trimmed and reported in adjusted",
     filesUpload: "File upload",
     filesDescription:
       "OpenAI Files-compatible upload: send a multipart form, get a file_id. Reference it from chat via a file block's file_id (or inline file_data); inside the chat turn the gateway pushes the bytes to the upstream object store with that turn's account credential and attaches them by object_key. 100MB per file.",

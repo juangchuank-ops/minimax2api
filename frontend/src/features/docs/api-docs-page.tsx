@@ -88,6 +88,15 @@ data: [DONE]`,
   -d '{
     "prompt": "一只在花园里散步的猫，写实风格",
     "n": 4
+  }'
+
+# 带参考图（改图），参考图可以是公网 URL 或 data URI：
+curl http://127.0.0.1:8080/v1/images/generations \\
+  -H "Authorization: Bearer sk-mm-xxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "prompt": "把这幅画改成水彩风格",
+    "image_url": "https://example.com/painting.png"
   }'`,
     response: `{
   "created": 1758000000,
@@ -100,6 +109,63 @@ data: [DONE]`,
       { name: "n", type: "number", noteKey: "docs.noteN" },
       { name: "size", type: "string", noteKey: "docs.noteSize" },
       { name: "response_format", type: "string", noteKey: "docs.noteResponseFormat" },
+      { name: "image_url", type: "string", noteKey: "docs.noteImageURL" },
+      { name: "image_urls", type: "string[]", noteKey: "docs.noteImageURLs" },
+      { name: "image", type: "string", noteKey: "docs.noteImageAlias" },
+    ],
+  },
+  {
+    category: "video",
+    endpoint: "generations",
+    method: "POST",
+    path: "/v1/videos/generations",
+    titleKey: "docs.videoGenerations",
+    descriptionKey: "docs.videoDescription",
+    request: `curl http://127.0.0.1:8080/v1/videos/generations \\
+  -H "Authorization: Bearer sk-mm-xxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "minimax-h3-max",
+    "prompt": "一只猫在弹钢琴，镜头缓慢推近",
+    "ratio": "16:9", "resolution": "768P", "duration": 8
+  }'
+
+# 带参考帧（首帧 / 尾帧）：
+curl http://127.0.0.1:8080/v1/videos/generations \\
+  -H "Authorization: Bearer sk-mm-xxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "minimax-h3-max",
+    "prompt": "镜头缓慢推近",
+    "ratio": "16:9", "resolution": "768P", "duration": 8,
+    "image_urls": ["https://example.com/first.png", "https://example.com/last.png"]
+  }'`,
+    response: `{
+  "created": 1758000000,
+  "model": "minimax-h3-max",
+  "data": [ { "url": "http://127.0.0.1:8080/media/gen_xxx.mp4", "source_url": "https://..." } ],
+  "status": "succeeded",
+  "params": { "model": "MiniMax-H3-Max", "ratio": "16:9", "resolution": "768P", "duration": 8 }
+}
+
+// 参数被改过时多一个 adjusted（这里：给了三张参考图，h3-max 只收两张）
+{
+  "created": 1758000000,
+  "model": "minimax-h3-max",
+  "data": [],
+  "status": "pending",
+  "params": { "model": "MiniMax-H3-Max", "ratio": "16:9", "resolution": "768P", "duration": 8 },
+  "adjusted": [ { "field": "reference_images", "requested": "3", "used": "2" } ]
+}`,
+    parameters: [
+      { name: "model", type: "string", noteKey: "docs.noteVideoModel" },
+      { name: "prompt", type: "string", required: true, noteKey: "docs.notePrompt" },
+      { name: "ratio", type: "string", noteKey: "docs.noteRatio" },
+      { name: "resolution", type: "string", noteKey: "docs.noteResolution" },
+      { name: "duration", type: "number", noteKey: "docs.noteDuration" },
+      { name: "image_url", type: "string", noteKey: "docs.noteImageURL" },
+      { name: "image_urls", type: "string[]", noteKey: "docs.noteVideoReferences" },
+      { name: "image", type: "string", noteKey: "docs.noteImageAlias" },
     ],
   },
   {

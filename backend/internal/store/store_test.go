@@ -568,6 +568,42 @@ func TestMergeBuiltinModelsBackfillsVideoRanges(t *testing.T) {
 	}
 }
 
+// The reference cap reaches existing installs the same way the ranges do, and
+// it has the same trap: zero means "unconstrained", so a missing cap has no
+// symptom on this side at all. The gateway simply stops trimming, every request
+// still succeeds, and the party that notices is the upstream — which answers a
+// picture it has nowhere to put by asking the caller to choose.
+func TestMergeBuiltinModelsBackfillsTheReferenceCap(t *testing.T) {
+	stored := BuiltinModels()
+	for _, model := range stored {
+		model.MaxReferences = 0
+	}
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("a catalogue stripped of its caps should report a change")
+	}
+
+	modelByID := func(id string) *ModelConfig {
+		for _, model := range merged {
+			if model.ID == id {
+				return model
+			}
+		}
+		return nil
+	}
+	if got := modelByID("minimax-h3-max"); got == nil || got.MaxReferences != 2 {
+		t.Errorf("H3-Max cap = %v, want 2 (a first and a last frame)", got)
+	}
+	// Zero is a real value, not a gap: H3.0 takes a reference set rather than a
+	// frame pair, and Hailuo's panel has not been read. Neither may be given a
+	// cap borrowed from the model next to it.
+	for _, id := range []string{"minimax-h3", "minimax-hailuo-2-3"} {
+		if got := modelByID(id); got == nil || got.MaxReferences != 0 {
+			t.Errorf("%s cap = %v, want 0 (uncapped)", id, got)
+		}
+	}
+}
+
 // The two H3 variants differ in resolution and agree on everything else. That
 // difference is the whole reason the ranges are per model rather than global,
 // so it is pinned here: a request that is valid on one and not the other is the

@@ -7,11 +7,13 @@ produces nothing (see UPSTREAM.md). That makes the real service useless as a
 target for testing *this* gateway, whose job is to phrase the turn correctly.
 
 So this stands in for it. It answers the two calls the adapter makes — a session
-handshake and the message stream — and records every options block it is sent,
-which is the thing under test.
+handshake and the message stream — and writes one record per turn: the
+`<video-generation-options>` block it was sent, and the reference pictures the
+turn carried. Those two are what the gateway decides, and they are the thing
+under test.
 
 Usage:
-    python tools/stub_upstream.py [--port 18081] [--log /tmp/blocks.jsonl]
+    python tools/stub_upstream.py [--port 18081] [--log /tmp/turns.jsonl]
 """
 
 import argparse
@@ -74,17 +76,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.endswith("/message"):
             try:
-                content = json.loads(raw).get("content", "")
-            except (ValueError, AttributeError):
-                content = ""
+                payload = json.loads(raw)
+            except ValueError:
+                payload = {}
+            content = payload.get("content", "")
             match = OPTIONS.search(content)
             self._note(f"     block={'found' if match else 'MISSING'} content={content[-160:]!r}")
-            if match:
-                with Handler.lock:
-                    Handler.blocks.append(match.group(1))
-                    if Handler.log_path:
-                        with open(Handler.log_path, "a", encoding="utf-8") as handle:
-                            handle.write(match.group(1) + "\n")
+
+            # One record per turn: the generation parameters and the pictures
+            # the turn actually carried. The second half is what makes a
+            # reference-image test mean anything — the response says what the
+            # gateway decided, this says what it did.
+            record = {
+                "options": json.loads(match.group(1)) if match else None,
+                "references": [
+                    item.get("url")
+                    for item in payload.get("attachments") or []
+                    if item.get("type") == "image"
+                ],
+            }
+            with Handler.lock:
+                Handler.blocks.append(record)
+                if Handler.log_path:
+                    with open(Handler.log_path, "a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             # A media frame, so the gateway's media merge path is exercised too.
             self._sse([
                 {"type": 6, "agent_message_chunk": {"msg_content": "已提交"},
