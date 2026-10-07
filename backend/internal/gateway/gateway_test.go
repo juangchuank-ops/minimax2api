@@ -1330,3 +1330,258 @@ func TestVideoGenerationsSurvivesADriveThatDoesNotAnswer(t *testing.T) {
 	}
 }
 
+
+// ------------------------------------------------------------------ ranges
+
+// videoMatrix is every combination the two H3 variants advertise, as the model
+// picker shows them.
+var videoMatrix = []struct {
+	id          string
+	upstream    string
+	resolutions []string
+}{
+	{"minimax-h3-max", "MiniMax-H3-Max", []string{"480P", "768P"}},
+	{"minimax-h3", "MiniMax-H3", []string{"768P", "2K"}},
+}
+
+var videoMatrixRatios = []string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+
+// The whole advertised matrix, driven through the endpoint.
+//
+// This is 264 turns - 11 durations by 6 ratios by 2 resolutions, for each of
+// the two models - and it is worth all of them, because "supported" is a claim
+// and the endpoint is where a caller finds out it was wrong. A rejection here
+// is what turns into a support ticket, and it would look like a broken gateway
+// rather than a bad parameter: the caller asked for something the model's own
+// panel offers.
+func TestVideoGenerationsAcceptsEveryAdvertisedCombination(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	turns := 0
+	for _, model := range videoMatrix {
+		for _, ratio := range videoMatrixRatios {
+			for _, resolution := range model.resolutions {
+				for duration := 5; duration <= 15; duration++ {
+					turns++
+					rec := h.video(t, map[string]any{
+						"model": model.id, "prompt": "一只猫在弹钢琴",
+						"ratio": ratio, "resolution": resolution, "duration": duration,
+					})
+					if rec.Code != http.StatusOK {
+						t.Fatalf("%s %s %s %ds: status = %d, body = %s",
+							model.id, ratio, resolution, duration, rec.Code, rec.Body.String())
+					}
+
+					payload := decodeJSON(t, rec)
+					if adjusted, ok := payload["adjusted"]; ok {
+						t.Errorf("%s %s %s %ds was repaired: %v",
+							model.id, ratio, resolution, duration, adjusted)
+					}
+					params, _ := payload["params"].(map[string]any)
+					if params == nil {
+						t.Fatalf("%s %s %s %ds: the response carries no params",
+							model.id, ratio, resolution, duration)
+					}
+					for field, want := range map[string]any{
+						"model": model.upstream, "ratio": ratio,
+						"resolution": resolution, "duration": float64(duration),
+					} {
+						if params[field] != want {
+							t.Errorf("%s %s %s %ds: params[%s] = %v, want %v",
+								model.id, ratio, resolution, duration, field, params[field], want)
+						}
+					}
+
+					// The response is the gateway's account of itself; the turn
+					// text is what upstream actually receives. Both have to say
+					// the same thing.
+					if len(*seen) != turns {
+						t.Fatalf("expected %d upstream turns, got %d", turns, len(*seen))
+					}
+					text := (*seen)[turns-1]
+					for _, want := range []string{
+						`"duration":` + strconv.Itoa(duration),
+						`"ratio":"` + ratio + `"`,
+						`"resolution":"` + resolution + `"`,
+						`"model":"` + model.upstream + `"`,
+					} {
+						if !strings.Contains(text, want) {
+							t.Errorf("%s %s %s %ds: options block is missing %s:/n%s",
+								model.id, ratio, resolution, duration, want, text)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if want := len(videoMatrix) * len(videoMatrixRatios) * 2 * 11; turns != want {
+		t.Errorf("covered %d combinations, want %d", turns, want)
+	}
+}
+
+// A value outside the model's range is repaired, reported, and never reaches
+// upstream as asked.
+//
+// All three matter. Rejecting it would fail a request over a parameter the
+// caller cannot look up anywhere in this API; repairing it silently would hand
+// back a video that is not the one that was ordered, at a price the caller did
+// not agree to; and repairing it without repairing the outgoing text would mean
+// the response and the turn disagree.
+func TestVideoGenerationsRepairsAValueTheModelDoesNotOffer(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	// 2K and 30s are both outside what H3-Max offers; 16:9 is inside it and has
+	// to be left alone.
+	rec := h.video(t, map[string]any{
+		"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴",
+		"ratio": "16:9", "resolution": "2K", "duration": 30,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	payload := decodeJSON(t, rec)
+	params, _ := payload["params"].(map[string]any)
+	if params["resolution"] != "768P" {
+		t.Errorf("resolution = %v, want the nearest offered value 768P", params["resolution"])
+	}
+	if params["duration"] != float64(15) {
+		t.Errorf("duration = %v, want the nearest offered value 15", params["duration"])
+	}
+	if params["ratio"] != "16:9" {
+		t.Errorf("an accepted ratio was changed: %v", params["ratio"])
+	}
+
+	adjusted, _ := payload["adjusted"].([]any)
+	if len(adjusted) != 2 {
+		t.Fatalf("adjusted = %v, want the two repaired fields", payload["adjusted"])
+	}
+	reported := map[string][2]string{}
+	for _, item := range adjusted {
+		entry, _ := item.(map[string]any)
+		field, _ := entry["field"].(string)
+		requested, _ := entry["requested"].(string)
+		used, _ := entry["used"].(string)
+		reported[field] = [2]string{requested, used}
+	}
+	if reported["resolution"] != [2]string{"2K", "768P"} {
+		t.Errorf("resolution adjustment = %v", reported["resolution"])
+	}
+	if reported["duration"] != [2]string{"30", "15"} {
+		t.Errorf("duration adjustment = %v", reported["duration"])
+	}
+
+	if len(*seen) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*seen))
+	}
+	text := (*seen)[0]
+	if strings.Contains(text, `"resolution":"2K"`) {
+		t.Errorf("the unsupported resolution reached upstream:/n%s", text)
+	}
+	if strings.Contains(text, `"duration":30`) {
+		t.Errorf("the unsupported duration reached upstream:/n%s", text)
+	}
+	for _, want := range []string{`"resolution":"768P"`, `"duration":15`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the repaired value is missing %s:/n%s", want, text)
+		}
+	}
+}
+
+// The two models disagree about resolution, so the same request is accepted on
+// one and repaired on the other. That asymmetry is the reason the ranges live
+// on the model rather than in the settings: a global default cannot be right
+// for both.
+func TestVideoGenerationsRepairsDifferentlyPerModel(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	h.captureMessages(t)
+
+	// 480P is H3-Max's floor and below H3.0's: accepted by one, moved by the
+	// other.
+	accepted := decodeJSON(t, h.video(t, map[string]any{
+		"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴",
+		"ratio": "16:9", "resolution": "480P", "duration": 5,
+	}))
+	if _, ok := accepted["adjusted"]; ok {
+		t.Errorf("H3-Max repaired 480P, which it offers: %v", accepted["adjusted"])
+	}
+
+	repaired := decodeJSON(t, h.video(t, map[string]any{
+		"model": "minimax-h3", "prompt": "一只猫在弹钢琴",
+		"ratio": "16:9", "resolution": "480P", "duration": 5,
+	}))
+	params, _ := repaired["params"].(map[string]any)
+	if params["resolution"] != "768P" {
+		t.Errorf("H3.0 resolution = %v, want 768P", params["resolution"])
+	}
+	if _, ok := repaired["adjusted"]; !ok {
+		t.Error("H3.0 repaired 480P without saying so")
+	}
+}
+
+// Hailuo's panel has not been read, so nothing about it is enforced.
+//
+// The endpoint must not turn that gap into a rejection: a range invented from
+// the H3 variants would fail requests this model may well accept, and the
+// caller has no way to tell that from a broken gateway.
+func TestVideoGenerationsLeavesAnUnreadModelUnconstrained(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/clip.mp4")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	rec := h.video(t, map[string]any{
+		"model": "minimax-hailuo-2-3", "prompt": "一只猫在弹钢琴",
+		"ratio": "5:4", "resolution": "1080P", "duration": 25,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if _, ok := payload["adjusted"]; ok {
+		t.Errorf("an unread model was repaired: %v", payload["adjusted"])
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*seen))
+	}
+	for _, want := range []string{`"ratio":"5:4"`, `"resolution":"1080P"`, `"duration":25`} {
+		if !strings.Contains((*seen)[0], want) {
+			t.Errorf("options block is missing %s:/n%s", want, (*seen)[0])
+		}
+	}
+}
+
+// The chat surface builds the same options block and has no field to report a
+// repair in, so the check that matters there is that the repair happened at all.
+func TestChatCompletionsRepairsAVideoTurnToo(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("已提交")))
+	h.addAccount(t, "primary", "token-good", 10)
+	seen := h.captureMessages(t)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-h3",
+		"messages": []any{map[string]any{"role": "user", "content": "一只猫在弹钢琴"}},
+	}, h.key)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*seen))
+	}
+	text := (*seen)[0]
+	// The console default is 768P, which H3.0 offers, so this is the settings
+	// path rather than a repair — but it still has to come out as a complete,
+	// accepted block.
+	for _, want := range []string{
+		`"model":"MiniMax-H3"`, `"ratio":"16:9"`, `"resolution":"768P"`, `"duration":5`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("options block is missing %s:/n%s", want, text)
+		}
+	}
+}

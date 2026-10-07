@@ -282,10 +282,25 @@ type ModelConfig struct {
 	// which the video plugin expects to receive as a generation parameter.
 	// Empty for the chat entries, which have no model selector to fill in.
 	UpstreamModel string `json:"upstreamModel"`
-	Type          string `json:"type"`
-	Enabled       bool   `json:"enabled"`
-	Builtin       bool   `json:"builtin"`
-	Description   string `json:"description"`
+	// Ratios, Resolutions and Durations are the generation values this model
+	// accepts, and they belong to the entry for the same reason UpstreamModel
+	// does: they are facts about the upstream, not policy about this gateway.
+	//
+	// They are per-model because they genuinely differ — the two H3 variants
+	// offer different resolutions — while the console's video defaults are a
+	// single global set. Without them a caller who asks for 2K on the 480P/768P
+	// model, or who inherits a default the chosen model does not offer, sends a
+	// value the upstream's own panel never sends.
+	//
+	// Empty means unconstrained rather than "accepts nothing"; see
+	// minimax.VideoLimits for why an unread model is left that way.
+	Ratios      []string `json:"ratios,omitempty"`
+	Resolutions []string `json:"resolutions,omitempty"`
+	Durations   []int    `json:"durations,omitempty"`
+	Type        string   `json:"type"`
+	Enabled     bool     `json:"enabled"`
+	Builtin     bool     `json:"builtin"`
+	Description string   `json:"description"`
 	Requests      int64  `json:"requests"`
 	Tokens        int64  `json:"tokens"`
 }
@@ -357,20 +372,45 @@ func BuiltinModels() []*ModelConfig {
 		{
 			ID: "minimax-h3", Name: "MiniMax H3.0", Upstream: "video", UpstreamModel: "MiniMax-H3",
 			Type: ModelTypeVideo, Enabled: true, Builtin: true,
+			Ratios: videoRatios(), Resolutions: []string{"768P", "2K"}, Durations: videoDurations(),
 			Description: "视频生成，质量优先；消耗账号积分，不占用 Token Plan；支持多模态参考",
 		},
 		{
 			ID: "minimax-h3-max", Name: "MiniMax H3 Max", Upstream: "video", UpstreamModel: "MiniMax-H3-Max",
 			Type: ModelTypeVideo, Enabled: true, Builtin: true,
-			Description: "视频生成，约 20 秒完成；仅支持文生视频与首/尾帧，480P/768P，5-15 秒",
+			Ratios: videoRatios(), Resolutions: []string{"480P", "768P"}, Durations: videoDurations(),
+			// The resolutions and durations used to be spelled out here. They
+			// are structured fields now, and a fact stated twice is a fact that
+			// will disagree with itself eventually — the console renders the
+			// ranges from the fields, so the prose no longer repeats them.
+			Description: "视频生成，约 20 秒完成；仅支持文生视频与首/尾帧",
 		},
 		{
+			// Hailuo carries no limits on purpose: its parameter panel has not
+			// been read, and a range invented from the H3 variants would reject
+			// requests this model may well accept. See minimax.VideoLimits.
 			ID: "minimax-hailuo-2-3", Name: "MiniMax Hailuo 2.3", Upstream: "video",
 			UpstreamModel: "MiniMax-Hailuo-2.3",
 			Type:          ModelTypeVideo, Enabled: true, Builtin: true,
 			Description: "视频生成，成本更低；可用 Token Plan；输出无声视频",
 		},
 	}
+}
+
+// videoRatios and videoDurations are the values both H3 variants offer.
+//
+// They are functions rather than shared slices because every catalogue entry is
+// serialised into the state file: two entries pointing at one backing array
+// would be a latent aliasing bug for no gain.
+func videoRatios() []string {
+	return []string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+}
+
+// videoDurations is the whole-second range the panel offers, listed rather than
+// expressed as bounds so that a gap — some models skip values — stays
+// expressible without a second representation.
+func videoDurations() []int {
+	return []int{5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 }
 
 // MergeBuiltinModels adds any built-in entry the stored catalogue is missing.
@@ -385,13 +425,15 @@ func BuiltinModels() []*ModelConfig {
 // be replaced.
 //
 // Entries already present are left exactly as stored. Only the *existence* of a
-// built-in is enforced, never its state — with one deliberate exception: an
-// upstream model id the stored copy is missing is adopted from the built-in.
-// There is no console and no API that sets UpstreamModel, so an empty value on
-// a built-in entry can never be the operator's intent; it is always the freeze
-// of a default from before that entry carried an id. The same argument repairs
-// settings in Normalize, and it applies with more force here: the field is not
-// reachable by any other route at all.
+// built-in is enforced, never its state — with one deliberate exception: fields
+// the stored copy is missing are adopted from the built-in. Those are the
+// upstream model id and the three generation ranges, and the argument is the
+// same for all four: the console's model editor writes `enabled`, `name` and
+// `description` and nothing else, so an empty value on a built-in entry can
+// never be the operator's intent — it is always the freeze of a default from
+// before that entry carried the field. The same argument repairs settings in
+// Normalize, and it applies with more force here: these fields are not reachable
+// by any other route at all.
 func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 	builtinByID := make(map[string]*ModelConfig)
 	for _, builtin := range BuiltinModels() {
@@ -409,11 +451,30 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 			continue
 		}
 		builtin, ok := builtinByID[model.ID]
-		if !ok || builtin.UpstreamModel == "" || model.UpstreamModel != "" {
+		if !ok {
 			continue
 		}
-		model.UpstreamModel = builtin.UpstreamModel
-		changed = true
+		if builtin.UpstreamModel != "" && model.UpstreamModel == "" {
+			model.UpstreamModel = builtin.UpstreamModel
+			changed = true
+		}
+		// The generation ranges are adopted under the same argument as the
+		// upstream id, and they need it more: a missing range is not a visible
+		// gap but a silent one. The gateway would simply stop repairing
+		// unsupported values on every install that predates this release, with
+		// nothing on screen to say the feature was off.
+		if len(model.Ratios) == 0 && len(builtin.Ratios) > 0 {
+			model.Ratios = builtin.Ratios
+			changed = true
+		}
+		if len(model.Resolutions) == 0 && len(builtin.Resolutions) > 0 {
+			model.Resolutions = builtin.Resolutions
+			changed = true
+		}
+		if len(model.Durations) == 0 && len(builtin.Durations) > 0 {
+			model.Durations = builtin.Durations
+			changed = true
+		}
 	}
 	for _, builtin := range BuiltinModels() {
 		if _, ok := known[builtin.ID]; ok {

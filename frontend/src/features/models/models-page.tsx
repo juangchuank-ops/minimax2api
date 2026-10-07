@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { listModels, updateModel } from "@/features/models/models-api";
+import { listModels, updateModel, type ModelDTO } from "@/features/models/models-api";
 import { errorMessage } from "@/shared/api/client";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { EmptyState } from "@/shared/components/data-state";
@@ -18,6 +18,57 @@ const TYPE_TONE: Record<string, string> = {
   image: "bg-violet-500/10 text-violet-700 dark:text-violet-300",
   video: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
 };
+
+// formatDurations collapses a contiguous run into a range.
+//
+// The panel offers every whole second from 5 to 15, and "5-15s" says the same
+// thing as eleven numbers while fitting in a table cell. A gap — some models
+// skip values — still has to be readable, so a non-contiguous set stays a list
+// rather than becoming a range that claims values it does not accept.
+function formatDurations(durations: number[], unit: string): string {
+  const sorted = [...durations].sort((a, b) => a - b);
+  const contiguous = sorted.every((value, index) => index === 0 || value === sorted[index - 1] + 1);
+  if (sorted.length > 1 && contiguous) {
+    return `${sorted[0]}-${sorted[sorted.length - 1]}${unit}`;
+  }
+  return sorted.map((value) => `${value}${unit}`).join(" / ");
+}
+
+// ModelRanges shows what a video model accepts.
+//
+// The ranges are per model and they differ — the two H3 variants disagree about
+// resolution — so without this the only way to learn them is to make a call and
+// read the repair report. A model whose panel has not been read shows nothing
+// rather than an empty row, because "no ranges" means unenforced, not
+// "accepts nothing".
+function ModelRanges({ model }: { model: ModelDTO }) {
+  const { t } = useTranslation();
+  const resolutions = model.resolutions ?? [];
+  const ratios = model.ratios ?? [];
+  const durations = model.durations ?? [];
+  if (resolutions.length === 0 && ratios.length === 0 && durations.length === 0) {
+    return null;
+  }
+  const fields: Array<{ label: string; value: string }> = [];
+  if (resolutions.length > 0) {
+    fields.push({ label: t("models.resolutions"), value: resolutions.join(" / ") });
+  }
+  if (ratios.length > 0) {
+    fields.push({ label: t("models.ratios"), value: ratios.join(" ") });
+  }
+  if (durations.length > 0) {
+    fields.push({ label: t("models.durations"), value: formatDurations(durations, t("models.seconds")) });
+  }
+  return (
+    <p className="mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px] text-muted-foreground/80">
+      {fields.map((field) => (
+        <span key={field.label}>
+          {field.label} <span className="font-mono">{field.value}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
 
 export function ModelsPage() {
   const { t, i18n } = useTranslation();
@@ -74,12 +125,13 @@ export function ModelsPage() {
                   <TableCell className="text-xs">
                     <p>{model.name}</p>
                     <p className="mt-0.5 text-[10px] text-muted-foreground">{model.description}</p>
+                    <ModelRanges model={model} />
                   </TableCell>
                   <TableCell className="text-center text-xs tabular-nums">{formatNumber(model.requests, i18n.language)}</TableCell>
                   <TableCell className="text-center text-xs tabular-nums">{formatTokens(model.tokens, i18n.language)}</TableCell>
                   <TableCell>
                     <div className="flex items-center justify-center gap-2">
-                      {model.builtin ? <Badge variant="outline">内置</Badge> : null}
+                      {model.builtin ? <Badge variant="outline">{t("models.builtin")}</Badge> : null}
                       <Switch
                         checked={model.enabled}
                         onCheckedChange={(enabled) => updateMutation.mutate({ id: model.id, enabled })}

@@ -3,6 +3,7 @@ package minimax
 import (
 	"encoding/json"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -167,5 +168,201 @@ func TestVideoOptionsRejectNonPositiveDurations(t *testing.T) {
 		if _, err := options.Normalize(VideoOptions{}); err == nil {
 			t.Fatalf("duration %d was accepted", duration)
 		}
+	}
+}
+
+// ------------------------------------------------------------- model ranges
+
+// The ranges the two H3 variants advertise, as the store seeds them. They are
+// written out rather than imported so that a change to the catalogue has to be
+// a change here too: the numbers are a claim about the upstream, and the test
+// is where the claim is recorded.
+var (
+	testRatios      = []string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+	testDurations   = []int{5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	testH3MaxLimits = VideoLimits{Ratios: testRatios, Resolutions: []string{"480P", "768P"}, Durations: testDurations}
+	testH3Limits    = VideoLimits{Ratios: testRatios, Resolutions: []string{"768P", "2K"}, Durations: testDurations}
+)
+
+// Every value a model advertises has to survive untouched.
+//
+// The whole matrix, because "supported" is the claim being made: 11 durations
+// times 6 ratios times each model's resolutions. A repair on any of them would
+// mean the gateway quietly changed a request it had no business changing, and
+// since the repaired value is still a valid one, nothing downstream would look
+// wrong.
+func TestConformLeavesEveryAdvertisedValueAlone(t *testing.T) {
+	cases := []struct {
+		model  string
+		limits VideoLimits
+	}{
+		{"MiniMax-H3-Max", testH3MaxLimits},
+		{"MiniMax-H3", testH3Limits},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			fallback := VideoOptions{Model: tc.model, Ratio: "16:9", Resolution: "768P", Duration: 5}
+			for _, ratio := range tc.limits.Ratios {
+				for _, resolution := range tc.limits.Resolutions {
+					for _, duration := range tc.limits.Durations {
+						want := VideoOptions{
+							Model: tc.model, Ratio: ratio, Resolution: resolution, Duration: duration,
+						}
+						got, adjustments := want.Conform(tc.limits, fallback)
+						if got != want {
+							t.Errorf("ratio %s / %s / %ds became %+v", ratio, resolution, duration, got)
+						}
+						if len(adjustments) != 0 {
+							t.Errorf("ratio %s / %s / %ds was reported as adjusted: %+v",
+								ratio, resolution, duration, adjustments)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// A value the model does not offer moves to the nearest one it does.
+//
+// Nearest rather than "the default" or "the first entry", because the axes are
+// ordered and the caller's intent survives the move: someone who asked for the
+// sharpest resolution available anywhere is asking for the sharpest this model
+// has, not for the cheapest.
+func TestConformMovesToTheNearestAcceptedValue(t *testing.T) {
+	fallback := VideoOptions{Model: "MiniMax-H3-Max", Ratio: "16:9", Resolution: "768P", Duration: 5}
+	cases := []struct {
+		name   string
+		field  string
+		limits VideoLimits
+		want   VideoOptions
+		got    VideoOptions
+		used   string
+	}{
+		{
+			name: "2K on a model that stops at 768P", field: "resolution",
+			limits: testH3MaxLimits,
+			want:   VideoOptions{Ratio: "16:9", Resolution: "2K", Duration: 5},
+			got:    VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 5}, used: "768P",
+		},
+		{
+			// The other model's floor, on this model's ceiling: 480P is what
+			// H3-Max offers, so the same request is accepted there and moved
+			// here.
+			name: "480P on a model that starts at 768P", field: "resolution",
+			limits: testH3Limits,
+			want:   VideoOptions{Ratio: "16:9", Resolution: "480P", Duration: 5},
+			got:    VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 5}, used: "768P",
+		},
+		{
+			name: "a resolution between the two", field: "resolution",
+			limits: testH3MaxLimits,
+			want:   VideoOptions{Ratio: "16:9", Resolution: "1080P", Duration: 5},
+			got:    VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 5}, used: "768P",
+		},
+		{
+			name: "an aspect between 4:3 and 16:9", field: "ratio",
+			limits: testH3MaxLimits,
+			want:   VideoOptions{Ratio: "1.85:1", Resolution: "768P", Duration: 5},
+			got:    VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 5}, used: "16:9",
+		},
+		{
+			name: "a portrait aspect", field: "ratio",
+			limits: testH3MaxLimits,
+			want:   VideoOptions{Ratio: "3:5", Resolution: "768P", Duration: 5},
+			got:    VideoOptions{Ratio: "9:16", Resolution: "768P", Duration: 5}, used: "9:16",
+		},
+		{
+			name: "longer than the panel offers", field: "duration",
+			limits: testH3MaxLimits,
+			want:   VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 30},
+			got:    VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 15}, used: "15",
+		},
+		{
+			name: "shorter than the panel offers", field: "duration",
+			limits: testH3MaxLimits,
+			want:   VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 2},
+			got:    VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 5}, used: "5",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, adjustments := tc.want.Conform(tc.limits, fallback)
+			if got != tc.got {
+				t.Fatalf("got %+v, want %+v", got, tc.got)
+			}
+			if len(adjustments) != 1 {
+				t.Fatalf("expected exactly one adjustment, got %+v", adjustments)
+			}
+			adjustment := adjustments[0]
+			if adjustment.Field != tc.field || adjustment.Used != tc.used {
+				t.Fatalf("adjustment = %+v, want field %s used %s", adjustment, tc.field, tc.used)
+			}
+			// The requested value is echoed back, because a caller that gets a
+			// 768P video after asking for 2K needs to know it asked for 2K.
+			requested := map[string]string{
+				"ratio":      tc.want.Ratio,
+				"resolution": tc.want.Resolution,
+				"duration":   strconv.Itoa(tc.want.Duration),
+			}[tc.field]
+			if adjustment.Requested != requested {
+				t.Fatalf("requested = %q, want %q", adjustment.Requested, requested)
+			}
+		})
+	}
+}
+
+// An unreadable value has no distance to measure, so the console default is the
+// next best answer — and the first entry is the best available when even the
+// default is not offered.
+func TestConformFallsBackWhenAValueCannotBeRanked(t *testing.T) {
+	fallback := VideoOptions{Ratio: "16:9", Resolution: "768P", Duration: 5}
+
+	got, adjustments := (VideoOptions{Ratio: "wide", Resolution: "auto", Duration: 5}).
+		Conform(testH3Limits, fallback)
+	if got.Ratio != "16:9" || got.Resolution != "768P" {
+		t.Fatalf("got %+v, want the defaults", got)
+	}
+	if len(adjustments) != 2 {
+		t.Fatalf("expected two adjustments, got %+v", adjustments)
+	}
+
+	// The default itself is not in the set: nothing can be measured and nothing
+	// can be inherited, so the first entry is used rather than nothing at all.
+	narrow := VideoLimits{Ratios: []string{"1:1"}, Resolutions: []string{"2K"}, Durations: []int{10}}
+	got, _ = (VideoOptions{Ratio: "", Resolution: "auto", Duration: 5}).Conform(narrow, fallback)
+	if got.Ratio != "1:1" || got.Resolution != "2K" || got.Duration != 10 {
+		t.Fatalf("got %+v, want the only accepted values", got)
+	}
+}
+
+// A model with no recorded ranges is left alone entirely.
+//
+// That is Hailuo 2.3 today: its parameter panel has not been read, and a range
+// invented from the H3 variants would reject requests the upstream may well
+// accept. Passing an out-of-range value through costs a failed turn at worst;
+// rejecting a valid one costs a turn that would have worked.
+func TestConformDoesNotConstrainAnUnreadModel(t *testing.T) {
+	want := VideoOptions{Model: "MiniMax-Hailuo-2.3", Ratio: "5:4", Resolution: "1080P", Duration: 25}
+	got, adjustments := want.Conform(VideoLimits{}, VideoOptions{})
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if len(adjustments) != 0 {
+		t.Fatalf("an unconstrained model reported adjustments: %+v", adjustments)
+	}
+}
+
+// A tie keeps the earlier entry, which is the order the upstream panel shows.
+// Nothing in the real catalogue ties — the durations are contiguous — but a
+// rule that is not pinned is a rule that changes by accident.
+func TestConformBreaksATieTowardsTheEarlierEntry(t *testing.T) {
+	limits := VideoLimits{Durations: []int{5, 15}}
+	got, adjustments := (VideoOptions{Duration: 10}).Conform(limits, VideoOptions{})
+	if got.Duration != 5 {
+		t.Fatalf("duration = %d, want the earlier entry 5", got.Duration)
+	}
+	if len(adjustments) != 1 || adjustments[0].Used != "5" {
+		t.Fatalf("adjustments = %+v", adjustments)
 	}
 }

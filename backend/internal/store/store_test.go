@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -507,6 +508,99 @@ func TestMergeBuiltinModelsBackfillsUpstreamModel(t *testing.T) {
 	}
 	if got := modelByID(merged, "minimax-m3-thinking").UpstreamModel; got != "" {
 		t.Errorf("minimax-m3-thinking grew an upstream id %q", got)
+	}
+}
+
+// The generation ranges have to reach installs that already hold the entry, for
+// the same reason the upstream id does — and the failure is worse here. A
+// missing id shows up as a request that goes nowhere; a missing range shows up
+// as nothing at all, because the gateway simply stops repairing unsupported
+// values and every request still succeeds.
+func TestMergeBuiltinModelsBackfillsVideoRanges(t *testing.T) {
+	stored := BuiltinModels()
+	for _, model := range stored {
+		model.Ratios, model.Resolutions, model.Durations = nil, nil, nil
+	}
+	modelByID := func(models []*ModelConfig, id string) *ModelConfig {
+		for _, model := range models {
+			if model.ID == id {
+				return model
+			}
+		}
+		return nil
+	}
+
+	merged, changed := MergeBuiltinModels(stored)
+	if !changed {
+		t.Fatal("a catalogue stripped of its ranges should report a change")
+	}
+
+	for _, builtin := range BuiltinModels() {
+		if len(builtin.Resolutions) == 0 {
+			continue
+		}
+		got := modelByID(merged, builtin.ID)
+		if got == nil {
+			t.Fatalf("built-in %q vanished", builtin.ID)
+		}
+		if len(got.Ratios) != len(builtin.Ratios) || len(got.Durations) != len(builtin.Durations) {
+			t.Errorf("model %q ratios=%v durations=%v, want %v and %v",
+				builtin.ID, got.Ratios, got.Durations, builtin.Ratios, builtin.Durations)
+		}
+		if len(got.Resolutions) != len(builtin.Resolutions) {
+			t.Errorf("model %q resolutions = %v, want %v", builtin.ID, got.Resolutions, builtin.Resolutions)
+		}
+	}
+
+	// Hailuo has no recorded ranges, and the merge must not invent any: an
+	// empty set means "unconstrained", and a range filled in from the H3
+	// variants would start rejecting requests the upstream may accept.
+	hailuo := modelByID(merged, "minimax-hailuo-2-3")
+	if hailuo == nil {
+		t.Fatal("the Hailuo entry vanished")
+	}
+	if len(hailuo.Ratios) != 0 || len(hailuo.Resolutions) != 0 || len(hailuo.Durations) != 0 {
+		t.Errorf("the merge invented ranges for an unread model: %v %v %v",
+			hailuo.Ratios, hailuo.Resolutions, hailuo.Durations)
+	}
+	if _, changedAgain := MergeBuiltinModels(merged); changedAgain {
+		t.Error("merging an already-backfilled catalogue reported a change")
+	}
+}
+
+// The two H3 variants differ in resolution and agree on everything else. That
+// difference is the whole reason the ranges are per model rather than global,
+// so it is pinned here: a request that is valid on one and not the other is the
+// case the gateway exists to repair.
+func TestBuiltinVideoRangesDifferByResolutionOnly(t *testing.T) {
+	models := make(map[string]*ModelConfig)
+	for _, model := range BuiltinModels() {
+		models[model.ID] = model
+	}
+	h3, h3Max := models["minimax-h3"], models["minimax-h3-max"]
+	if h3 == nil || h3Max == nil {
+		t.Fatal("both H3 variants must be in the catalogue")
+	}
+	if strings.Join(h3.Ratios, ",") != strings.Join(h3Max.Ratios, ",") {
+		t.Errorf("ratios differ: %v vs %v", h3.Ratios, h3Max.Ratios)
+	}
+	if len(h3.Durations) != len(h3Max.Durations) {
+		t.Errorf("durations differ: %v vs %v", h3.Durations, h3Max.Durations)
+	}
+	if got := strings.Join(h3Max.Resolutions, "/"); got != "480P/768P" {
+		t.Errorf("H3-Max resolutions = %s, want 480P/768P", got)
+	}
+	if got := strings.Join(h3.Resolutions, "/"); got != "768P/2K" {
+		t.Errorf("H3.0 resolutions = %s, want 768P/2K", got)
+	}
+	// The durations are the panel's whole-second buttons, 5 through 15.
+	for index, duration := range h3Max.Durations {
+		if duration != 5+index {
+			t.Fatalf("durations are not 5..15: %v", h3Max.Durations)
+		}
+	}
+	if len(h3Max.Durations) != 11 {
+		t.Errorf("durations = %v, want eleven of them", h3Max.Durations)
 	}
 }
 

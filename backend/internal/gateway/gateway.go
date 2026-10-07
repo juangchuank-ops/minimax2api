@@ -1028,20 +1028,25 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defaults := videoDefaults(settings, model)
 	options, err := (minimax.VideoOptions{
 		Model:      model.UpstreamModel,
 		Ratio:      request.Ratio,
 		Resolution: request.Resolution,
 		Duration:   request.Duration,
-	}).Normalize(minimax.VideoOptions{
-		Ratio:      settings.Video.DefaultRatio,
-		Resolution: settings.Video.DefaultResolution,
-		Duration:   settings.Video.DefaultDuration,
-	})
+	}).Normalize(defaults)
 	if err != nil {
 		writeError(out, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Filling the gaps is not enough on its own. The console's defaults are a
+	// single global set while the ranges are per model, so a complete request
+	// can still name a value this model does not offer — 2K on the 480P/768P
+	// variant, or a default resolution the chosen model happens not to carry.
+	// Those are repaired here rather than rejected: the plugin answers a value
+	// it cannot use by asking the caller to choose, and a headless caller has
+	// nobody to answer.
+	options, adjustments := options.Conform(videoLimits(model), defaults)
 
 	// Reference frames ride along as ordinary attachments; the plugin reads them
 	// from the turn rather than from the options block, which only carries the
@@ -1130,6 +1135,21 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 		"created": time.Now().Unix(),
 		"model":   model.ID,
 		"data":    items,
+		// The parameters the turn actually went out with. This endpoint fills
+		// in whatever the caller omitted and repairs whatever the model does not
+		// accept, and neither is visible in `data` — a video at the wrong
+		// resolution looks like a video. `params` is therefore the only place a
+		// caller can learn what it was billed for, and `adjusted` names the
+		// repairs alone, so an absent key means the request went out as written.
+		"params": map[string]any{
+			"model":      options.Model,
+			"ratio":      options.Ratio,
+			"resolution": options.Resolution,
+			"duration":   options.Duration,
+		},
+	}
+	if len(adjustments) > 0 {
+		response["adjusted"] = adjustments
 	}
 	// A turn that produced no media still returns 200 with an empty `data` and
 	// the agent's own words, because "submitted, here is the task" is a useful
@@ -1178,19 +1198,39 @@ func (g *Gateway) outgoingText(
 	if model.Type != store.ModelTypeVideo {
 		return prompt
 	}
-	if options.Model == "" {
-		options.Model = model.UpstreamModel
+	defaults := videoDefaults(settings, model)
+	filled, err := options.Normalize(defaults)
+	if err != nil {
+		// Only reachable when the catalogue entry names no upstream model, which
+		// no built-in does. The defaults are still the best answer available, and
+		// a turn with an incomplete block produces nothing at all.
+		filled = defaults
 	}
-	if options.Ratio == "" {
-		options.Ratio = settings.Video.DefaultRatio
+	// A repair made on this path goes unannounced: a chat turn answers with the
+	// agent's own prose and has no field to report one in. The dedicated video
+	// endpoint does report it; see VideoGenerations.
+	filled, _ = filled.Conform(videoLimits(model), defaults)
+	return minimax.BuildVideoPrompt(prompt, settings.Video.PluginName, filled, settings.Video.OptionsTag)
+}
+
+// videoDefaults is what a video turn falls back to for a parameter the caller
+// left out: the console's defaults, plus the entry's upstream model id.
+func videoDefaults(settings config.Settings, model *store.ModelConfig) minimax.VideoOptions {
+	return minimax.VideoOptions{
+		Model:      model.UpstreamModel,
+		Ratio:      settings.Video.DefaultRatio,
+		Resolution: settings.Video.DefaultResolution,
+		Duration:   settings.Video.DefaultDuration,
 	}
-	if options.Resolution == "" {
-		options.Resolution = settings.Video.DefaultResolution
+}
+
+// videoLimits narrows a catalogue entry to the ranges the gateway enforces.
+func videoLimits(model *store.ModelConfig) minimax.VideoLimits {
+	return minimax.VideoLimits{
+		Ratios:      model.Ratios,
+		Resolutions: model.Resolutions,
+		Durations:   model.Durations,
 	}
-	if options.Duration <= 0 {
-		options.Duration = settings.Video.DefaultDuration
-	}
-	return minimax.BuildVideoPrompt(prompt, settings.Video.PluginName, options, settings.Video.OptionsTag)
 }
 
 // timeoutFor picks the budget for one turn.

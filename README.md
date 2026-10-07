@@ -159,8 +159,8 @@ curl http://127.0.0.1:8080/v1/messages \
 | `minimax-m3-thinking` | chat | 深度思考，推理内容走 `reasoning_content` |
 | `minimax-m2.7` / `minimax-m2.7-highspeed` | chat | 上一代对话模型及其高速版 |
 | `minimax-image` | image | 图像生成 |
-| `minimax-h3` | video | H3.0，质量优先，消耗账号积分 |
-| `minimax-h3-max` | video | H3 Max，约 20 秒完成（唯一能同步返回的） |
+| `minimax-h3` | video | H3.0，质量优先，消耗账号积分，**768P / 2K** |
+| `minimax-h3-max` | video | H3 Max，约 20 秒完成（唯一能同步返回的），**480P / 768P** |
 | `minimax-hailuo-2-3` | video | Hailuo 2.3，成本更低，输出无声视频 |
 
 **每个模型 ID 都能在 `/v1/chat/completions` 上用**，因为 OpenAI 的 `/v1/models` schema 里没有任何字段能表达「这是图像模型」——客户端会把列表里的每个 id 都当成对话模型填进下拉框。所以本网关的原则是：**列出来的就能用**。
@@ -172,6 +172,45 @@ curl http://127.0.0.1:8080/v1/messages \
 | `video` | ✅ 整轮被改写成插件引用 | — | ✅ | — |
 
 > chat 类模型的 ID **最终打的都是同一个上游 Agent**，上游按账号默认模型回答——这些条目只是标签。上游模型选择器走在消息请求体里，可在「系统设置 → 上游 → `model` 字段模板」配置。
+
+### 视频生成
+
+```bash
+curl http://127.0.0.1:8080/v1/videos/generations \
+  -H "Authorization: Bearer sk-mm-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"minimax-h3-max","prompt":"一只猫在弹钢琴",
+       "ratio":"16:9","resolution":"768P","duration":8}'
+```
+
+四个参数都**有实际取值**，因为插件会先把没指定的项问清楚再开始生成，而接口调用没人可答——少一个就是这一轮什么都不产出。省略的项回落到「系统设置 → 视频生成」的默认值。
+
+**支持范围按模型各存一份**（控制台「模型目录」里每个视频模型下面直接列出来）：
+
+| 模型 | 画幅 | 分辨率 | 时长 |
+| --- | --- | --- | --- |
+| `minimax-h3-max` | 21:9 / 16:9 / 4:3 / 1:1 / 3:4 / 9:16 | **480P / 768P** | 5-15 秒 |
+| `minimax-h3` | 同上 | **768P / 2K** | 5-15 秒 |
+| `minimax-hailuo-2-3` | 未读取，不约束 | 未读取，不约束 | 未读取，不约束 |
+
+> 范围来自上游自己的模型参数面板，那是客户端唯一会送出的取值集合。**Hailuo 2.3 的面板还没读过**，所以它一份范围都没有——空 = 不校验，而不是「什么都不接受」。凭空按 H3 的范围去卡它，会把上游本来收的请求拦掉。
+
+**给了范围外的值不会报错，会被改到最近的一个并在响应里报出来**：
+
+```jsonc
+{
+  "model": "minimax-h3-max",
+  "data": [ /* … */ ],
+  "params": { "model": "MiniMax-H3-Max", "ratio": "16:9",
+              "resolution": "768P", "duration": 15 },   // 实际用的
+  "adjusted": [                                          // 只有被改过才有这个键
+    { "field": "resolution", "requested": "2K", "used": "768P" },
+    { "field": "duration",   "requested": "30", "used": "15" }
+  ]
+}
+```
+
+改而不是拒，是因为拒绝一个参数意味着整轮失败；「最近」而不是「默认值」，是因为轴是有序的——要 2K 的人要的是这个模型最清晰的那档，不是最便宜的那档。但**改了不说是不行的**：`params` 是唯一能知道这一轮按什么参数计费的地方，`adjusted` 为空则说明请求原样发出去了。
 
 ---
 
@@ -336,6 +375,8 @@ frontend/
   src/features/         各功能页
   src/shared/           API 客户端、鉴权、i18n、工具
 tools/                  自检脚本（冒烟 / 契约 / 字段 / 签到 / 渲染 / 密钥扫描）
+  stub_upstream.py      桩上游：答握手与消息流，落盘收到的参数块
+  video_matrix.py       视频参数全矩阵（配桩使用，不消耗积分）
 assets/                 logo
 ```
 
@@ -360,6 +401,17 @@ python tools/fields.py   --base http://127.0.0.1:8080 --password 你的密码   
 python tools/signin_e2e.py --base http://127.0.0.1:8080 --password 你的密码 # 签到链路（自建假上游）
 node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码  # 真实渲染（需本机 Chrome）
 ```
+
+视频参数矩阵（把上游指到桩上，不消耗积分）：
+
+```bash
+# 1. 把 settings.upstream.baseURL 指到桩（隔离实例的数据目录里改）
+python tools/stub_upstream.py --port 18081
+# 2. 跑 264 组组合 + 越界 / 画幅 / 未读模型四组
+python tools/video_matrix.py --base http://127.0.0.1:18099 --password 你的密码
+```
+
+> 桩会把收到的每个 `<video-generation-options>` 块写进 `--log` 指定的文件，所以「网关到底发了什么」是可直接核对的事实，不是推断。
 
 推送前扫密钥（工作树 + 全部历史）：
 
@@ -395,6 +447,12 @@ git config core.hooksPath tools/hooks    # 装成 pre-commit 钩子
 
 **Q：视频请求发出去后 Agent 反过来问我时长 / 分辨率？**
 参数没填满。插件会**先问清楚未指定的项再开始生成**，而接口调用没人可答——少一个参数就是这一轮什么都不产出。把 `duration` / `ratio` / `resolution` 都传上，或确认系统设置里的默认值非空。
+
+**Q：我传了 `2K`，拿到的却是 `768P`？**
+`minimax-h3-max` 只到 `768P`，`2K` 是 `minimax-h3` 才有的档。这类范围外的值会被**改到该模型最近的一档**而不是报错，改动写在响应的 `adjusted` 里，`params` 是实际用的参数。想确认某个模型收什么，看控制台「模型目录」那一行，或看响应里的 `adjusted`。
+
+**Q：视频参数到底以哪个为准——系统设置里的默认值，还是模型自己的范围？**
+模型范围优先。设置里那三个默认值是**全局唯一**的一份，而两个 H3 的分辨率档并不相同，所以默认值只负责「你没传时填什么」，填完还要过一遍该模型的范围；范围里没有就改到最近的一档。
 
 **Q：接到角色扮演前端上，回复里把人设和历史对话一起吐出来了？**
 适配器把上游的**回显帧**当成了回答，不是模型在复述。详见「上游协议要点 → 流式解析」。
