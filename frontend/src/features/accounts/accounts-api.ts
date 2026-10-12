@@ -301,3 +301,42 @@ export function signinAccount(id: string): Promise<{ result: SigninAccountResult
 export function refreshCredit(id: string): Promise<{ credit: AccountCredit; account: AccountDTO }> {
   return apiRequest(`/admin/api/accounts/${id}/credit`, { method: "POST" });
 }
+
+// ------------------------------------------------------------ browser sign-in
+
+/**
+ * Outcome of a poll. The backend drives the browser itself, so once the status
+ * is "ok" the account already exists in the pool and `account` is the same view
+ * the list renders — there is nothing left for the console to submit.
+ */
+export type BrowserLoginResult = {
+  status: "pending" | "ok" | "timeout" | "error";
+  account?: AccountDTO;
+  error?: string;
+};
+
+/**
+ * Opens an upstream sign-in page in a managed browser and returns a session id
+ * to poll. The window outlives this request, so the id is the only handle on it.
+ *
+ * `proxy` is an optional outbound proxy for the browser (e.g. the international
+ * site is geo-fenced), forwarded verbatim to the local CDP bridge. Omitted or
+ * blank means a direct connection. The response echoes it back for redisplay.
+ */
+export function browserLoginStart(
+  region: AccountRegion,
+  proxy?: string,
+): Promise<{ sessionId: string; target: string; region: string; proxy?: string }> {
+  return apiRequest("/admin/api/browser-login", {
+    method: "POST",
+    body: { region, ...(proxy ? { proxy } : {}) },
+  });
+}
+
+export function browserLoginPoll(sessionId: string): Promise<BrowserLoginResult> {
+  return apiRequest(`/admin/api/browser-login/${encodeURIComponent(sessionId)}`);
+}
+
+export function browserLoginCancel(sessionId: string): Promise<{ cancelled: boolean }> {
+  return apiRequest(`/admin/api/browser-login/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+}
