@@ -347,30 +347,34 @@ func TestSweepCountsDuplicateClaimAsAlready(t *testing.T) {
 	}
 }
 
-// TestSweepSkipsMainlandAccounts documents that the mainland deployment speaks a
-// different check-in protocol. Signing one with the international shape would
-// earn a rejection that looks exactly like a dead token, so the honest answer is
-// to skip it.
-func TestSweepSkipsMainlandAccounts(t *testing.T) {
+// TestSweepSignsMainlandAccounts documents that the mainland deployment shares
+// the international check-in protocol: the same endpoints and the same
+// timezone_offset parameter set, routed to agent.minimaxi.com by the account's
+// region. A mainland account therefore signs in normally rather than being
+// skipped.
+func TestSweepSignsMainlandAccounts(t *testing.T) {
 	f := newFixture(t, defaultSettings())
 	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
 		target.Region = store.RegionCN
 	})
 
 	report := f.service.Sweep(context.Background())
-	if report.Skipped != 1 {
-		t.Errorf("skipped = %d, want 1", report.Skipped)
+	if report.Skipped != 0 {
+		t.Errorf("skipped = %d, want 0", report.Skipped)
 	}
-	if f.client.statusCall != 0 {
-		t.Errorf("a mainland account must not be sent to the international endpoint, got %d calls", f.client.statusCall)
+	if report.Claimed != 1 {
+		t.Errorf("claimed = %d, want 1", report.Claimed)
+	}
+	if f.client.statusCall != 1 {
+		t.Errorf("a mainland account must sign in through the status endpoint, got %d calls", f.client.statusCall)
 	}
 
 	account, _ := f.store.AccountByID(f.account.ID)
-	if account.SigninStatus != store.SigninSkipped {
-		t.Errorf("status = %q, want %q", account.SigninStatus, store.SigninSkipped)
+	if account.SigninStatus != store.SigninOK {
+		t.Errorf("status = %q, want %q", account.SigninStatus, store.SigninOK)
 	}
 	if account.Status != store.StatusActive {
-		t.Errorf("skipping must not disturb the account's health, got %q", account.Status)
+		t.Errorf("signing in must not disturb the account's health, got %q", account.Status)
 	}
 }
 
