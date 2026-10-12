@@ -1,11 +1,15 @@
 // Package signin drives the daily MiniMax check-in and the credit readings
 // that keep spent accounts out of rotation.
 //
-// Only the international deployment (agent.minimax.io) speaks the protocol
-// implemented in internal/minimax. Mainland accounts share the same product but
-// a different check-in parameter set, so they are reported as skipped rather
-// than signed with the wrong shape — a rejection there would be indistinguishable
-// from a genuinely broken token and would retire a healthy account.
+// Check-in works the same way on both deployments (the international
+// agent.minimax.io and the mainland agent.minimaxi.com). They share the same
+// product, the same check-in endpoints and the same `timezone_offset` parameter
+// set, so an account is signed against whichever host its region routes to and
+// no region is skipped.
+//
+// Balance reads are not region-specific either: the credit endpoint answers the
+// same way on both deployments, so mainland accounts have their balance
+// refreshed like any other.
 package signin
 
 import (
@@ -450,9 +454,6 @@ func skipReason(account *store.Account) string {
 	if !account.Enabled {
 		return "账号已禁用"
 	}
-	if account.Region != store.RegionGlobal {
-		return "仅支持国际站账号（国内站签到参数不同）"
-	}
 	if strings.TrimSpace(account.Token) == "" || account.UUID == "" || account.DeviceID == "" {
 		return "缺少令牌或设备指纹"
 	}
@@ -577,9 +578,6 @@ func sameLocalDay(a, b time.Time) bool {
 // says nothing about whether the token works, and marking the account invalid
 // here would retire healthy accounts whenever the balance endpoint hiccups.
 func (s *Service) refreshCredit(ctx context.Context, account *store.Account) int {
-	if account.Region != store.RegionGlobal {
-		return -1
-	}
 	// Independent of the balance read: a claim that paid out is worth confirming
 	// even when the balance endpoint is unhappy.
 	s.reconcile(ctx, account)
@@ -606,9 +604,6 @@ func (s *Service) RefreshCredit(ctx context.Context, id string) (*store.Credit, 
 	if !ok {
 		return nil, errors.New("账号不存在")
 	}
-	if account.Region != store.RegionGlobal {
-		return nil, errors.New("余额接口仅支持国际站账号")
-	}
 	s.reconcile(ctx, account)
 	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
 	defer cancel()
@@ -627,6 +622,10 @@ func (s *Service) RefreshCredit(ctx context.Context, id string) (*store.Credit, 
 
 // creditLoop keeps the stored balances warm so the routing guard has something
 // current to act on without waiting for the next sweep.
+//
+// The loop runs independently of the sign-in switch: balance reads work for
+// both regions, so Signin.Enabled must not gate it. It is controlled solely by
+// CreditRefresh(), where 0 disables polling.
 func (s *Service) creditLoop(ctx context.Context) {
 	for {
 		interval := s.settings().CreditRefresh()
@@ -641,14 +640,11 @@ func (s *Service) creditLoop(ctx context.Context) {
 		if !sleep(ctx, interval) {
 			return
 		}
-		if !s.settings().Signin.Enabled {
-			continue
-		}
 		for _, account := range s.store.ListAccounts() {
 			if ctx.Err() != nil {
 				return
 			}
-			if !account.Enabled || account.Region != store.RegionGlobal {
+			if !account.Enabled {
 				continue
 			}
 			s.refreshCredit(ctx, account)

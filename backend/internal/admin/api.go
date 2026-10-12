@@ -28,11 +28,20 @@ type API struct {
 	client   *minimax.Client
 	signin   *signin.Service
 	settings func() config.Settings
-	started  time.Time
+	// browserLoginBridge is the base URL of the local CDP bridge that drives a
+	// real browser for the "browser login" flow. Empty disables the feature.
+	browserLoginBridge string
+	httpClient         *http.Client
+	started            time.Time
 }
 
-func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signin.Service, settings func() config.Settings) *API {
-	return &API{store: st, pool: p, client: client, signin: signinSvc, settings: settings, started: time.Now()}
+func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signin.Service, settings func() config.Settings, browserLoginBridge string) *API {
+	return &API{
+		store: st, pool: p, client: client, signin: signinSvc, settings: settings,
+		browserLoginBridge: strings.TrimRight(strings.TrimSpace(browserLoginBridge), "/"),
+		httpClient:         &http.Client{},
+		started:            time.Now(),
+	}
 }
 
 // Register installs every admin route on the mux.
@@ -79,6 +88,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /admin/api/settings", a.guard(a.saveSettings))
 
 	mux.HandleFunc("GET /admin/api/gallery", a.guard(a.gallery))
+
+	mux.HandleFunc("POST /admin/api/browser-login", a.guard(a.startBrowserLogin))
+	mux.HandleFunc("GET /admin/api/browser-login/{id}", a.guard(a.pollBrowserLogin))
+	mux.HandleFunc("DELETE /admin/api/browser-login/{id}", a.guard(a.cancelBrowserLogin))
 }
 
 // ---------------------------------------------------------------- middleware
@@ -1387,10 +1400,11 @@ func probeTimeout(settings config.Settings) time.Duration {
 	return timeout
 }
 
+// quotaPlan names the quota panel after the account's current region. The
+// stored Quota.Plan is deliberately ignored: an early bad sync could freeze a
+// stale value (e.g. an international label on a cn account) that every later
+// sync would then preserve verbatim.
 func quotaPlan(account *store.Account) string {
-	if account.Quota != nil && account.Quota.Plan != "" {
-		return account.Quota.Plan
-	}
 	if account.Region == store.RegionCN {
 		return "MiniMax Agent（国内）"
 	}

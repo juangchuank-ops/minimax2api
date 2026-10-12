@@ -13,13 +13,13 @@ import (
 	"minimax2api/internal/config"
 )
 
-// International check-in ("Daily check-in") endpoints.
+// Daily check-in endpoints.
 //
-// These live on the same host as the agent API but under a different prefix,
-// and they are NOT interchangeable with the mainland deployment: the query
-// carries `timezone_offset` rather than `timezone_id`, and the parameter set
-// differs. Only the international host is implemented here; a mainland
-// account is skipped rather than signed with the wrong protocol.
+// These live on the same host as the agent API but under a different prefix.
+// They are shared by both deployments: the international agent.minimax.io and
+// the mainland agent.minimaxi.com answer the same paths with the same
+// `timezone_offset` parameter set, so an account is signed against whichever
+// host its region routes to and no region is skipped.
 const (
 	DefaultSigninStatusPath = "/minimax-cloud/api/v1/signin/status"
 	DefaultSigninClaimPath  = "/minimax-cloud/api/v1/signin/claim"

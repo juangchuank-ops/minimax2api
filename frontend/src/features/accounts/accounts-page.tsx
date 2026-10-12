@@ -6,6 +6,7 @@ import {
   Coins,
   Download,
   FileUp,
+  Globe,
   Pencil,
   Plus,
   RefreshCw,
@@ -18,7 +19,7 @@ import {
   Power,
   PowerOff,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -57,6 +58,9 @@ import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
   batchAccounts,
+  browserLoginCancel,
+  browserLoginPoll,
+  browserLoginStart,
   cleanupAccounts,
   createAccount,
   deleteAccount,
@@ -75,12 +79,14 @@ import {
   updateAccount,
   type AccountDTO,
   type AccountInput,
+  type AccountRegion,
   type AccountRegionInput,
   type AccountSummary,
 } from "@/features/accounts/accounts-api";
 import { AccountNameCell, AccountRoutingCell, AccountStatusCell } from "@/features/accounts/account-name-cell";
 import { AccountQuotaCell } from "@/features/accounts/account-quota";
 import { AccountCreditCell, AccountSigninCell } from "@/features/accounts/account-signin";
+import { getSettings } from "@/features/settings/settings-api";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { EmptyState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
@@ -185,6 +191,18 @@ export function AccountsPage() {
   const [concurrencyOpen, setConcurrencyOpen] = useState(false);
   const [concurrencyValue, setConcurrencyValue] = useState(2);
 
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserRegion, setBrowserRegion] = useState<AccountRegion>("global");
+  const [browserProxy, setBrowserProxy] = useState("");
+  const [browserBusy, setBrowserBusy] = useState(false);
+  // The live session id lives in a ref, not state: the polling loop and the
+  // cleanup path both read the current value, and a stale closure here would
+  // leave a browser window open.
+  const browserSessionRef = useRef<string | null>(null);
+  const browserTimerRef = useRef<number | null>(null);
+  const browserPollInFlightRef = useRef(false);
+  const browserMountedRef = useRef(true);
+
   const accountsQuery = useQuery({
     queryKey: ["accounts", page, pageSize, search, statusFilter, kindFilter, groupFilter],
     queryFn: () =>
@@ -210,6 +228,18 @@ export function AccountsPage() {
   });
   const signinEnabled = signinQuery.data?.enabled ?? false;
   const skipZeroCredit = signinQuery.data?.skipZeroCredit ?? false;
+
+  // The project-wide outbound proxy (Settings → Upstream → Proxy) is used as the
+  // default for the browser-login dialog, so the operator does not retype it on
+  // every attempt.
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings, staleTime: 60_000 });
+  const projectProxy = settingsQuery.data?.upstream.proxy ?? "";
+  // The settings request may resolve after the dialog was opened; fill the field
+  // then, but never clobber a value the operator has already typed.
+  useEffect(() => {
+    if (!browserOpen || !projectProxy) return;
+    setBrowserProxy((current) => current || projectProxy);
+  }, [browserOpen, projectProxy]);
 
   const items = accountsQuery.data?.items ?? [];
   const summary: AccountSummary = accountsQuery.data?.summary ?? {
@@ -420,6 +450,16 @@ export function AccountsPage() {
     [t],
   );
 
+  // Browser sign-in drives a real upstream page, so "auto" has no meaning here:
+  // the window has to be pointed at one of the two sites up front.
+  const browserRegionOptions = useMemo(
+    () => [
+      { value: "global", label: t("accounts.regionGlobal") },
+      { value: "cn", label: t("accounts.regionCN") },
+    ],
+    [t],
+  );
+
   const kindOptions = useMemo(
     () => [
       { value: "", label: t("accounts.allTypes") },
@@ -500,6 +540,141 @@ export function AccountsPage() {
     }
   }
 
+  // --------------------------------------------------------- browser sign-in
+  //
+  // The backend owns the browser window and inserts the account itself once the
+  // user signs in, so this side only has to start a session, poll it to a
+  // verdict, and refresh the list on success.
+
+  function stopBrowserTimer(): void {
+    if (browserTimerRef.current !== null) {
+      window.clearInterval(browserTimerRef.current);
+      browserTimerRef.current = null;
+    }
+    browserPollInFlightRef.current = false;
+  }
+
+  /**
+   * Drops the active session. `cancelSession` tells the backend to close the
+   * browser window — skipped on success, because there the backend is already
+   * done with it and the account has been written.
+   */
+  function clearBrowserSession(cancelSession: boolean): void {
+    stopBrowserTimer();
+    const sessionId = browserSessionRef.current;
+    browserSessionRef.current = null;
+    setBrowserBusy(false);
+    if (cancelSession && sessionId) {
+      void browserLoginCancel(sessionId).catch(() => {
+        // Best effort: the session may already have reached a verdict.
+      });
+    }
+  }
+
+  function closeBrowserDialog(): void {
+    clearBrowserSession(true);
+    setBrowserOpen(false);
+    setBrowserRegion("global");
+    setBrowserProxy("");
+  }
+
+  // Seed the proxy field with the project-wide outbound proxy on open, unless
+  // the operator already typed a temporary override.
+  function openBrowserDialog(): void {
+    const projectProxy = settingsQuery.data?.upstream.proxy ?? "";
+    setBrowserProxy((current) => current || projectProxy);
+    setBrowserOpen(true);
+  }
+
+  function handleBrowserOpenChange(open: boolean): void {
+    if (open) {
+      openBrowserDialog();
+      return;
+    }
+    // Overlay click, Escape and the close button all land here, and every one
+    // of them means the user walked away from a window that is still open.
+    closeBrowserDialog();
+  }
+
+  function finishBrowserSuccess(): void {
+    clearBrowserSession(false);
+    setBrowserOpen(false);
+    setBrowserRegion("global");
+    setBrowserProxy("");
+    toast.success(t("accounts.browserLoginSuccess"));
+    invalidate();
+  }
+
+  function finishBrowserFailure(message: string): void {
+    clearBrowserSession(true);
+    // The dialog stays open so the region can be changed and the attempt
+    // retried without reopening the menu.
+    toast.error(message);
+  }
+
+  function startBrowserPolling(sessionId: string): void {
+    stopBrowserTimer();
+    browserTimerRef.current = window.setInterval(() => {
+      // A slow response must not stack up behind the next tick, or a single
+      // verdict would be reported several times.
+      if (browserPollInFlightRef.current) return;
+      browserPollInFlightRef.current = true;
+      void browserLoginPoll(sessionId)
+        .then((result) => {
+          // Ignore anything that lands after the dialog closed or the component
+          // unmounted — the session ref is the guard against a stale response.
+          if (!browserMountedRef.current || browserSessionRef.current !== sessionId) return;
+          if (result.status === "pending") return;
+          if (result.status === "ok") finishBrowserSuccess();
+          else finishBrowserFailure(result.error || t("accounts.browserLoginFailed"));
+        })
+        .catch((error: unknown) => {
+          if (!browserMountedRef.current || browserSessionRef.current !== sessionId) return;
+          finishBrowserFailure(errorMessage(error));
+        })
+        .finally(() => {
+          browserPollInFlightRef.current = false;
+        });
+    }, 1500);
+  }
+
+  async function startBrowserLogin(): Promise<void> {
+    setBrowserBusy(true);
+    try {
+      const result = await browserLoginStart(browserRegion, browserProxy);
+      if (!browserMountedRef.current) {
+        // The page went away between the click and the response; close the
+        // window nobody is waiting on.
+        void browserLoginCancel(result.sessionId).catch(() => undefined);
+        return;
+      }
+      browserSessionRef.current = result.sessionId;
+      startBrowserPolling(result.sessionId);
+    } catch (error) {
+      if (!browserMountedRef.current) return;
+      setBrowserBusy(false);
+      toast.error(errorMessage(error));
+    }
+  }
+
+  useEffect(() => {
+    browserMountedRef.current = true;
+    return () => {
+      browserMountedRef.current = false;
+      if (browserTimerRef.current !== null) {
+        window.clearInterval(browserTimerRef.current);
+        browserTimerRef.current = null;
+      }
+      const sessionId = browserSessionRef.current;
+      browserSessionRef.current = null;
+      if (sessionId) {
+        void browserLoginCancel(sessionId).catch(() => {
+          // Best effort on teardown.
+        });
+      }
+    };
+  }, []);
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -519,6 +694,10 @@ export function AccountsPage() {
                 <DropdownMenuItem onClick={() => setEditor({ ...EMPTY_EDITOR, open: true })}>
                   <SquareTerminal />
                   {t("accounts.tokenLogin")}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={openBrowserDialog}>
+                  <Globe />
+                  {t("accounts.browserLogin")}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setImportOpen(true)}>
                   <FileUp />
@@ -1020,6 +1199,55 @@ export function AccountsPage() {
             </Button>
             <Button size="sm" disabled={importMutation.isPending || !importText.trim()} onClick={() => importMutation.mutate()}>
               {t("accounts.importAction")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={browserOpen} onOpenChange={handleBrowserOpenChange}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("accounts.browserLoginTitle")}</DialogTitle>
+            <DialogDescription>{t("accounts.browserLoginDescription")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <Label htmlFor="browser-login-region">{t("accounts.region")}</Label>
+              <Select
+                ariaLabel={t("accounts.region")}
+                disabled={browserBusy}
+                value={browserRegion}
+                onChange={(value) => setBrowserRegion(value as AccountRegion)}
+                options={browserRegionOptions}
+              />
+              <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.browserLoginRegionHelp")}</p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="browser-login-proxy">{t("accounts.browserLoginProxy")}</Label>
+              <Input
+                id="browser-login-proxy"
+                className="font-mono text-[11px]"
+                disabled={browserBusy}
+                value={browserProxy}
+                onChange={(event) => setBrowserProxy(event.target.value)}
+                placeholder={t("accounts.browserLoginProxyPlaceholder")}
+              />
+              <p className="text-[11px] leading-5 text-muted-foreground">{t("accounts.browserLoginProxyHelp")}</p>
+            </div>
+            {browserBusy ? (
+              <p className="flex items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
+                <Spinner className="size-3.5" />
+                {t("accounts.browserLoginPending")}
+              </p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button variant="secondary" size="sm" onClick={closeBrowserDialog}>
+              {t("common.cancel")}
+            </Button>
+            <Button size="sm" disabled={browserBusy} onClick={() => void startBrowserLogin()}>
+              <Globe />
+              {t("accounts.browserLoginStart")}
             </Button>
           </DialogFooter>
         </DialogContent>
