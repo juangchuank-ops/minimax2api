@@ -7,6 +7,7 @@ type DropdownContextValue = {
   open: boolean;
   setOpen: (open: boolean) => void;
   anchor: React.RefObject<HTMLDivElement | null>;
+  content: React.RefObject<HTMLDivElement | null>;
 };
 
 const DropdownContext = React.createContext<DropdownContextValue | null>(null);
@@ -14,11 +15,17 @@ const DropdownContext = React.createContext<DropdownContextValue | null>(null);
 function DropdownMenu({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = React.useState(false);
   const anchor = React.useRef<HTMLDivElement | null>(null);
+  const content = React.useRef<HTMLDivElement | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
+    // 内容 portal 到 body，不在 anchor 子树里，所以两个都要判。只判 anchor
+    // 会把点菜单项当成点外部：菜单在 mousedown 与 mouseup 之间被卸载，
+    // 两者不在同一元素上，click 根本不会产生，菜单项的 onClick 也就永不执行。
     function onPointerDown(event: MouseEvent): void {
-      if (anchor.current && !anchor.current.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (anchor.current?.contains(target) || content.current?.contains(target)) return;
+      setOpen(false);
     }
     function onKeyDown(event: KeyboardEvent): void {
       if (event.key === "Escape") setOpen(false);
@@ -32,7 +39,7 @@ function DropdownMenu({ children }: { children: React.ReactNode }) {
   }, [open]);
 
   return (
-    <DropdownContext.Provider value={{ open, setOpen, anchor }}>
+    <DropdownContext.Provider value={{ open, setOpen, anchor, content }}>
       <div ref={anchor} className="relative inline-flex">
         {children}
       </div>
@@ -73,6 +80,7 @@ function DropdownMenuContent({
   if (!context?.open) return null;
   return createPortal(
     <div
+      ref={context.content}
       role="menu"
       className={cn(
         "fixed z-50 min-w-44 overflow-hidden rounded-md border border-border/60 bg-popover p-1 text-popover-foreground shadow-lg animate-in fade-in-0 zoom-in-95",

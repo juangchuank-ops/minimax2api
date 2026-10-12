@@ -34,7 +34,7 @@ func main() {
 	client := minimax.New(settingsFn)
 	accountPool := pool.New(st, settingsFn)
 	signinSvc := signin.New(st, client, settingsFn, gateway.CredentialOf)
-	api := admin.New(st, accountPool, client, signinSvc, settingsFn)
+	api := admin.New(st, accountPool, client, signinSvc, settingsFn, cfg.BrowserLoginBridge)
 	compat := gateway.New(st, accountPool, client, settingsFn)
 
 	mux := http.NewServeMux()

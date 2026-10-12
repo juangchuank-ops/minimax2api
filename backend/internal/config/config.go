@@ -17,6 +17,11 @@ type Config struct {
 	StaticDir     string
 	AdminUser     string
 	AdminPassword string
+	// BrowserLoginBridge is the base URL of the local CDP bridge that drives a
+	// real browser for the console's "browser login" flow. It is a process-level
+	// option rather than a stored setting because it names another process on
+	// this host, not a tunable of the gateway itself.
+	BrowserLoginBridge string
 }
 
 func Load() Config {
@@ -26,6 +31,7 @@ func Load() Config {
 	flag.StringVar(&cfg.StaticDir, "static", env("MINIMAX2API_STATIC", "frontend/dist"), "built frontend directory")
 	flag.StringVar(&cfg.AdminUser, "admin-user", env("MINIMAX2API_ADMIN_USER", "admin"), "initial admin username")
 	flag.StringVar(&cfg.AdminPassword, "admin-password", env("MINIMAX2API_ADMIN_PASSWORD", ""), "initial admin password (random when empty)")
+	flag.StringVar(&cfg.BrowserLoginBridge, "browser-login-bridge", env("MINIMAX2API_BROWSER_LOGIN_BRIDGE", "http://127.0.0.1:8766"), "browser login CDP bridge base URL")
 	flag.Parse()
 
 	if cfg.AdminPassword == "" {
@@ -89,11 +95,10 @@ type VideoSettings struct {
 
 // SigninSettings drives the daily check-in sweep and the credit guard.
 //
-// Only the international deployment is implemented. MiniMax runs the check-in
-// under a different parameter set on the mainland host (it keys off
-// timezone_id rather than timezone_offset), and signing a mainland account with
-// the international protocol just earns a rejection, so those accounts are
-// skipped rather than guessed at.
+// Both deployments are supported. The international agent.minimax.io and the
+// mainland agent.minimaxi.com share the same check-in endpoints and the same
+// `timezone_offset` parameter set, so an account is signed against whichever
+// host its region routes to; no region is skipped.
 type SigninSettings struct {
 	Enabled bool `json:"enabled"`
 	// Hour and Minute are local wall-clock time for the daily sweep. The
