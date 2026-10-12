@@ -13,7 +13,7 @@
   同时提供 <b>Anthropic Messages 兼容端点</b>，并配一套管理台 + 号池调度。
 </p>
 
-后端是纯 Go 标准库，**无第三方依赖**，单二进制 + 单 JSON 文件即可运行。前端 React 19 + Vite + Tailwind 4，组件自建、零依赖。
+后端是纯 Go 标准库，**无第三方依赖**，单二进制 + 单 JSON 文件即可运行。前端 React 19 + Vite + Tailwind 4，**不依赖第三方 UI 组件库**（组件自建）。
 
 ---
 
@@ -53,8 +53,9 @@
 
 **签到与积分**
 
-- 后台按天自动给国际站账号签到，结果直接落在号池列表的「签到」「积分」两列
-- 零积分账号在请求中自动跳过（带新鲜期，过期后重新参与调度）
+- 后台按天自动给账号签到，结果直接落在号池列表的「签到」「积分」两列。**默认关闭**，需在「系统设置 → 签到」启用
+- 国内站与国际站账号均支持签到
+- 零积分账号在请求中自动跳过（带新鲜期，过期后重新参与调度）。这是 **opt-in**，默认关
 - 支持单账号「立即签到」/「刷新积分」与一键全部签到
 
 **管理台**
@@ -76,13 +77,44 @@
 
 ### 环境要求
 
-- Go 1.24+
-- Node.js 20+（仅在需要重新构建前端时用到）
-- **一个境外出站代理**（部署在境外机器上则不需要）
+- **操作系统**：启动脚本覆盖 **Linux / macOS**（`.sh`）与 **Windows**（`.bat`），直接双击或在终端跑即可。
+- **Go 1.24+**：构建后端必需。`go.mod` 无第三方依赖，纯标准库。
+- **Node.js 22+**：不只是构建前端——「浏览器登录」的桥进程运行时也要 Node 22（依赖全局 `WebSocket`，Node 22.4+ 才有）。构建前端本身需要 20.19+ / 22.12+（Vite 8），所以统一按 **22+** 装最省事。
+- **Chrome / Chromium / Edge**：仅「浏览器登录」功能需要，且必须装在**运行本服务的这台机器**上。桥会自动在常见路径找（Linux 的 PATH、macOS 的 `/Applications`、Windows 的 `Program Files`），找不到可设 `CHROME_BIN` 指过去。
+- **境外出站代理**：只在国际站业务请求上需要；部署在境外机器、或只用国内站则不需要。地址填你自己的（`http://` 或 `socks5://`），在「系统设置 → 上游 → 代理」里配。
+- **Python 3**（可选）：只有跑 `tools/` 下的自检脚本才需要。
 
 > 国际站的业务请求有地域围栏，直连会返回**空 body 的 `401`**，看起来极像令牌失效。见下方「出口 IP」。
 
-### 构建
+### 用启动脚本运行（推荐）
+
+仓库根目录有两个现成脚本，会自动处理「检测不到前端产物 / 二进制就先构建」，**无需先手动 build**：
+
+```bash
+# Linux / macOS：只监听 127.0.0.1，同网段的手机 / 其他电脑访问不到
+./start-minimax2api.sh [端口] [初始管理员密码] [--rebuild]
+
+# Linux / macOS：监听 0.0.0.0，局域网内可访问
+./start-minimax2api-lan.sh [端口] [初始管理员密码] [--rebuild]
+```
+
+Windows 用户双击或在命令行跑同名的 `.bat`（无需先装 Git Bash）：
+
+```bat
+:: 仅本机
+start-minimax2api.bat [端口] [初始管理员密码] [--rebuild]
+
+:: 局域网
+start-minimax2api-lan.bat [端口] [初始管理员密码] [--rebuild]
+```
+
+- 端口默认 `8080`，密码只在首次启动（`data/app.json` 不存在）时生效；不传密码会**随机生成并打印在日志里**。
+- 脚本还会**自动拉起浏览器登录桥**（见下方「浏览器登录」），并在退出时一并停掉。
+- `--rebuild` 会在启动前重新构建前后端；不加则只在缺产物时构建。
+
+> ⚠️ **局域网模式的安全提醒**：`start-minimax2api-lan.sh` 会把管理台对整个网段开放。别人只能看到登录页，但请务必给管理员账号设一个像样的密码，并且只在可信网络（家里的 Wi-Fi、公司内网）里这样跑。
+
+### 手动构建（高级 / Windows）
 
 ```bash
 # 1. 前端（产物输出到 frontend/dist）
@@ -102,6 +134,12 @@ MINIMAX2API_ADMIN_PASSWORD=你的密码 ./minimax2api -addr 127.0.0.1:8080
 ```
 
 打开 `http://127.0.0.1:8080`，用 `admin` / 你设置的密码登录。
+
+> 上面是 POSIX（Linux / macOS）写法。**Windows** 下用 `set` 设环境变量：
+>
+> ```bat
+> set MINIMAX2API_ADMIN_PASSWORD=你的密码 && minimax2api.exe -addr 127.0.0.1:8080
+> ```
 
 > 不传 `MINIMAX2API_ADMIN_PASSWORD` 时，首次启动会随机生成密码并打印在控制台。
 
@@ -125,6 +163,26 @@ cn:eyJhbGciOiJIUzI1NiIs...
 导入框的**区域**默认「自动识别」，逐行读令牌里的手机号区号，国内号和国际号可以混在一份列表里一次导完。整批都是同一站点（或令牌里没有手机号推断不出来）时，选定 `国内` / `国际` 强制覆盖。
 
 > 已存在的账号会被**更新**而不是报错——令牌过期后重新导入同一行即可刷新。
+
+### 浏览器登录（可选）
+
+不想手动抓 JWT 时，可以让服务端这台机器上的真实 Chrome 帮你登：
+
+1. 管理台 → **号池管理** → 添加账号 → 「**浏览器登录**」
+2. 服务端机器上会弹出一个真实 Chrome 窗口，人工登录 MiniMax
+3. 登录完成后自动抓取 `localStorage._token` 并加入号池（region 按手机号区号自动判定）
+
+前置条件：**运行本服务的机器**上有 Chrome、Node 22+，且浏览器登录桥已启动：
+
+```bash
+node tools/browser-login-bridge.mjs --port 8766
+```
+
+> 用启动脚本运行时**会自动拉起**这个桥，不用手动执行。
+
+- 桥用的代理默认取「系统设置 → 上游 → 代理」，可在登录时临时覆盖。
+- 登录态会**复用**（同一个 profile），下次打开通常已经是登录状态。
+- **限制**：没有图形界面的服务器不适用；从局域网其它设备访问管理台时，登录窗口仍然开在**服务端机器**上，而不是你当前操作的设备上。
 
 ### 调用
 
@@ -274,6 +332,7 @@ curl http://127.0.0.1:8080/v1/videos/generations \
 | `-static` | `MINIMAX2API_STATIC` | `frontend/dist` | 前端产物目录 |
 | `-admin-user` | `MINIMAX2API_ADMIN_USER` | `admin` | 初始管理员用户名 |
 | `-admin-password` | `MINIMAX2API_ADMIN_PASSWORD` | 随机 | 初始管理员密码 |
+| `-browser-login-bridge` | `MINIMAX2API_BROWSER_LOGIN_BRIDGE` | `http://127.0.0.1:8766` | 浏览器登录 CDP 桥地址 |
 
 ### 运行时设置
 
@@ -411,6 +470,9 @@ location / {
 ```
 backend/
   cmd/minimax2api/      入口：路由装配、静态托管、优雅关闭
+  cmd/driveprobe/       调试探针：读会话摘要 / 文件下载地址
+  cmd/entryprobe/       调试探针：判定消息该发往哪个入口
+  cmd/videorun/         调试探针：发一条真实视频请求并报告结果（消耗积分）
   internal/config/      启动参数 + 运行时设置模型
   internal/store/       状态与持久化（内存态 + 单文件）
   internal/pool/        号池调度
@@ -420,10 +482,12 @@ backend/
   internal/admin/       管理台 API
 frontend/
   src/app/              壳层与路由
-  src/components/ui/    自建 UI 组件（零依赖）
-  src/features/         各功能页
+  src/components/ui/    自建 UI 组件（不依赖第三方 UI 组件库）
+  src/features/         各功能页（含 docs 接口文档页）
   src/shared/           API 客户端、鉴权、i18n、工具
-tools/                  自检脚本（冒烟 / 契约 / 字段 / 签到 / 渲染 / 密钥扫描）
+tools/                  自检脚本（冒烟 / 契约 / 字段 / 签到 / 渲染 / 主题 / 密钥扫描）
+  browser-login-bridge.mjs  浏览器登录桥：驱动真实 Chrome 抓 _token
+  theme.mjs             主题 / 文档语言适配检查
   stub_upstream.py      桩上游：答握手与消息流，落盘收到的参数块
   video_matrix.py       视频参数全矩阵（配桩使用，不消耗积分）
 assets/                 logo
@@ -441,14 +505,30 @@ go test ./...    # 单元测试（含并发 / 重入锁回归）
 go vet ./...
 ```
 
-端到端（需先启动服务）：
+端到端（需先启动服务，且本机装 **Python 3**）：
 
 ```bash
 python tools/smoke.py    --base http://127.0.0.1:8080 --password 你的密码 --skip-upstream
 python tools/contract.py --base http://127.0.0.1:8080 --password 你的密码   # 接口契约
 python tools/fields.py   --base http://127.0.0.1:8080 --password 你的密码   # DTO 字段契约
 python tools/signin_e2e.py --base http://127.0.0.1:8080 --password 你的密码 # 签到链路（自建假上游）
-node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码  # 真实渲染（需本机 Chrome）
+```
+
+真实渲染 / 主题检查需要先起一个带调试端口的 Chrome：
+
+```bash
+# 先启动 Chrome（临时 profile，开调试端口 9222）
+chrome --headless=new --disable-gpu --remote-debugging-port=9222 \
+       --user-data-dir=<临时目录> about:blank
+
+node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码  # 真实渲染
+node tools/theme.mjs  http://127.0.0.1:8080 http://127.0.0.1:9222           # 主题 / 语言适配
+```
+
+浏览器登录桥也可以单独手动启动（启动脚本会自动拉，一般不用管）：
+
+```bash
+node tools/browser-login-bridge.mjs --port 8766
 ```
 
 视频参数矩阵（把上游指到桩上，不消耗积分）：
@@ -520,7 +600,7 @@ git config core.hooksPath tools/hooks    # 装成 pre-commit 钩子
 转存走的是和 API 同一个代理。生成物在 MiniMax 的 CDN 上，出口围栏同样适用——本地直连会失败，表现为超时或连接重置。生成物默认转存到 `data/generated/`，通过 `/media/` 对外提供。
 
 **Q：签到显示「已跳过」，是坏了吗？**
-不是。跳过有明确原因，账号记录里会写明：国内站账号走的是另一套签到参数（`timezone_id` 而不是 `timezone_offset`）；或账号缺 `realUserID`（这时发请求必定 401，而 401 会让账号被当成坏号退役）。跳过是**成功语义**，不影响账号健康。
+不是。跳过有明确原因，账号记录里会写明：账号缺 `realUserID`（这时发请求必定 401，而 401 会让账号被当成坏号退役）、**缺少令牌或设备指纹**，或账号已禁用。跳过是**成功语义**，不影响账号健康。
 
 **Q：上游改版后全部 404 / 400？**
 路径变了。重新抓一次包，在「系统设置 → 上游」里更新，不用重新编译。
