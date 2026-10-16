@@ -218,16 +218,22 @@ type Options struct {
 	DisableStream bool
 }
 
-// UploadedImage is a remote image reference forwarded to the agent.
+// UploadedImage is a picture the turn carries.
 //
-// MiniMax's attachment pipeline needs a signed upload we cannot reproduce from
-// the outside, so images are passed through by URL and resolved upstream.
-type UploadedImage struct {
-	URL    string
-	Name   string
-	Width  int
-	Height int
-}
+// It used to be a bare URL: the upstream resolved the reference server-side and
+// that was the entire integration. That path is closed. The upstream now
+// answers a URL-only attachment with
+//
+//	[1406010011]: attachment requires one owned object_key or allowed legacy URL
+//
+// so a picture has to travel exactly the way a document does — prepared, pushed
+// to the object store with the turn's own credential, and referenced by the
+// object key that comes back. Only the envelope differs, and only in one field;
+// see buildMessageBody.
+//
+// It is an alias rather than a second struct because the payload is genuinely
+// the same one, and two copies of it would be two places to forget a field.
+type UploadedImage = PendingAttachment
 
 // Client talks to the MiniMax Agent web API.
 type Client struct {
@@ -691,10 +697,19 @@ func (c *Client) Completion(ctx context.Context, opts Options) (*Result, error) 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Upload before the session is opened: a file that cannot reach the object
-	// store should not spend a session (and the opening sequence behind it).
-	// Object keys cache per credential, so a retried turn on the same account
-	// does not push the same bytes twice.
+	// Upload before the session is opened: an attachment that cannot reach the
+	// object store should not spend a session (and the opening sequence behind
+	// it). Object keys cache per credential, so a retried turn on the same
+	// account does not push the same bytes twice.
+	//
+	// Pictures go through the same pipeline as documents. They did not always:
+	// a picture used to be a URL the upstream fetched for itself, and the
+	// upstream stopped accepting those. See UploadedImage.
+	for i := range opts.Images {
+		if err := c.UploadAttachment(ctx, opts.Credential, &opts.Images[i]); err != nil {
+			return nil, err
+		}
+	}
 	for i := range opts.Files {
 		if err := c.UploadAttachment(ctx, opts.Credential, &opts.Files[i]); err != nil {
 			return nil, err
@@ -758,22 +773,38 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 	return result, nil
 }
 
+// imageAttachmentKind is what a picture says it is, on the wire.
+//
+// The string, not a number. The bundle does contain a numeric enum
+// (`Image = 1`, `Doc = 2`) and a reader that compares against 1, but both
+// belong to the *legacy* attachment shape. The cloud envelope this gateway
+// sends is written by `f`, which copies the composer's own type straight
+// through — and a captured request from the real web client carries
+//
+//	"meta": { "attachment_type": "image", ... }
+//
+// so the composer's type is a string. A document says "file", which is the same
+// vocabulary and is what this gateway has always sent; the numeric enum would
+// have been the odd one out, and reading it off the enum instead of off a
+// request was a mistake worth remembering.
+const imageAttachmentKind = "image"
+
 // buildMessageBody renders the request body for one turn.
 //
 // The agent expects the whole conversation in a single `content` string, which
 // is what the gateway already produces when it flattens OpenAI messages.
 //
-// Attachments have two shapes. Images keep the flat `url` reference they have
-// always used — the upstream resolves the URL server-side and that path is
-// proven. Files use the `meta`/`cloud` envelope the web client sent when its
-// own upload was captured: `attachment_type`, name, mime and size under
-// `meta`, the object key under `cloud`. A file-only turn still carries a
-// non-empty `content` — the captured turn used a single space.
+// Both kinds of attachment use the same `meta`/`cloud` envelope the web client
+// sends once its own upload has landed: `attachment_type`, name, mime and size
+// under `meta`, the object key under `cloud`. They differ in exactly one field
+// — see imageAttachmentKind. A turn that carries an attachment but no words
+// still sends a non-empty `content`: a captured attachment-only turn sent
+// spaces, and anything non-empty keeps the two shapes distinguishable.
 func buildMessageBody(settings config.Settings, opts Options, turnID string) map[string]any {
-	// A turn that only carries files still needs a non-empty `content` — the
-	// captured file upload turn sent a single space, and that is what goes out.
+	// An attachment-only turn still needs a non-empty `content` — the captured
+	// file upload turn sent a single space, and that is what goes out.
 	text := opts.Text
-	if strings.TrimSpace(text) == "" && len(opts.Files) > 0 {
+	if strings.TrimSpace(text) == "" && (len(opts.Images) > 0 || len(opts.Files) > 0) {
 		text = " "
 	}
 	body := map[string]any{
@@ -784,10 +815,20 @@ func buildMessageBody(settings config.Settings, opts Options, turnID string) map
 
 	attachments := make([]any, 0, len(opts.Images)+len(opts.Files))
 	for _, image := range opts.Images {
+		if image.ObjectKey == "" {
+			// Same rule as a document: an attachment with no key is one the
+			// upstream refuses, and Completion has already uploaded everything
+			// it was given. Reaching here means a caller built Options by hand.
+			continue
+		}
 		attachments = append(attachments, map[string]any{
-			"type": "image",
-			"url":  image.URL,
-			"name": image.Name,
+			"meta": map[string]any{
+				"attachment_type": imageAttachmentKind,
+				"file_name":       image.Name,
+				"mime_type":       image.MimeType,
+				"size_bytes":      image.Size,
+			},
+			"cloud": map[string]any{"object_key": image.ObjectKey},
 		})
 	}
 	for _, file := range opts.Files {

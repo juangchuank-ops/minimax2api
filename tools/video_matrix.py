@@ -90,6 +90,8 @@ def main():
     parser.add_argument("--base", default="http://127.0.0.1:18099")
     parser.add_argument("--password", default="admin12345")
     parser.add_argument("--log", default="", help="the stub's --log file, to check what upstream received")
+    parser.add_argument("--stub", default="http://127.0.0.1:18081",
+                        help="the stub's base URL; it serves the reference pictures too")
     args = parser.parse_args()
     base = args.base.rstrip("/")
 
@@ -201,24 +203,29 @@ def main():
     print("\n6. reference pictures")
     before = len(read_turns(args.log))
 
+    # A reference is fetched by the gateway now, so the URL has to resolve.
+    def reference(name):
+        return f"{args.stub.rstrip('/')}/image/{name}"
+
+
     status, payload = call(base, "/v1/images/generations", "POST",
-                           {"prompt": "改成水彩", "image_url": "https://example.test/a.png"}, key)
+                           {"prompt": "改成水彩", "image_url": reference("a.png")}, key)
     check("image: one image_url is accepted and nothing is reported as adjusted",
           status == 200 and "adjusted" not in payload, f"status={status} {payload}")
 
     status, payload = call(base, "/v1/images/generations", "POST", {
         "prompt": "把这四张合成一张",
-        "image": "https://example.test/1.png",
-        "image_url": "https://example.test/2.png",
-        "image_urls": ["https://example.test/3.png", "https://example.test/4.png"],
+        "image": reference("1.png"),
+        "image_url": reference("2.png"),
+        "image_urls": [reference("3.png"), reference("4.png")],
     }, key)
     check("image: every spelling is additive", status == 200, f"status={status} {payload}")
 
     status, payload = call(base, "/v1/videos/generations", "POST", {
         "model": "minimax-h3-max", "prompt": "镜头缓慢推近",
         "ratio": "16:9", "resolution": "768P", "duration": 8,
-        "image_urls": ["https://example.test/first.png", "https://example.test/last.png",
-                       "https://example.test/spare.png"],
+        "image_urls": [reference("first.png"), reference("last.png"),
+                       reference("spare.png")],
     }, key)
     adjusted = payload.get("adjusted") or []
     check("video: h3-max trims a third reference and says so",
@@ -228,8 +235,8 @@ def main():
     status, payload = call(base, "/v1/videos/generations", "POST", {
         "model": "minimax-h3", "prompt": "镜头缓慢推近",
         "ratio": "16:9", "resolution": "768P", "duration": 8,
-        "image_urls": ["https://example.test/1.png", "https://example.test/2.png",
-                       "https://example.test/3.png"],
+        "image_urls": [reference("1.png"), reference("2.png"),
+                       reference("3.png")],
     }, key)
     check("video: h3 keeps every reference it was given",
           status == 200 and "adjusted" not in payload, f"status={status} {payload}")
@@ -248,25 +255,45 @@ def main():
               status == 400 and "http(s) URL" in message and bare not in message,
               f"status={status} {message[:160]}")
 
+    # An inline reference needs no configuration: the bytes are in the request,
+    # so they are decoded and uploaded. It used to require the media public base
+    # URL, because the reference was republished as a URL for the upstream to
+    # fetch — that requirement went away with the URL path.
     status, payload = call(base, "/v1/images/generations", "POST",
                            {"prompt": "改成水彩", "image_url": "data:image/png;base64," + bare}, key)
-    check("image: an inline reference names the setting it needs",
-          status == 400 and "public base URL" in json.dumps(payload),
-          f"status={status} {json.dumps(payload, ensure_ascii=False)[:160]}")
+    check("image: an inline reference is accepted with no public base URL",
+          status == 200, f"status={status} {json.dumps(payload, ensure_ascii=False)[:160]}")
 
     # The response says what the gateway decided; the stub says what it did.
+    #
+    # A reference is an object now, not a URL: the picture had to be fetched,
+    # uploaded, and cited by the key that came back. A file name alone would not
+    # show that — the key is the part the upstream actually insists on.
     want = [
-        ["https://example.test/a.png"],
-        ["https://example.test/1.png", "https://example.test/2.png",
-         "https://example.test/3.png", "https://example.test/4.png"],
-        ["https://example.test/first.png", "https://example.test/last.png"],
-        ["https://example.test/1.png", "https://example.test/2.png", "https://example.test/3.png"],
+        ["a.png"],
+        ["1.png", "2.png", "3.png", "4.png"],
+        ["first.png", "last.png"],
+        ["1.png", "2.png", "3.png"],
     ]
     turns = read_turns(args.log)[before:]
-    got = [turn["references"] for turn in turns]
-    check(f"upstream received exactly the {sum(len(item) for item in want)} references across four turns",
-          got == want, json.dumps(got, ensure_ascii=False))
-    check("no refused request reached upstream", len(turns) == len(want), f"{len(turns)} turns")
+    got = [[item["file_name"] for item in turn["references"]] for turn in turns]
+    # The fifth turn is the inline one, whose file name the gateway invents, so
+    # it is checked by shape rather than by value.
+    total = sum(len(item) for item in want) + 1
+    check(f"upstream received exactly the {total} references across five turns",
+          got[:len(want)] == want and len(got) == len(want) + 1
+          and len(got[-1]) == 1 and got[-1][0].startswith("inline-"),
+          json.dumps(got, ensure_ascii=False))
+    keys = [item["object_key"] for turn in turns for item in turn["references"]]
+    check("every reference arrived with an object key from the upload",
+          len(keys) == total and all(keys), json.dumps(keys, ensure_ascii=False))
+    check("no reference travelled as a bare URL",
+          not any("url" in item for turn in turns for item in turn["references"]))
+    # The kind is the string, not the number the bundle's enum suggests. A
+    # numeric value here would still pass every other check and still be wrong.
+    kinds = {item["kind"] for turn in turns for item in turn["references"]}
+    check('every reference said it was "image"', kinds == {"image"}, json.dumps(sorted(kinds)))
+    check("no refused request reached upstream", len(turns) == len(want) + 1, f"{len(turns)} turns")
 
     print()
     if FAILURES:

@@ -299,7 +299,9 @@ curl http://127.0.0.1:8080/v1/videos/generations \
 
 三个字段是**同一份列表的三种写法**，顺序是 `image` → `image_url` → `image_urls`。同时给不会互相覆盖——静默丢掉调用方自己看得见的一张图，不是帮忙。
 
-**取值只有两种**：公网 `http(s)` URL，或 `data:` URI。data URI 会被写进媒体目录、用「系统设置 → 媒体 → 公开访问前缀」重新发布出去，因为 Agent 是**服务端下载附件**的，读不了 `data:`；没配公开前缀时会明确报错，而不是转发上去让它含混地失败。
+**取值只有两种**：公网 `http(s)` URL，或 `data:` URI。两种都**不需要额外配置**——网关把参考图取回来（URL 自己下载、data URI 直接解码），再和文档一样**上传到上游的对象存储**，用返回的 object key 引用。
+
+> ⚠️ 上游**不再接受「只给一个 URL」的附件**了（会回 `[1406010011] attachment requires one owned object_key or allowed legacy URL`，那个「allowed legacy URL」白名单里只有它自己的 OSS 域名）。所以参考图现在**由网关自己发请求取回**——client key 能指使网关去取它够得着的任何地址，**密钥的可信度和账号同级**。单个参考图上限 32 MB、超时 60 秒。
 
 > 裸 base64（不带 `data:` 前缀的那种）会被 **400 拒掉**并说明要什么。这是客户端按「OpenAI 图像编辑」惯例发送时最常犯的错——原样转发只会换来一个不点名的上游错误，还白花一轮。
 
@@ -585,7 +587,10 @@ git config core.hooksPath tools/hooks    # 装成 pre-commit 钩子
 模型范围优先。设置里那三个默认值是**全局唯一**的一份，而两个 H3 的分辨率档并不相同，所以默认值只负责「你没传时填什么」，填完还要过一遍该模型的范围；范围里没有就改到最近的一档。
 
 **Q：参考图传 base64 直接 400？**
-只收公网 `http(s)` URL 和 `data:` URI 两种。裸 base64 要自己补前缀（`data:image/png;base64,`）；`data:` URI 还需要配「系统设置 → 媒体 → 公开访问前缀」，因为 Agent 是**服务端下载附件**的，读不了内联数据。
+只收公网 `http(s)` URL 和 `data:` URI 两种，裸 base64 要自己补前缀（`data:image/png;base64,`）。两种都不需要额外配置。
+
+**Q：上游报 `[1406010011] attachment requires one owned object_key or allowed legacy URL`？**
+这是上游改版后的新规矩：附件必须由账号自己上传过（带 object key），或者落在它自己的 OSS 域名白名单里。**本项目已修**——参考图会先被取回、上传、再用 object key 引用。如果你的版本还在报这个，先确认 `go build` 用的是最新代码。
 
 **Q：给了三张参考图，模型只用两张？**
 `minimax-h3-max` 只做首帧/尾帧，上限 2 张；超出的会被截断，并在响应的 `adjusted` 里写成 `reference_images: 3 → 2`。要真正的多图参考用 `minimax-h3`（不限制）。**顺序就是语义**：前两张分别当首帧和尾帧。

@@ -249,6 +249,60 @@ func TestBuildMessageBodyCarriesFileEnvelope(t *testing.T) {
 	}
 }
 
+// A picture travels in the same envelope as a document and differs in one
+// field: what it says it is.
+//
+// This is the whole fix, so it is pinned here rather than only through the
+// gateway. The value is the string "image" because that is what a captured
+// request from the real web client carries — the bundle's numeric enum belongs
+// to a different, legacy shape.
+func TestBuildMessageBodyCarriesImageEnvelope(t *testing.T) {
+	settings := config.DefaultSettings(t.TempDir())
+	body := buildMessageBody(settings, Options{
+		Images: []UploadedImage{{
+			Name: "cat.png", MimeType: "image/png", Size: 67, ObjectKey: "9484b529-a583",
+		}},
+	}, "turn-1")
+
+	attachments, _ := body["attachments"].([]any)
+	if len(attachments) != 1 {
+		t.Fatalf("attachments = %#v, want one", body["attachments"])
+	}
+	entry, _ := attachments[0].(map[string]any)
+	meta, _ := entry["meta"].(map[string]any)
+	cloud, _ := entry["cloud"].(map[string]any)
+	if meta == nil || cloud == nil {
+		t.Fatalf("attachment = %#v, want meta and cloud", entry)
+	}
+	if meta["attachment_type"] != imageAttachmentKind {
+		t.Errorf("attachment_type = %#v, want %q", meta["attachment_type"], imageAttachmentKind)
+	}
+	if meta["file_name"] != "cat.png" || meta["mime_type"] != "image/png" || meta["size_bytes"] != int64(67) {
+		t.Errorf("meta = %v", meta)
+	}
+	if cloud["object_key"] != "9484b529-a583" {
+		t.Errorf("cloud = %v", cloud)
+	}
+
+	// The URL shape the upstream no longer accepts must not come back.
+	if _, ok := entry["url"]; ok {
+		t.Errorf("the attachment still carries a bare url: %#v", entry)
+	}
+}
+
+// An attachment with no object key is the thing the upstream refuses, so it is
+// left out rather than sent to be rejected.
+func TestBuildMessageBodyDropsAnUnuploadedImage(t *testing.T) {
+	settings := config.DefaultSettings(t.TempDir())
+	body := buildMessageBody(settings, Options{
+		Text:   "看看这个",
+		Images: []UploadedImage{{Name: "cat.png", MimeType: "image/png"}},
+	}, "turn-1")
+	if _, ok := body["attachments"]; ok {
+		t.Errorf("an image without an object key was sent: %#v", body["attachments"])
+	}
+}
+
 func TestBuildMessageBodySendsSpaceForFileOnlyTurn(t *testing.T) {
 	// The captured file-only turn carried content " " — an empty string is
 	// what a bare turn looks like, and the two must stay distinguishable.
@@ -261,9 +315,9 @@ func TestBuildMessageBodySendsSpaceForFileOnlyTurn(t *testing.T) {
 	}
 
 	imageOnly := buildMessageBody(settings, Options{
-		Images: []UploadedImage{{URL: "https://example.test/a.png", Name: "a.png"}},
+		Images: []UploadedImage{{Name: "a.png", MimeType: "image/png", Size: 3, ObjectKey: "k"}},
 	}, "turn-1")
-	if imageOnly["content"] != "" {
-		t.Errorf("image-only content = %q, want the empty string preserved", imageOnly["content"])
+	if imageOnly["content"] != " " {
+		t.Errorf("image-only content = %q, want a single space", imageOnly["content"])
 	}
 }

@@ -364,7 +364,7 @@ func TestAnthropicMessagesForwardsImageBlocks(t *testing.T) {
 		"model": "minimax-agent",
 		"messages": []any{map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "这是什么"},
-			map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://example.com/cat.png"}},
+			map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": h.imageURL("cat.png")}},
 		}}},
 	}, h.key)
 

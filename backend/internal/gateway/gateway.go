@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -569,55 +570,128 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 // resolveImage turns an OpenAI image reference into something the agent can
 // fetch on its own.
 //
-// Remote URLs pass through untouched. Inline data URIs are written into the
-// media directory and republished under Media.PublicBaseURL, because the agent
-// downloads attachments server-side and cannot dereference a data: URI. When no
-// public base URL is configured the request is rejected with an actionable
-// message rather than being forwarded to fail opaquely upstream.
+// It used to hand back a URL, either the caller's or one republished under
+// Media.PublicBaseURL, and the upstream resolved it. That is over: an
+// attachment now has to be backed by an object key the account owns, so a
+// reference is turned into bytes here and uploaded with the turn. See
+// minimax.UploadedImage.
+//
+// Two forms are accepted and only two — a `data:` URI, which already carries
+// its bytes, and an http(s) URL, which the gateway fetches. Neither needs the
+// media public base URL any more, and nothing is written to the media
+// directory: the bytes go to the object store, not to disk.
+//
+// Fetching a caller-supplied URL is new, and it is worth being plain about what
+// that means: the gateway is now the one making the request, so a client key
+// can point it at anything the gateway can reach. Treat the key list with the
+// same care as the account list.
 func (g *Gateway) resolveImage(raw string) (minimax.UploadedImage, error) {
 	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "data:") {
-		// Anything that is not a data URI has to be a URL the agent can fetch
-		// itself. Without this the fallthrough is a *value* that looks fine
-		// here and fails upstream naming nothing — and the value it happens to
-		// is a bare base64 payload, which is what a client sends when it
-		// assumes these endpoints follow the image-edit convention.
-		//
-		// The value is quoted to 60 characters because a base64 payload is
-		// megabytes long and this string reaches the audit log.
-		if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
-			return minimax.UploadedImage{}, fmt.Errorf(
-				"reference image must be an http(s) URL or a data: URI — the agent downloads references server-side, so a bare base64 payload or a local path cannot work (got %.60q)",
-				raw)
+	if raw == "" {
+		return minimax.UploadedImage{}, errors.New("reference image is empty")
+	}
+
+	if strings.HasPrefix(raw, "data:") {
+		mimeType, payload, err := decodeDataURL(raw)
+		if err != nil {
+			return minimax.UploadedImage{}, err
 		}
-		return minimax.UploadedImage{URL: raw, Name: imageName(raw)}, nil
+		if len(payload) == 0 {
+			return minimax.UploadedImage{}, errors.New("reference image is empty")
+		}
+		return minimax.UploadedImage{
+			Name:     "inline-" + randomID(12) + extensionFor(mimeType),
+			MimeType: mimeType,
+			Size:     int64(len(payload)),
+			Data:     payload,
+		}, nil
 	}
 
-	index := strings.Index(raw, ",")
-	if index < 0 {
-		return minimax.UploadedImage{}, fmt.Errorf("invalid data URI")
+	// Anything that is not a data URI has to be a URL the gateway can fetch.
+	// Without this check the fallthrough is a *value* that looks fine here and
+	// fails upstream naming nothing — and the value it happens to be is a bare
+	// base64 payload, which is what a client sends when it assumes these
+	// endpoints follow the image-edit convention.
+	//
+	// The value is quoted to 60 characters because a base64 payload is
+	// megabytes long and this string reaches the audit log.
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return minimax.UploadedImage{}, fmt.Errorf(
+			"reference image must be an http(s) URL or a data: URI — the gateway fetches it and uploads it to the agent, so a bare base64 payload or a local path cannot work (got %.60q)",
+			raw)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw[index+1:]))
-	if err != nil {
-		return minimax.UploadedImage{}, fmt.Errorf("invalid base64 image payload: %w", err)
-	}
+	return g.downloadImage(raw)
+}
 
+// referenceImageTimeout bounds one fetch. It is deliberately not the request
+// timeout: that one is sized for a conversation turn, and a picture that has
+// not arrived within a minute is not going to.
+const referenceImageTimeout = 60 * time.Second
+
+// maxReferenceImageBytes caps what a reference URL may hand back.
+//
+// The URL comes from the caller, so without a ceiling one request can pull an
+// unbounded stream into memory — before the upstream has seen anything and had
+// a chance to reject it.
+const maxReferenceImageBytes = 32 << 20
+
+// downloadImage fetches a reference picture and returns its bytes.
+func (g *Gateway) downloadImage(raw string) (minimax.UploadedImage, error) {
 	settings := g.settings()
-	if strings.TrimSpace(settings.Media.PublicBaseURL) == "" {
-		return minimax.UploadedImage{}, fmt.Errorf("inline base64 images require the media public base URL to be configured; otherwise send a publicly reachable image URL")
+	ctx, cancel := context.WithTimeout(context.Background(), referenceImageTimeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return minimax.UploadedImage{}, fmt.Errorf("reference image URL is not usable: %w", err)
 	}
-	if err := os.MkdirAll(settings.Media.GeneratedDir, 0o755); err != nil {
-		return minimax.UploadedImage{}, fmt.Errorf("prepare media directory: %w", err)
+	// The media client is the one that knows about the egress proxy, and the
+	// reference is as likely to be behind the geo-fence as anything else this
+	// gateway fetches.
+	response, err := minimax.DownloadClient(settings).Do(request)
+	if err != nil {
+		// The URL carries no credential of ours, so the transport error goes
+		// through as it is — there is nothing in it to redact.
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: HTTP %d", response.StatusCode)
 	}
 
-	name := "inline_" + randomID(12) + ".png"
-	target := filepath.Join(settings.Media.GeneratedDir, name)
-	if err := os.WriteFile(target, decoded, 0o644); err != nil {
-		return minimax.UploadedImage{}, fmt.Errorf("store inline image: %w", err)
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxReferenceImageBytes+1))
+	if err != nil {
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: %w", err)
 	}
+	if len(payload) == 0 {
+		return minimax.UploadedImage{}, errors.New("fetch reference image: the server returned no content")
+	}
+	if len(payload) > maxReferenceImageBytes {
+		return minimax.UploadedImage{}, fmt.Errorf(
+			"reference image is larger than %d MB", maxReferenceImageBytes>>20)
+	}
+
+	mimeType := strings.TrimSpace(response.Header.Get("content-type"))
+	if index := strings.Index(mimeType, ";"); index >= 0 {
+		mimeType = strings.TrimSpace(mimeType[:index])
+	}
+	if mimeType == "" || mimeType == "application/octet-stream" {
+		// Plenty of CDNs answer with a generic type. The extension is a better
+		// guess than calling every png an octet stream — the upstream reads
+		// this field to decide how to hand the picture to the model.
+		if guessed := mime.TypeByExtension(filepath.Ext(imageName(raw))); guessed != "" {
+			mimeType = guessed
+		}
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
 	return minimax.UploadedImage{
-		URL:  strings.TrimRight(settings.Media.PublicBaseURL, "/") + "/" + name,
-		Name: name,
+		Name:     imageName(raw),
+		MimeType: mimeType,
+		Size:     int64(len(payload)),
+		Data:     payload,
 	}, nil
 }
 

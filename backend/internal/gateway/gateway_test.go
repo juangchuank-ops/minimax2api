@@ -3,11 +3,13 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +34,22 @@ type harness struct {
 	upstream *httptest.Server
 	settings *config.Settings
 	key      string
+	// pictures serves the reference images a test hands to the gateway.
+	//
+	// It exists because the gateway fetches a reference itself now: a picture
+	// is downloaded, pushed to the object store and cited by object key, so a
+	// test URL has to resolve to something real. A test that used a made-up
+	// hostname would be testing the error path by accident.
+	pictures *httptest.Server
+}
+
+// tinyPNG is one transparent pixel, base64 — the smallest thing that is really
+// an image.
+const tinyPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+// imageURL is a reference URL the gateway can actually fetch.
+func (h *harness) imageURL(name string) string {
+	return h.pictures.URL + "/" + name
 }
 
 // upstreamText builds the SSE body a normal answer produces.
@@ -93,6 +111,34 @@ func upstreamFunc(accept func(token string) bool, stream func(token string) stri
 			_, _ = io.WriteString(w, stream(token))
 			return
 		}
+		// The object-store leg. Attachments — documents and pictures alike — are
+		// uploaded before the turn, so a stub that cannot complete an upload
+		// cannot test anything that carries one. The key is derived from the
+		// file name so a test can assert on it.
+		if strings.HasSuffix(r.URL.Path, "/uploads/prepare") {
+			raw, _ := io.ReadAll(r.Body)
+			var prepared struct {
+				FileName string `json:"file_name"`
+			}
+			_ = json.Unmarshal(raw, &prepared)
+			payload, _ := json.Marshal(map[string]any{
+				"object_key": "stub/" + prepared.FileName,
+				"upload_instruction": map[string]any{
+					"method": "POST",
+					// Back at this same stub: what matters is that the upload
+					// completes, not where it lands.
+					"url":         "http://" + r.Host + "/oss",
+					"form_fields": map[string]string{"key": "stub"},
+				},
+			})
+			w.Header().Set("content-type", "application/json")
+			_, _ = w.Write(payload)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/oss") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("content-type", "application/json")
 		_, _ = io.WriteString(w, `{"session_id":"sess_test"}`)
 	}
@@ -125,6 +171,16 @@ func newHarness(t *testing.T, upstream http.HandlerFunc) *harness {
 	t.Cleanup(server.Close)
 	settings.Upstream.BaseURL = server.URL
 
+	pixels, err := base64.StdEncoding.DecodeString(tinyPNG)
+	if err != nil {
+		t.Fatalf("decode the fixture image: %v", err)
+	}
+	pictures := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "image/png")
+		_, _ = w.Write(pixels)
+	}))
+	t.Cleanup(pictures.Close)
+
 	settingsFn := func() config.Settings { return settings }
 	client := minimax.New(settingsFn)
 	p := pool.New(st, settingsFn)
@@ -142,6 +198,7 @@ func newHarness(t *testing.T, upstream http.HandlerFunc) *harness {
 		upstream: server,
 		settings: &settings,
 		key:      key.Key,
+		pictures: pictures,
 	}
 }
 
@@ -866,11 +923,15 @@ func TestImageGenerationsIgnoresTheModelAndCountFields(t *testing.T) {
 	}
 }
 
-// An inline data URI cannot be fetched by the upstream, so the request must be
-// refused with an actionable message rather than forwarded to fail opaquely.
-func TestChatCompletionsRejectsInlineImageWithoutPublicBaseURL(t *testing.T) {
-	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+// An inline data URI used to need Media.PublicBaseURL, because the upstream
+// fetched the reference and cannot dereference a data: URI. It does not any
+// more: the gateway decodes the bytes and uploads them, so the setting is no
+// longer part of this path at all.
+func TestChatCompletionsAcceptsAnInlineImageWithNoPublicBaseURL(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("看到了")))
 	h.addAccount(t, "primary", "token-good", 10)
+	h.settings.Media.PublicBaseURL = ""
+	bodies := h.captureMessageBodies(t)
 
 	rec := h.chat(t, map[string]any{
 		"model": "minimax-agent",
@@ -879,46 +940,7 @@ func TestChatCompletionsRejectsInlineImageWithoutPublicBaseURL(t *testing.T) {
 			"content": []any{
 				map[string]any{"type": "text", "text": "what is this"},
 				map[string]any{"type": "image_url", "image_url": map[string]any{
-					"url": "data:image/png;base64,iVBORw0KGgo=",
-				}},
-			},
-		}},
-	}, h.key)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "public base URL") {
-		t.Fatalf("error should explain how to fix it: %s", rec.Body.String())
-	}
-}
-
-// A remote image URL is forwarded as an attachment without being downloaded.
-func TestChatCompletionsForwardsRemoteImage(t *testing.T) {
-	var body string
-	h := newHarness(t, upstreamFunc(
-		nil,
-		func(string) string { return upstreamText("看到了") },
-	))
-	// Wrap the stub to capture the message payload.
-	original := h.upstream.Config.Handler
-	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/message") {
-			raw, _ := io.ReadAll(r.Body)
-			body = string(raw)
-		}
-		original.ServeHTTP(w, r)
-	})
-	h.addAccount(t, "primary", "token-good", 10)
-
-	rec := h.chat(t, map[string]any{
-		"model": "minimax-agent",
-		"messages": []any{map[string]any{
-			"role": "user",
-			"content": []any{
-				map[string]any{"type": "text", "text": "what is this"},
-				map[string]any{"type": "image_url", "image_url": map[string]any{
-					"url": "https://example.com/cat.png",
+					"url": "data:image/png;base64," + tinyPNG,
 				}},
 			},
 		}},
@@ -927,8 +949,53 @@ func TestChatCompletionsForwardsRemoteImage(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(body, "https://example.com/cat.png") {
-		t.Fatalf("message body should carry the remote image: %s", body)
+	if len(*bodies) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*bodies))
+	}
+	if got := referenceAttachments(t, (*bodies)[0]); len(got) != 1 {
+		t.Fatalf("attachments = %v, want the inline picture", got)
+	}
+}
+
+// A remote image URL is fetched by the gateway and uploaded, not forwarded.
+//
+// It used to be passed straight through, and the upstream resolved it. It no
+// longer does: an attachment without an object key the account owns is refused
+// outright, so the URL never reaches upstream at all — what does is the object
+// key the upload produced.
+func TestChatCompletionsUploadsRemoteImage(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("看到了")))
+	h.addAccount(t, "primary", "token-good", 10)
+	bodies := h.captureMessageBodies(t)
+
+	rec := h.chat(t, map[string]any{
+		"model": "minimax-agent",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "what is this"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": h.imageURL("cat.png"),
+				}},
+			},
+		}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(*bodies) != 1 {
+		t.Fatalf("expected one upstream turn, got %d", len(*bodies))
+	}
+	body := (*bodies)[0]
+	if got := referenceNames(t, body); len(got) != 1 || got[0] != "cat.png" {
+		t.Fatalf("references = %v, want cat.png", got)
+	}
+	if got := referenceObjectKeys(t, body); len(got) != 1 || got[0] != "stub/cat.png" {
+		t.Fatalf("object keys = %v, want the key the upload returned", got)
+	}
+	if encoded, _ := json.Marshal(body); strings.Contains(string(encoded), h.pictures.URL) {
+		t.Errorf("the source URL still travels upstream: %s", encoded)
 	}
 }
 
@@ -1221,22 +1288,53 @@ func (h *harness) image(t *testing.T, body map[string]any) *httptest.ResponseRec
 	return rec
 }
 
-// referenceURLs pulls the reference pictures out of a captured turn body.
+// referenceAttachments pulls the picture attachments out of a captured turn.
 //
-// Files and images share the `attachments` array but not its shape, so the
-// filter is on `type` rather than on position — a turn that carries both must
-// not have its document counted as a picture.
-func referenceURLs(t *testing.T, body map[string]any) []string {
+// Pictures and documents share the `attachments` array and, since the upstream
+// stopped accepting URL-only attachments, they share the envelope too. The one
+// field that separates them is the string "image" — so the filter is on that
+// rather than on position: a turn carrying both must not have its document
+// counted as a picture.
+func referenceAttachments(t *testing.T, body map[string]any) []map[string]any {
 	t.Helper()
 	items, _ := body["attachments"].([]any)
-	out := make([]string, 0, len(items))
+	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		entry, _ := item.(map[string]any)
-		if entry["type"] != "image" {
+		meta, _ := entry["meta"].(map[string]any)
+		if meta["attachment_type"] != "image" {
 			continue
 		}
-		url, _ := entry["url"].(string)
-		out = append(out, url)
+		out = append(out, entry)
+	}
+	return out
+}
+
+// referenceNames is what those attachments are called, in order.
+//
+// The order is not incidental: it is how a caller says which frame is first.
+func referenceNames(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	out := make([]string, 0)
+	for _, entry := range referenceAttachments(t, body) {
+		meta, _ := entry["meta"].(map[string]any)
+		name, _ := meta["file_name"].(string)
+		out = append(out, name)
+	}
+	return out
+}
+
+// referenceObjectKeys is where those bytes landed.
+//
+// A picture with no object key is the thing the upstream refuses, so this is
+// the assertion that says the upload actually happened.
+func referenceObjectKeys(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	out := make([]string, 0)
+	for _, entry := range referenceAttachments(t, body) {
+		cloud, _ := entry["cloud"].(map[string]any)
+		key, _ := cloud["object_key"].(string)
+		out = append(out, key)
 	}
 	return out
 }
@@ -1631,7 +1729,7 @@ func TestImageGenerationsCarriesReferenceImages(t *testing.T) {
 
 	rec := h.image(t, map[string]any{
 		"prompt":    "把这张图改成水彩风格",
-		"image_url": "https://example.test/cat.png",
+		"image_url": h.imageURL("cat.png"),
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -1639,8 +1737,8 @@ func TestImageGenerationsCarriesReferenceImages(t *testing.T) {
 	if len(*bodies) != 1 {
 		t.Fatalf("expected one upstream turn, got %d", len(*bodies))
 	}
-	got := referenceURLs(t, (*bodies)[0])
-	if len(got) != 1 || got[0] != "https://example.test/cat.png" {
+	got := referenceNames(t, (*bodies)[0])
+	if len(got) != 1 || got[0] != "cat.png" {
 		t.Fatalf("references = %v, want the one that was sent", got)
 	}
 	if _, adjusted := decodeJSON(t, rec)["adjusted"]; adjusted {
@@ -1661,20 +1759,15 @@ func TestImageGenerationsAcceptsEveryReferenceSpelling(t *testing.T) {
 
 	rec := h.image(t, map[string]any{
 		"prompt":     "把这四张合成一张",
-		"image":      "https://example.test/a.png",
-		"image_url":  "https://example.test/b.png",
-		"image_urls": []any{"https://example.test/c.png", "https://example.test/d.png"},
+		"image":      h.imageURL("a.png"),
+		"image_url":  h.imageURL("b.png"),
+		"image_urls": []any{h.imageURL("c.png"), h.imageURL("d.png")},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	want := []string{
-		"https://example.test/a.png",
-		"https://example.test/b.png",
-		"https://example.test/c.png",
-		"https://example.test/d.png",
-	}
-	got := referenceURLs(t, (*bodies)[0])
+	want := []string{"a.png", "b.png", "c.png", "d.png"}
+	got := referenceNames(t, (*bodies)[0])
 	if len(got) != len(want) {
 		t.Fatalf("references = %v, want %v", got, want)
 	}
@@ -1696,9 +1789,9 @@ func TestVideoGenerationsCapsReferencesAtWhatTheModelAccepts(t *testing.T) {
 	rec := h.video(t, map[string]any{
 		"model": "minimax-h3-max", "prompt": "一只猫在弹钢琴",
 		"image_urls": []any{
-			"https://example.test/first.png",
-			"https://example.test/last.png",
-			"https://example.test/spare.png",
+			h.imageURL("first.png"),
+			h.imageURL("last.png"),
+			h.imageURL("spare.png"),
 		},
 	})
 	if rec.Code != http.StatusOK {
@@ -1715,13 +1808,13 @@ func TestVideoGenerationsCapsReferencesAtWhatTheModelAccepts(t *testing.T) {
 		t.Errorf("adjustment = %v", entry)
 	}
 
-	got := referenceURLs(t, (*bodies)[0])
+	got := referenceNames(t, (*bodies)[0])
 	if len(got) != 2 {
 		t.Fatalf("references sent = %v, want two", got)
 	}
 	// The first two, not an arbitrary two: on a first/last pair the order is
 	// how the caller says which is which.
-	if got[0] != "https://example.test/first.png" || got[1] != "https://example.test/last.png" {
+	if got[0] != "first.png" || got[1] != "last.png" {
 		t.Errorf("references sent = %v, want the first two in order", got)
 	}
 }
@@ -1736,10 +1829,10 @@ func TestVideoGenerationsKeepsEveryReferenceH3Accepts(t *testing.T) {
 	rec := h.video(t, map[string]any{
 		"model": "minimax-h3", "prompt": "一只猫在弹钢琴",
 		"image_urls": []any{
-			"https://example.test/1.png",
-			"https://example.test/2.png",
-			"https://example.test/3.png",
-			"https://example.test/4.png",
+			h.imageURL("1.png"),
+			h.imageURL("2.png"),
+			h.imageURL("3.png"),
+			h.imageURL("4.png"),
 		},
 	})
 	if rec.Code != http.StatusOK {
@@ -1748,7 +1841,7 @@ func TestVideoGenerationsKeepsEveryReferenceH3Accepts(t *testing.T) {
 	if _, adjusted := decodeJSON(t, rec)["adjusted"]; adjusted {
 		t.Error("H3.0 reported a trim it does not have")
 	}
-	if got := referenceURLs(t, (*bodies)[0]); len(got) != 4 {
+	if got := referenceNames(t, (*bodies)[0]); len(got) != 4 {
 		t.Errorf("references sent = %v, want all four", got)
 	}
 }
@@ -1763,9 +1856,9 @@ func TestChatCompletionsCapsReferencesOnAVideoModel(t *testing.T) {
 
 	content := []any{map[string]any{"type": "text", "text": "一只猫在弹钢琴"}}
 	for _, url := range []string{
-		"https://example.test/1.png",
-		"https://example.test/2.png",
-		"https://example.test/3.png",
+		h.imageURL("1.png"),
+		h.imageURL("2.png"),
+		h.imageURL("3.png"),
 	} {
 		content = append(content, map[string]any{
 			"type": "image_url", "image_url": map[string]any{"url": url},
@@ -1778,7 +1871,7 @@ func TestChatCompletionsCapsReferencesOnAVideoModel(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := referenceURLs(t, (*bodies)[0]); len(got) != 2 {
+	if got := referenceNames(t, (*bodies)[0]); len(got) != 2 {
 		t.Errorf("references sent = %v, want two", got)
 	}
 }
@@ -1827,30 +1920,29 @@ func TestGenerationRefusesAReferenceItCannotFetch(t *testing.T) {
 	}
 }
 
-// A data URI is accepted, because it is one of the two forms the agent can be
-// handed: it is written into the media directory and republished under the
-// public base URL. Without that base URL the request is refused rather than
-// forwarded to fail opaquely — the agent downloads attachments server-side and
-// cannot dereference a data: URI.
-func TestGenerationAcceptsAnInlineReferenceOnlyWithAPublicBaseURL(t *testing.T) {
+// A data URI is one of the two forms a reference may take, and it needs no
+// configuration: the bytes are already in the request, so they are decoded and
+// uploaded like any other attachment.
+//
+// It used to require Media.PublicBaseURL — the reference was republished as a
+// URL for the upstream to fetch. That requirement is gone with the URL path.
+func TestGenerationAcceptsAnInlineReference(t *testing.T) {
 	h := newHarness(t, acceptsEverything(upstreamMedia("https://cdn/out.png")))
 	h.addAccount(t, "primary", "token-good", 10)
-	h.captureMessageBodies(t)
+	h.settings.Media.PublicBaseURL = ""
+	bodies := h.captureMessageBodies(t)
 
-	const inline = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-
-	rec := h.image(t, map[string]any{"prompt": "改成水彩", "image_url": inline})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "public base URL") {
-		t.Errorf("the refusal does not name the setting to fill in: %s", rec.Body.String())
-	}
-
-	h.settings.Media.PublicBaseURL = "https://gateway.test/media"
-	h.settings.Media.GeneratedDir = t.TempDir()
-	rec = h.image(t, map[string]any{"prompt": "改成水彩", "image_url": inline})
+	rec := h.image(t, map[string]any{"prompt": "改成水彩", "image_url": "data:image/png;base64," + tinyPNG})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := (*bodies)[0]
+	if got := referenceObjectKeys(t, body); len(got) != 1 || got[0] == "" {
+		t.Fatalf("object keys = %v, want one key from the upload", got)
+	}
+	// The bytes went to the object store, not to the media directory: nothing
+	// about this path writes a file any more.
+	if entries, err := os.ReadDir(h.settings.Media.GeneratedDir); err == nil && len(entries) > 0 {
+		t.Errorf("the inline reference was written to the media directory: %v", entries)
 	}
 }
